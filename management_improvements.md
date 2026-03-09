@@ -28,6 +28,21 @@ Use total score to order dispatch candidates.
 - Planner dispatch: `repo=<repo_name> do task <task_id>`.
 - Worker closeout: `<task_id> | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>`.
 - Worker must update target repo `tasks.md` status before closeout.
+- Default to one task per worker at a time.
+- Treat ordered task lists as planner sequencing, not as a worker queue, unless the worker explicitly supports queued execution.
+- For repo-local boards that already encode dependencies, rely on those dependencies instead of giving workers broad multi-task bundles.
+
+## Worker Handoff Template
+Use this preamble when dispatching:
+
+```text
+repo=<repo_name> do task <task_id>
+
+Read <repo>/tasks.md and execute only that task.
+Before closeout, update the task status and relevant acceptance/testing checkboxes in tasks.md.
+Close out with:
+<task_id> | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
+```
 
 ## Central File Structure Upgrades (Next)
 - Add a `Now` section with top 3 tasks across all repos.

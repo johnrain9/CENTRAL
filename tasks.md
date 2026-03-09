@@ -1,15 +1,17 @@
 # CENTRAL Multi-Repo Task Board
 
-Last sync: 2026-02-28T14:19:57-07:00
+Last sync: 2026-03-09T00:00:00-07:00
 
 ## Tracked Repos
 - photo_auto_tagging: /home/cobra/photo_auto_tagging
+- aimSoloAnalysis: /home/cobra/aimSoloAnalysis
 - video_queue: /home/cobra/video_queue
 - video_wall: /home/cobra/video_wall
 - tts: /home/cobra/tts
 
 ## Repo Snapshots
-- photo_auto_tagging | branch=main | last_commit=29b88d7 2026-02-28 feat(gallery-integration): link modern gallery and mount routes at launch
+- photo_auto_tagging | branch=main | last_commit=8b1a6ab 2026-03-07 Stabilize V2 review and gallery flows
+- aimSoloAnalysis | branch=feature/task-p0-12-evidence-plumbing | last_commit=54804fb 2026-03-08 chore: commit all current workspace changes | dirty=true (`TASKS.md` modified, `docs/wsl2_native_js_ui_design.md` untracked)
 - video_queue | branch=main | last_commit=2dfe1c9 2026-02-28 feat(ui-v2): deliver /v2 svelte app, contracts, and validation
 - video_wall | branch=main | last_commit=8ffd834 2026-02-17 Implement video wall transport, animated previews, modal player, and source filtering
 - tts | non-git workspace | local TTS setup (Kokoro + XTTS) | key scripts: `run_kokoro.py`, `run_xtts.py`
@@ -17,12 +19,14 @@ Last sync: 2026-02-28T14:19:57-07:00
 ## Source Task Files
 - /home/cobra/photo_auto_tagging/tasks.md
 - /home/cobra/photo_auto_tagging/docs/ui_redesign_tasks.md
+- /home/cobra/aimSoloAnalysis/TASKS.md
 - /home/cobra/video_queue/tasks.md
 - /home/cobra/video_wall/tasks.md
 - /home/cobra/tts (no `tasks.md` found yet)
 
 ## Portfolio Status Summary
-- photo_auto_tagging/tasks.md: total=218 done=203 todo=15
+- photo_auto_tagging/tasks.md: total=262 done=238 todo=24
+- aimSoloAnalysis/TASKS.md: done=57 in_progress=1 todo=21
 - video_queue/tasks.md: done=26 in_progress=3 todo=21
 - video_wall/tasks.md: done=1 in_progress=0 todo=0
 - photo_auto_tagging/docs/ui_redesign_tasks.md: checkboxes total=178 done=0 todo=178
@@ -46,6 +50,36 @@ Last sync: 2026-02-28T14:19:57-07:00
 - [todo] VQ-UI2-10 - Phase 3 UI: JobDetail panel, prompt list, and log viewer
 - [todo] VQ-UI2-11 - Workspace state, shortcuts, and interaction polish
 - [todo] VQ-UI2-12 - Parity test suite, rollout gates, and rollback runbook
+
+### aimSoloAnalysis (open from `TASKS.md`)
+- [in_progress] XRK R&D notes (PROGRESS_AIMSOLO_XRK.txt) - continue in parallel
+- [todo] Store raw arrays (compressed blobs) for full channel fidelity
+- [todo] Add lean-angle proxy (from lateral accel + GPS radius) with quality gating
+- [todo] Add light brake/throttle detection (turn/lean dependent) to synthesis
+- [todo] Decode hGPS 56-byte record format
+- [todo] Validate CRC16 trailer and timebase mapping
+- [todo] Map hCHS fields to data types + sample rates
+- [todo] Ingestion time benchmark
+- [todo] Product-behavior assertion suite + golden scenario drift checks
+- [todo] TASK-P0-09 - Upgrade coaching copy from consistency-only cues to explicit did-vs-should turn-in delta with causal rationale and concrete marker guidance
+- [todo] TASK-P0-10 - Freeze top-insight did-vs-should payload contract (`did`, `should`, `because`, `success_check`) and null/fallback behavior
+- [todo] TASK-P0-11 - Implement deterministic coaching copy policy for did-vs-should delta + causal rationale + measurable validation wording
+- [todo] TASK-P0-12 - Ensure evidence plumbing always provides target/reference turn-in, rider average, and recent-lap turn-in history with graceful degradation
+- [todo] TASK-P0-13 - Add golden behavior tests for did-vs-should coaching scenarios
+- [todo] TASK-P0-14 - Gate did-vs-should coaching quality in eval scorecard
+- [todo] TASK-PLAT-01 - Replace PowerShell bootstrap with native Python bootstrap refresh for WSL2/Linux planning flows
+- [todo] TASK-PLAT-02 - Document and validate native WSL2 run/eval workflow for backend, frontend, and planner operations
+- [todo] TASK-UI-10 - Freeze rewritten-UI API and payload contract for import/summary/insights/compare/map, including not-ready/error states
+- [todo] TASK-UI-11 - Freeze modern JS trackside UI architecture and visual system for P0 flow
+- [todo] TASK-UI-12 - Scaffold `ui-v2/` modern JS frontend shell and route skeleton for import/summary/insights/compare/corner
+- [todo] TASK-UI-13 - Implement rewritten Insights experience with top-1 dominance and structured did-vs-should rendering
+- [todo] TASK-UI-14 - Upgrade frontend evaluation harness for rewritten UI quality gates
+
+### aimSoloAnalysis Summary
+- Status: active repo with planner-owned dirty state (`TASKS.md` modified, `docs/wsl2_native_js_ui_design.md` untracked) on branch `feature/task-p0-12-evidence-plumbing`.
+- Main risk: the WSL2/UI rewrite is valid, but it must not jump ahead of the coaching-contract chain. `TASK-P0-10` is the first hard gate for both P0 coaching quality and UI contract freeze.
+- Design-intake dispatch order: `TASK-P0-10` -> `TASK-P0-11` + `TASK-P0-12` -> `TASK-P0-13` -> `TASK-P0-14` -> `TASK-PLAT-01` -> `TASK-PLAT-02` -> `TASK-UI-10` -> `TASK-UI-11` -> `TASK-UI-12` -> `TASK-UI-13` -> `TASK-UI-14`.
+- Next-action rule: do not start `TASK-UI-12` scaffold work until native WSL2 bootstrap exists and the rewritten UI contract/architecture are frozen.
 
 ### video_queue (not done from tasks.md)
 - [in_progress] T01: Test Infrastructure Upgrade
