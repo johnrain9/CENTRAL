@@ -279,4 +279,51 @@ python -m autonomy.cli worker list --json --profile default
 
 ## Notes
 - This is a design/planning task, not a schema/code migration task.
+
+---
+
+## Task AUT-OPS-06: Move autonomy docs out of photo_auto_tagging and make CENTRAL canonical
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+- Secondary repo: `/home/cobra/photo_auto_tagging`
+- Secondary repo: `/home/cobra/.codex/skills`
+
+## Status
+- `todo`
+
+## Objective
+- Re-home autonomy operator/planner/triage documentation so `CENTRAL` is the canonical location and `photo_auto_tagging` no longer carries the long-term source of truth for dispatch-system docs.
+
+## Context
+- Autonomy runtime implementation currently lives in `/home/cobra/photo_auto_tagging/autonomy`.
+- Some autonomy docs were updated under `/home/cobra/photo_auto_tagging/docs/autonomy_skills/*`.
+- User direction is explicit: these docs do not belong in PhotoQuery as canonical documentation and should move to `CENTRAL`.
+
+## Deliverables
+1. Create or update the canonical autonomy docs in `CENTRAL`.
+2. Move or rewrite autonomy-skill repo docs so `CENTRAL` is the canonical reference location.
+3. Reduce `photo_auto_tagging/docs/autonomy_skills/*` to one of:
+   - stub/reference docs pointing to `CENTRAL`
+   - intentionally minimal implementation-local notes
+   - removal if no longer needed
+4. Ensure packaged skills under `/home/cobra/.codex/skills/autonomy-*` reference the CENTRAL-owned docs/runbooks where appropriate.
+5. Update any README or operator references that still imply PhotoQuery owns the dispatch documentation set.
+
+## Acceptance Criteria
+1. `CENTRAL` clearly contains the canonical autonomy docs/runbooks.
+2. `photo_auto_tagging` no longer appears to be the long-term doc home for autonomy operations/planning.
+3. Skills/docs/README references do not point users to stale PhotoQuery doc paths as primary references.
+4. Repo-local cleanup does not remove implementation-specific information that still belongs next to the code.
+
+## Testing
+```bash
+rg -n "autonomy_skills|dispatch_system_readme|CENTRAL" /home/cobra/CENTRAL /home/cobra/photo_auto_tagging/docs /home/cobra/.codex/skills
+git -C /home/cobra/CENTRAL diff --stat
+git -C /home/cobra/photo_auto_tagging diff --stat
+```
+
+## Notes
+- This is a documentation ownership cleanup task, not a runtime-code change.
+- Keep implementation docs near code only when they are truly implementation-local; move operator/planner truth to `CENTRAL`.
 - Completed in [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md) under `Source-Of-Truth Migration`.

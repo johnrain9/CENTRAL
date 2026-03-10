@@ -131,6 +131,9 @@ Last sync: 2026-03-09T00:00:00-07:00
 - [done] AUT-OPS-05 - Decide and document source-of-truth migration from repo `tasks.md` boards to autonomy DB-backed planning.
   - scope: migration phases, mirror rules, drift resolution, and rollback path
   - why: planner currently tracks work in markdown boards; autonomy should eventually become the primary execution surface.
+- [todo] AUT-OPS-06 - Move autonomy docs out of `photo_auto_tagging` and make `CENTRAL` the canonical doc home.
+  - scope: re-home operator/planner/triage docs into `CENTRAL`, reduce repo-local docs to stubs or implementation-local notes, and update skill references.
+  - why: dispatch-system docs do not belong in PhotoQuery as the canonical documentation surface.
 - Worker-ready task packet: [dispatch_system_tasks.md](/home/cobra/CENTRAL/dispatch_system_tasks.md)
 
 ## CENTRAL Canonical Task System Tasks
