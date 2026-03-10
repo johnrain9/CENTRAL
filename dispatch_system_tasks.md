@@ -132,7 +132,7 @@ python -m autonomy.cli task blocked --json
 - Mirror/update repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `in_progress`
+- `done`
 
 ## Objective
 - Align autonomy skill docs and repo docs with the actual local runtime path, including init requirements, repo venv expectations, and the `dispatcher` launcher.
@@ -172,7 +172,7 @@ python -m autonomy.cli dispatch status --profile default
 - Keep docs explicit about current reality, not idealized future state.
 - If `autonomy` console-script installation is fixed first, docs may describe that as preferred and module path as fallback.
 - CENTRAL mirror/update completed in [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md).
-- Remaining external write surface:
+- External docs updated:
   - `/home/cobra/.codex/skills/autonomy-*`
   - `/home/cobra/photo_auto_tagging/docs/autonomy_skills/*`
 

@@ -122,7 +122,7 @@ Last sync: 2026-03-09T00:00:00-07:00
 - [done] AUT-OPS-02 - Define planner-owned task ingestion/update workflow from repo-local `tasks.md` and `CENTRAL/tasks.md` into the autonomy DB.
   - scope: decomposition rules, ownership rules, promotion to `pending`, and when central vs autonomy DB is source of truth
   - why: user should rarely create/update dispatch tasks manually; planner should do that work.
-- [in_progress] AUT-OPS-03 - Update autonomy skills and repo docs to reflect real bootstrap/install behavior and the `dispatcher` launcher path.
+- [done] AUT-OPS-03 - Update autonomy skills and repo docs to reflect real bootstrap/install behavior and the `dispatcher` launcher path.
   - scope: `autonomy-operator`, `autonomy-planner`, `autonomy-triage`, and `photo_auto_tagging/docs/autonomy_skills/*`
   - why: current skill text assumes canonical `autonomy` CLI availability, but local bootstrap still depends on repo runtime setup.
 - [done] AUT-OPS-04 - Add review/approval operating runbook for `pending_review`, failure triage, retry, and stale-review clearing.
