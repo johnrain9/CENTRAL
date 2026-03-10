@@ -1469,6 +1469,122 @@ def render_summary_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_generated_tasks_board(summary: dict[str, Any], snapshots: list[dict[str, Any]], *, generated_at: str) -> str:
+    central_ops = [snapshot for snapshot in snapshots if str(snapshot["task_id"]).startswith("CENTRAL-OPS-")]
+    other_tasks = [snapshot for snapshot in snapshots if not str(snapshot["task_id"]).startswith("CENTRAL-OPS-")]
+
+    def _render_task_lines(task_rows: list[dict[str, Any]]) -> list[str]:
+        if not task_rows:
+            return ["- none"]
+        lines: list[str] = []
+        for snapshot in task_rows:
+            runtime_status = snapshot["runtime"]["runtime_status"] if snapshot["runtime"] else "none"
+            lines.append(
+                f"- [{snapshot['planner_status']}] {snapshot['task_id']} - {snapshot['title']}"
+            )
+            lines.append(
+                f"  - priority: {snapshot['priority']} | repo: {snapshot['target_repo_id']} | runtime: {runtime_status}"
+            )
+        return lines
+
+    lines = [
+        "# CENTRAL Generated Task Board",
+        "",
+        generated_banner(generated_at),
+        "",
+        "This file is a derived landing page generated from CENTRAL DB state.",
+        "Do not edit it as the source of truth.",
+        "",
+        "## Portfolio Summary",
+    ]
+    for status, count in summary["planner_counts"].items():
+        lines.append(f"- planner {status}: {count}")
+    for status, count in summary["runtime_counts"].items():
+        if count:
+            lines.append(f"- runtime {status}: {count}")
+    lines.extend(
+        [
+            f"- blocked count: {summary['blocked_count']}",
+            f"- pending review count: {summary['pending_review_count']}",
+            "",
+            "## Top Eligible",
+        ]
+    )
+    if summary["top_eligible"]:
+        for item in summary["top_eligible"]:
+            lines.append(
+                f"- {item['task_id']} | p{item['priority']} | {item['target_repo_id']} | {item['title']}"
+            )
+    else:
+        lines.append("- none")
+    lines.extend(
+        [
+            "",
+            "## CENTRAL Canonical Task System Tasks",
+            *_render_task_lines(central_ops),
+        ]
+    )
+    if other_tasks:
+        lines.extend(
+            [
+                "",
+                "## Other Canonical Tasks",
+                *_render_task_lines(other_tasks),
+            ]
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_repo_markdown(repo_id: str, repo_rows: list[dict[str, Any]], *, generated_at: str) -> str:
+    lines = [
+        f"# CENTRAL Repo View: {repo_id}",
+        "",
+        generated_banner(generated_at),
+        "",
+    ]
+    if not repo_rows:
+        lines.extend(["- no tasks", ""])
+        return "\n".join(lines)
+    table_rows: list[dict[str, Any]] = []
+    for snapshot in repo_rows:
+        runtime_status = snapshot["runtime"]["runtime_status"] if snapshot["runtime"] else "none"
+        table_rows.append(
+            {
+                "task_id": snapshot["task_id"],
+                "priority": snapshot["priority"],
+                "planner_status": snapshot["planner_status"],
+                "runtime_status": runtime_status,
+                "dependency_blocked": "yes" if snapshot["dependency_blocked"] else "",
+                "planner_owner": snapshot["planner_owner"],
+                "worker_owner": snapshot["worker_owner"] or "",
+                "lease_owner": snapshot["lease"]["lease_owner_id"] if snapshot["lease"] else "",
+                "title": snapshot["title"],
+            }
+        )
+    lines.extend(
+        [
+            "```text",
+            render_table(
+                table_rows,
+                [
+                    ("task_id", "task_id"),
+                    ("p", "priority"),
+                    ("planner", "planner_status"),
+                    ("runtime", "runtime_status"),
+                    ("dep_blocked", "dependency_blocked"),
+                    ("planner_owner", "planner_owner"),
+                    ("lease_owner", "lease_owner"),
+                    ("title", "title"),
+                ],
+            ),
+            "```",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def begin_immediate(conn: sqlite3.Connection) -> None:
     conn.execute("BEGIN IMMEDIATE")
 
@@ -2262,6 +2378,147 @@ def command_export_task_card_md(args: argparse.Namespace) -> int:
     return print_or_json(payload, as_json=args.json, formatter=json_dumps)
 
 
+def command_export_tasks_board_md(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        generated_at = now_iso()
+        summary = summarize_portfolio(conn)
+        snapshots = fetch_task_snapshots(conn)
+    finally:
+        conn.close()
+    output_path = (
+        Path(args.output).expanduser().resolve()
+        if args.output
+        else (DEFAULT_GENERATED_DIR / "tasks.md")
+    )
+    write_output(output_path, render_generated_tasks_board(summary, snapshots, generated_at=generated_at))
+    payload = {
+        "output_path": str(output_path),
+        "generated_at": generated_at,
+        "task_count": len(snapshots),
+    }
+    return print_or_json(payload, as_json=args.json, formatter=json_dumps)
+
+
+def command_export_markdown_bundle(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        generated_at = now_iso()
+        summary = summarize_portfolio(conn)
+        snapshots = fetch_task_snapshots(conn)
+        blocked_rows = format_blocked_rows(snapshots)
+        review_rows = format_review_rows(snapshots)
+        assignment_rows = format_assignments_rows(snapshots)
+    finally:
+        conn.close()
+
+    output_dir = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else DEFAULT_GENERATED_DIR
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    board_path = output_dir / "tasks.md"
+    summary_path = output_dir / "portfolio_summary.md"
+    blocked_path = output_dir / "blocked_tasks.md"
+    review_path = output_dir / "review_queue.md"
+    assignments_path = output_dir / "assignments.md"
+    per_repo_dir = output_dir / "per_repo"
+    task_cards_dir = output_dir / "task_cards"
+    per_repo_dir.mkdir(parents=True, exist_ok=True)
+    task_cards_dir.mkdir(parents=True, exist_ok=True)
+
+    write_output(board_path, render_generated_tasks_board(summary, snapshots, generated_at=generated_at))
+    write_output(summary_path, render_summary_markdown(summary))
+
+    def _render_simple_markdown(title: str, rows: list[dict[str, Any]], columns: list[tuple[str, str]]) -> str:
+        lines = [f"# {title}", "", generated_banner(generated_at), ""]
+        if rows:
+            lines.append("```text")
+            lines.append(render_table(rows, columns))
+            lines.append("```")
+        else:
+            lines.append("- none")
+        lines.append("")
+        return "\n".join(lines)
+
+    write_output(
+        blocked_path,
+        _render_simple_markdown(
+            "Blocked Tasks",
+            blocked_rows,
+            [("task_id", "task_id"), ("repo", "repo"), ("planner_owner", "planner_owner"), ("blocked_at", "blocked_at"), ("blocker", "blocker")],
+        ),
+    )
+    write_output(
+        review_path,
+        _render_simple_markdown(
+            "Review Queue",
+            review_rows,
+            [("task_id", "task_id"), ("repo", "repo"), ("runtime", "runtime_status"), ("planner", "planner_status"), ("age_at", "age_at"), ("claimed_by", "claimed_by")],
+        ),
+    )
+    write_output(
+        assignments_path,
+        _render_simple_markdown(
+            "Assignments And Leases",
+            assignment_rows,
+            [("task_id", "task_id"), ("repo", "repo"), ("planner_owner", "planner_owner"), ("worker_owner", "worker_owner"), ("lease_owner", "lease_owner"), ("lease_expires_at", "lease_expires_at"), ("runtime", "runtime_status")],
+        ),
+    )
+
+    per_repo_paths: list[str] = []
+    by_repo: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for snapshot in snapshots:
+        by_repo[str(snapshot["target_repo_id"])].append(snapshot)
+    for repo_id in sorted(by_repo.keys()):
+        repo_path = per_repo_dir / f"{repo_id}.md"
+        write_output(repo_path, render_repo_markdown(repo_id, by_repo[repo_id], generated_at=generated_at))
+        per_repo_paths.append(str(repo_path))
+
+    task_card_paths: list[str] = []
+    for snapshot in snapshots:
+        task_card_path = task_cards_dir / f"{snapshot['task_id']}.md"
+        write_output(task_card_path, render_task_card_markdown(snapshot, generated_at=generated_at))
+        task_card_paths.append(str(task_card_path))
+
+    payload = {
+        "generated_at": generated_at,
+        "output_dir": str(output_dir),
+        "board_path": str(board_path),
+        "summary_path": str(summary_path),
+        "blocked_path": str(blocked_path),
+        "review_path": str(review_path),
+        "assignments_path": str(assignments_path),
+        "per_repo_count": len(per_repo_paths),
+        "task_card_count": len(task_card_paths),
+    }
+    return print_or_json(payload, as_json=args.json, formatter=json_dumps)
+
+
+def command_export_repo_md(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        generated_at = now_iso()
+        snapshots = fetch_task_snapshots(conn, repo_id=args.repo_id)
+    finally:
+        conn.close()
+    output_path = (
+        Path(args.output).expanduser().resolve()
+        if args.output
+        else (DEFAULT_GENERATED_DIR / "per_repo" / f"{args.repo_id}.md")
+    )
+    write_output(output_path, render_repo_markdown(args.repo_id, snapshots, generated_at=generated_at))
+    payload = {
+        "generated_at": generated_at,
+        "output_path": str(output_path),
+        "repo_id": args.repo_id,
+        "task_count": len(snapshots),
+    }
+    return print_or_json(payload, as_json=args.json, formatter=json_dumps)
+
+
 def command_runtime_eligible(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
@@ -2472,6 +2729,43 @@ def build_parser() -> argparse.ArgumentParser:
     export_task_parser.add_argument("--output", help="Output path. Defaults to CENTRAL/generated/task_cards/<task_id>.md")
     add_json_argument(export_task_parser)
     export_task_parser.set_defaults(func=command_export_task_card_md)
+
+    export_board_parser = subparsers.add_parser(
+        "export-tasks-board-md",
+        help="Write a non-canonical generated task-board landing page from CENTRAL DB state.",
+    )
+    add_db_argument(export_board_parser)
+    export_board_parser.add_argument(
+        "--output",
+        help="Output path. Defaults to CENTRAL/generated/tasks.md",
+    )
+    add_json_argument(export_board_parser)
+    export_board_parser.set_defaults(func=command_export_tasks_board_md)
+
+    export_bundle_parser = subparsers.add_parser(
+        "export-markdown-bundle",
+        help="Write the standard non-canonical markdown export bundle from CENTRAL DB state.",
+    )
+    add_db_argument(export_bundle_parser)
+    export_bundle_parser.add_argument(
+        "--output-dir",
+        help="Output directory. Defaults to CENTRAL/generated",
+    )
+    add_json_argument(export_bundle_parser)
+    export_bundle_parser.set_defaults(func=command_export_markdown_bundle)
+
+    export_repo_parser = subparsers.add_parser(
+        "export-repo-md",
+        help="Write a non-canonical per-repo markdown queue export from CENTRAL DB state.",
+    )
+    add_db_argument(export_repo_parser)
+    export_repo_parser.add_argument("--repo-id", required=True)
+    export_repo_parser.add_argument(
+        "--output",
+        help="Output path. Defaults to CENTRAL/generated/per_repo/<repo_id>.md",
+    )
+    add_json_argument(export_repo_parser)
+    export_repo_parser.set_defaults(func=command_export_repo_md)
 
     runtime_eligible_parser = subparsers.add_parser("runtime-eligible", help="Show runtime-claimable tasks from DB state.")
     add_db_argument(runtime_eligible_parser)

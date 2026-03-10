@@ -155,14 +155,32 @@ Optional exports remain derived outputs only:
 ```bash
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py export-summary-md
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py export-task-card-md --task-id CENTRAL-OPS-20
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py export-tasks-board-md
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py export-markdown-bundle
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py export-repo-md --repo-id CENTRAL
 ```
 
 Default output locations:
 
 - `/home/cobra/CENTRAL/generated/portfolio_summary.md`
 - `/home/cobra/CENTRAL/generated/task_cards/<task_id>.md`
+- `/home/cobra/CENTRAL/generated/tasks.md`
 
 Every generated markdown artifact is marked as generated from the CENTRAL DB and non-canonical.
+
+`export-tasks-board-md` is the generated landing-page export for operators who still want a `tasks.md`-style board view without manual maintenance.
+
+`export-markdown-bundle` writes the standard `generated/` markdown set in one shot:
+
+- `generated/tasks.md`
+- `generated/portfolio_summary.md`
+- `generated/blocked_tasks.md`
+- `generated/review_queue.md`
+- `generated/assignments.md`
+- `generated/per_repo/<repo_id>.md`
+- `generated/task_cards/<task_id>.md`
+
+`export-repo-md --repo-id <repo_id>` writes one repo-specific markdown queue view to `generated/per_repo/<repo_id>.md`.
 
 ## Runtime Commands
 

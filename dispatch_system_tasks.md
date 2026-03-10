@@ -332,3 +332,69 @@ git -C /home/cobra/photo_auto_tagging diff --stat
   - [`docs/autonomy_skills/autonomy-operator.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-operator.md)
   - [`docs/autonomy_skills/autonomy-planner.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-planner.md)
   - [`docs/autonomy_skills/autonomy-triage.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-triage.md)
+
+---
+
+## Task AUT-OPS-07: Reconcile autonomy runbooks and legacy CLI surfaces with DB-native CENTRAL
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+- Secondary repo: `/home/cobra/photo_auto_tagging`
+- Secondary repo: `/home/cobra/.codex/skills`
+
+## Status
+- `done`
+
+## Objective
+- Finish the AUT workstream by reconciling autonomy runbooks, packaged skills, and legacy autonomy CLI surfaces with the DB-native CENTRAL control plane.
+
+## Context
+- Earlier AUT tasks assumed autonomy DB and markdown bridges were still the main planner/operator surface.
+- `CENTRAL-OPS-15` through `CENTRAL-OPS-19` changed the canonical operating model materially:
+  - CENTRAL SQLite DB is now source of truth
+  - `scripts/central_task_db.py` is the primary planner/operator/runtime command surface
+  - `autonomy central sync` is no longer a primary workflow
+- The AUT stream needs an explicit closeout task so old bridge-first assumptions do not linger in packaged skills or operator docs.
+
+## Deliverables
+1. Update autonomy runbooks and packaged skills so DB-native CENTRAL workflow is the documented primary path.
+2. Demote `autonomy central sync` to deprecated import-only status in docs and CLI help.
+3. Remove remaining guidance that treats markdown task files as canonical planner state.
+4. Record the AUT-side closeout of the markdown/bridge-first contract.
+
+## Acceptance Criteria
+1. AUT-facing docs and skills point operators and planners to the CENTRAL DB CLI for canonical workflows.
+2. `autonomy central sync` is clearly documented as deprecated/import-only.
+3. AUT task tracking explicitly records that canonical task maintenance no longer lives in markdown surfaces.
+
+## Testing
+```bash
+tmpdb=$(mktemp /tmp/central_tasks_smoke_XXXXXX.db)
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py init --db-path "$tmpdb" --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-create --db-path "$tmpdb" --input /tmp/central_task_payload_XXXXXX.json --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-summary --db-path "$tmpdb" --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py runtime-claim --db-path "$tmpdb" --worker-id smoke-worker --queue-name default --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py migrate-bootstrap --db-path "$tmpdb" --json
+```
+
+Smoke result on 2026-03-10:
+- DB init succeeded
+- task create succeeded
+- summary view showed eligible work
+- runtime claim succeeded
+- bootstrap migration imported `AUT-OPS` and `CENTRAL-OPS` records into the temp DB
+
+## Notes
+- This is a reconciliation and cutover task, not a new runtime subsystem.
+- Completed in:
+  - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
+  - [`docs/autonomy_skills/README.md`](/home/cobra/CENTRAL/docs/autonomy_skills/README.md)
+  - [`docs/autonomy_skills/autonomy-operator.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-operator.md)
+  - [`docs/autonomy_skills/autonomy-planner.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-planner.md)
+  - [`docs/autonomy_skills/autonomy-triage.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-triage.md)
+  - [`/home/cobra/.codex/skills/autonomy-operator/SKILL.md`](/home/cobra/.codex/skills/autonomy-operator/SKILL.md)
+  - [`/home/cobra/.codex/skills/autonomy-planner/SKILL.md`](/home/cobra/.codex/skills/autonomy-planner/SKILL.md)
+  - [`/home/cobra/.codex/skills/autonomy-triage/SKILL.md`](/home/cobra/.codex/skills/autonomy-triage/SKILL.md)
+  - [`/home/cobra/photo_auto_tagging/autonomy/cli.py`](/home/cobra/photo_auto_tagging/autonomy/cli.py)
+  - [`/home/cobra/photo_auto_tagging/autonomy/central_sync.py`](/home/cobra/photo_auto_tagging/autonomy/central_sync.py)

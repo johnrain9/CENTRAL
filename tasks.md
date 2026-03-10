@@ -134,6 +134,11 @@ Last sync: 2026-03-09T00:00:00-07:00
 - [done] AUT-OPS-06 - Move autonomy docs out of `photo_auto_tagging` and make `CENTRAL` the canonical doc home.
   - scope: re-home operator/planner/triage docs into `CENTRAL`, reduce repo-local docs to stubs or implementation-local notes, and update skill references.
   - why: dispatch-system docs do not belong in PhotoQuery as the canonical documentation surface.
+- [todo] AUT-OPS-07 - Debug dispatcher startup transaction nesting failure.
+  - canonical DB task in CENTRAL; target repo: `/home/cobra/photo_auto_tagging`
+  - why: current legacy `dispatcher` startup still fails during orphan recovery with nested SQLite transaction handling.
+  - scope: mark `autonomy central sync` deprecated/import-only, point skills and runbooks at `central_task_db.py`, and remove remaining manual-canonical-markdown guidance.
+  - why: after the CENTRAL DB cutover, the AUT workstream needs an explicit closeout task that makes the old markdown/bridge contract non-primary.
 - Worker-ready task packet: [dispatch_system_tasks.md](/home/cobra/CENTRAL/dispatch_system_tasks.md)
 
 ## CENTRAL Canonical Task System Tasks
@@ -206,6 +211,27 @@ Last sync: 2026-03-09T00:00:00-07:00
   - bootstrap file: [tasks/CENTRAL-OPS-19.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-19.md)
   - implementation: [docs/central_task_cli.md](/home/cobra/CENTRAL/docs/central_task_cli.md), [dispatch_system_readme.md](/home/cobra/CENTRAL/dispatch_system_readme.md), [/home/cobra/.codex/skills/autonomy-planner/SKILL.md](/home/cobra/.codex/skills/autonomy-planner/SKILL.md), [/home/cobra/photo_auto_tagging/autonomy/cli.py](/home/cobra/photo_auto_tagging/autonomy/cli.py)
   - why: the end state must be DB-native planning plus optional generated exports only.
+- [todo] CENTRAL-OPS-20 - Implement CENTRAL-native dispatcher daemon loop.
+  - bootstrap file: [tasks/CENTRAL-OPS-20.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-20.md)
+  - why: DB-native runtime primitives exist, but there is still no long-running CENTRAL dispatcher daemon.
+- [todo] CENTRAL-OPS-21 - Implement CENTRAL-native worker execution bridge.
+  - bootstrap file: [tasks/CENTRAL-OPS-21.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-21.md)
+  - why: claimed CENTRAL tasks still need a real worker execution path.
+- [todo] CENTRAL-OPS-22 - Cut over dispatcher launcher and operator workflow to CENTRAL-native runtime.
+  - bootstrap file: [tasks/CENTRAL-OPS-22.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-22.md)
+  - why: the `dispatcher` command still needs to point at the CENTRAL-native runtime once it exists.
+- [done] CENTRAL-OPS-23 - Generate DB-native task-board landing page export.
+  - bootstrap file: [tasks/CENTRAL-OPS-23.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-23.md)
+  - implementation: [scripts/central_task_db.py](/home/cobra/CENTRAL/scripts/central_task_db.py), [docs/central_task_cli.md](/home/cobra/CENTRAL/docs/central_task_cli.md)
+  - why: operators still benefit from a board-style landing page, but it must be generated from DB state rather than maintained manually.
+- [done] CENTRAL-OPS-24 - Add one-shot markdown export bundle generation.
+  - bootstrap file: [tasks/CENTRAL-OPS-24.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-24.md)
+  - implementation: [scripts/central_task_db.py](/home/cobra/CENTRAL/scripts/central_task_db.py), [docs/central_task_cli.md](/home/cobra/CENTRAL/docs/central_task_cli.md)
+  - why: operators should be able to refresh all standard non-canonical markdown exports from DB state with one command.
+- [done] CENTRAL-OPS-25 - Add per-repo markdown export generation.
+  - bootstrap file: [tasks/CENTRAL-OPS-25.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-25.md)
+  - implementation: [scripts/central_task_db.py](/home/cobra/CENTRAL/scripts/central_task_db.py), [docs/central_task_cli.md](/home/cobra/CENTRAL/docs/central_task_cli.md)
+  - why: operators still need repo-specific generated queue views without falling back to manual markdown maintenance.
 - Canonical task packet: [central_task_system_tasks.md](/home/cobra/CENTRAL/central_task_system_tasks.md)
 
 ### Intake 2026-02-28: `video_queue_auto_prompt_design.md`

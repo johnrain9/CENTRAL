@@ -899,3 +899,195 @@ python -m autonomy.cli task list --json --status pending
   - [`/home/cobra/photo_auto_tagging/autonomy/central_sync.py`](/home/cobra/photo_auto_tagging/autonomy/central_sync.py)
 - Canonical bootstrap file:
   - [`tasks/CENTRAL-OPS-19.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-19.md)
+
+---
+
+## Task CENTRAL-OPS-20: Implement CENTRAL-native dispatcher daemon loop
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `done`
+
+## Objective
+- Add a generated board-style landing page so operators can scan canonical CENTRAL tasks in markdown form without hand-maintaining task-board truth.
+
+## Context
+- `CENTRAL-OPS-16` provided DB-generated views and basic markdown exports.
+- `CENTRAL-OPS-19` made DB-native operation the primary workflow and retired manual canonical markdown maintenance.
+- A generated landing page is still useful for human scanning, but it must remain non-canonical and DB-driven.
+
+## Deliverables
+1. Add a CLI command that exports a generated `tasks.md`-style landing page from DB state.
+2. Include a clear generated/non-canonical banner.
+3. Include portfolio summary and canonical task listings.
+4. Document the export command for operator use.
+
+## Acceptance Criteria
+1. Operators can regenerate a board-style landing page from DB state with one command.
+2. The landing page is clearly marked as generated and non-canonical.
+3. The export does not restore manual markdown maintenance as planner truth.
+
+## Testing
+- Manual review of the new export command.
+- Manual review of the updated CLI documentation.
+- Manual review complete on 2026-03-10:
+  - `export-tasks-board-md` added to [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - export usage documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
+
+## Notes
+- This is a generated-view extension task, not a return to markdown-canonical planning.
+- Completed in:
+  - [`tasks/CENTRAL-OPS-20.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-20.md)
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
+- Canonical bootstrap file:
+  - [`tasks/CENTRAL-OPS-20.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-20.md)
+
+---
+
+## Task CENTRAL-OPS-21: Implement CENTRAL-native worker execution bridge
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `done`
+
+## Objective
+- Add a one-shot export command that regenerates the standard markdown export bundle from CENTRAL DB state.
+
+## Context
+- Individual markdown exports already exist for summaries and task cards.
+- `CENTRAL-OPS-20` added a generated board-style landing page.
+- Operators still benefit from a single bundle-refresh command for all standard markdown outputs.
+
+## Deliverables
+1. Add a bundle export command.
+2. Generate board, summary, blocked, review, assignments, and task-card outputs.
+3. Keep all bundle outputs non-canonical and generated from DB state.
+4. Document the new command.
+
+## Acceptance Criteria
+1. One command regenerates the standard markdown bundle.
+2. Generated outputs remain clearly non-canonical.
+3. The bundle command does not depend on markdown as input.
+
+## Testing
+- Manual review of the bundle export implementation.
+- Manual review of the updated CLI documentation.
+- Manual review complete on 2026-03-10:
+  - `export-markdown-bundle` added to [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - bundle export usage documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
+
+## Notes
+- This is an operator convenience layer over existing DB-native export surfaces.
+- Completed in:
+  - [`tasks/CENTRAL-OPS-21.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-21.md)
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
+- Canonical bootstrap file:
+  - [`tasks/CENTRAL-OPS-21.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-21.md)
+
+---
+
+## Task CENTRAL-OPS-22: Cut over dispatcher launcher and operator workflow to CENTRAL-native runtime
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `done`
+
+## Objective
+- Add DB-native per-repo markdown exports for repo-specific operator scans and sharing.
+
+## Context
+- Per-repo queue views were part of the generated-surface contract.
+- The bundle export now exists, but repo-specific markdown files were still missing.
+- Operators may still want repo-specific markdown exports as long as they remain generated and non-canonical.
+
+## Deliverables
+1. Add a per-repo markdown export command.
+2. Extend the markdown bundle to emit per-repo files.
+3. Keep repo exports clearly non-canonical.
+4. Document the command surface.
+
+## Acceptance Criteria
+1. Operators can generate `generated/per_repo/<repo_id>.md` from DB state.
+2. The bundle command also emits per-repo files.
+3. Per-repo exports do not become canonical planner state.
+
+## Testing
+- Manual review of the per-repo export implementation.
+- Manual review of the updated CLI documentation.
+- Minimal smoke verification complete on 2026-03-10:
+  - `python3 /home/cobra/CENTRAL/scripts/central_task_db.py export-repo-md --repo-id CENTRAL --json`
+
+## Notes
+- This is a generated-export extension task, not a workflow change.
+- Completed in:
+  - [`tasks/CENTRAL-OPS-22.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-22.md)
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
+- Canonical bootstrap file:
+  - [`tasks/CENTRAL-OPS-22.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-22.md)
+
+
+---
+
+## Task CENTRAL-OPS-23: Generate DB-native task-board landing page export
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `done`
+
+## Objective
+- Add a DB-generated landing-page export so operators can read a `tasks.md`-style portfolio board without reintroducing manual canonical markdown maintenance.
+
+## Testing
+- Manual review complete on 2026-03-10 for generated board export implementation and CLI docs.
+
+## Notes
+- Completed in [`tasks/CENTRAL-OPS-23.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-23.md).
+
+---
+
+## Task CENTRAL-OPS-24: Add one-shot markdown export bundle generation
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `done`
+
+## Objective
+- Add a one-shot command that regenerates the standard non-canonical markdown export bundle from CENTRAL DB state.
+
+## Testing
+- Manual review complete on 2026-03-10 for bundle export implementation and CLI docs.
+
+## Notes
+- Completed in [`tasks/CENTRAL-OPS-24.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-24.md).
+
+---
+
+## Task CENTRAL-OPS-25: Add per-repo markdown export generation
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `done`
+
+## Objective
+- Add DB-native per-repo markdown export generation so operators can refresh repo-specific queue views directly from CENTRAL DB state.
+
+## Testing
+- Manual review complete on 2026-03-10 for per-repo export implementation and CLI docs.
+
+## Notes
+- Completed in [`tasks/CENTRAL-OPS-25.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-25.md).
