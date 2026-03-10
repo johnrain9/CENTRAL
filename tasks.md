@@ -131,6 +131,7 @@ Last sync: 2026-03-09T00:00:00-07:00
 - [todo] AUT-OPS-05 - Decide and document source-of-truth migration from repo `tasks.md` boards to autonomy DB-backed planning.
   - scope: migration phases, mirror rules, drift resolution, and rollback path
   - why: planner currently tracks work in markdown boards; autonomy should eventually become the primary execution surface.
+- Worker-ready task packet: [dispatch_system_tasks.md](/home/cobra/CENTRAL/dispatch_system_tasks.md)
 
 ### Intake 2026-02-28: `video_queue_auto_prompt_design.md`
 - Source: `/home/cobra/photo_auto_tagging/docs/video_queue_auto_prompt_design.md`
