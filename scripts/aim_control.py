@@ -399,14 +399,15 @@ def start_stack(ui_port: int) -> None:
     write_pid(UI_PID, ui_pid)
     UI_PORT_FILE.write_text(f"{ui_port}\n", encoding="utf-8")
     wait_for_port(ui_port)
-    browser_url = f"http://127.0.0.1:{ui_port}"
-    wsl_url = f"http://{wsl_ip()}:{ui_port}" if wsl_ip() else None
+    ip = wsl_ip()
+    browser_url = f"http://{ip}:{ui_port}" if ip else f"http://127.0.0.1:{ui_port}"
+    fallback_url = f"http://127.0.0.1:{ui_port}"
     open_browser(browser_url)
 
     print(f"Aim Solo started")
     print(f"UI:      {browser_url}")
-    if wsl_url:
-        print(f"WSL IP:  {wsl_url}")
+    if browser_url != fallback_url:
+        print(f"Fallback: {fallback_url}")
     print(f"API:     http://localhost:{BACKEND_PORT}")
     print(f"Logs:    {UI_LOG} | {BACKEND_LOG}")
 
@@ -418,12 +419,13 @@ def status() -> None:
     backend_running = pid_is_running(backend_pid)
     ui_running = pid_is_running(ui_pid)
     if backend_running or ui_running:
-        browser_url = f"http://127.0.0.1:{ui_port}"
-        wsl_url = f"http://{wsl_ip()}:{ui_port}" if wsl_ip() else None
+        ip = wsl_ip()
+        browser_url = f"http://{ip}:{ui_port}" if ip else f"http://127.0.0.1:{ui_port}"
+        fallback_url = f"http://127.0.0.1:{ui_port}"
         print("Aim Solo status: running")
         print(f"UI:      {'up' if ui_running else 'down'} on {browser_url} (pid {ui_pid or 'n/a'})")
-        if wsl_url:
-            print(f"WSL IP:  {wsl_url}")
+        if browser_url != fallback_url:
+            print(f"Fallback: {fallback_url}")
         print(f"API:     {'up' if backend_running else 'down'} on http://localhost:{BACKEND_PORT} (pid {backend_pid or 'n/a'})")
         print(f"Logs:    {UI_LOG} | {BACKEND_LOG}")
     else:
