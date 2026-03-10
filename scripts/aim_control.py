@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import http.client
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -182,10 +183,25 @@ def wait_for_port(port: int, *, host: str = "127.0.0.1", timeout: float = 20.0) 
     die(f"Timed out waiting for {host}:{port}")
 
 
-def open_browser(ui_port: int) -> None:
+def wsl_ip() -> str | None:
+    try:
+        output = subprocess.run(
+            ["hostname", "-I"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+    except OSError:
+        return None
+    for token in output.split():
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", token):
+            return token
+    return None
+
+
+def open_browser(url: str) -> None:
     if os.environ.get("AIM_NO_BROWSER") == "1":
         return
-    url = f"http://localhost:{ui_port}"
     subprocess.run(["cmd.exe", "/C", "start", "", url], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -383,10 +399,14 @@ def start_stack(ui_port: int) -> None:
     write_pid(UI_PID, ui_pid)
     UI_PORT_FILE.write_text(f"{ui_port}\n", encoding="utf-8")
     wait_for_port(ui_port)
-    open_browser(ui_port)
+    browser_url = f"http://127.0.0.1:{ui_port}"
+    wsl_url = f"http://{wsl_ip()}:{ui_port}" if wsl_ip() else None
+    open_browser(browser_url)
 
     print(f"Aim Solo started")
-    print(f"UI:      http://localhost:{ui_port}")
+    print(f"UI:      {browser_url}")
+    if wsl_url:
+        print(f"WSL IP:  {wsl_url}")
     print(f"API:     http://localhost:{BACKEND_PORT}")
     print(f"Logs:    {UI_LOG} | {BACKEND_LOG}")
 
@@ -398,8 +418,12 @@ def status() -> None:
     backend_running = pid_is_running(backend_pid)
     ui_running = pid_is_running(ui_pid)
     if backend_running or ui_running:
+        browser_url = f"http://127.0.0.1:{ui_port}"
+        wsl_url = f"http://{wsl_ip()}:{ui_port}" if wsl_ip() else None
         print("Aim Solo status: running")
-        print(f"UI:      {'up' if ui_running else 'down'} on http://localhost:{ui_port} (pid {ui_pid or 'n/a'})")
+        print(f"UI:      {'up' if ui_running else 'down'} on {browser_url} (pid {ui_pid or 'n/a'})")
+        if wsl_url:
+            print(f"WSL IP:  {wsl_url}")
         print(f"API:     {'up' if backend_running else 'down'} on http://localhost:{BACKEND_PORT} (pid {backend_pid or 'n/a'})")
         print(f"Logs:    {UI_LOG} | {BACKEND_LOG}")
     else:
