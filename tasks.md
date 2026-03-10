@@ -114,6 +114,24 @@ Last sync: 2026-03-09T00:00:00-07:00
 
 ## Design Intake Queue (New)
 
+## Planner-Owned Dispatch System Tasks
+
+- [todo] AUT-OPS-01 - Install and expose the canonical `autonomy` console script so operator/planner skills can use `autonomy ...` directly without repo-local module fallback.
+  - scope: `photo_auto_tagging` env/bootstrap and shell integration
+  - why: current working path is `python -m autonomy.cli ...`; this is operationally correct but not the polished control-plane contract.
+- [todo] AUT-OPS-02 - Define planner-owned task ingestion/update workflow from repo-local `tasks.md` and `CENTRAL/tasks.md` into the autonomy DB.
+  - scope: decomposition rules, ownership rules, promotion to `pending`, and when central vs autonomy DB is source of truth
+  - why: user should rarely create/update dispatch tasks manually; planner should do that work.
+- [todo] AUT-OPS-03 - Update autonomy skills and repo docs to reflect real bootstrap/install behavior and the `dispatcher` launcher path.
+  - scope: `autonomy-operator`, `autonomy-planner`, `autonomy-triage`, and `photo_auto_tagging/docs/autonomy_skills/*`
+  - why: current skill text assumes canonical `autonomy` CLI availability, but local bootstrap still depends on repo runtime setup.
+- [todo] AUT-OPS-04 - Add review/approval operating runbook for `pending_review`, failure triage, retry, and stale-review clearing.
+  - scope: approval cadence, rejection/reset rules, and required operator evidence on closeout
+  - why: dispatcher runtime without a crisp review workflow will accumulate stale review debt.
+- [todo] AUT-OPS-05 - Decide and document source-of-truth migration from repo `tasks.md` boards to autonomy DB-backed planning.
+  - scope: migration phases, mirror rules, drift resolution, and rollback path
+  - why: planner currently tracks work in markdown boards; autonomy should eventually become the primary execution surface.
+
 ### Intake 2026-02-28: `video_queue_auto_prompt_design.md`
 - Source: `/home/cobra/photo_auto_tagging/docs/video_queue_auto_prompt_design.md`
 - Primary target repo: `video_queue` (`/home/cobra/video_queue`)
