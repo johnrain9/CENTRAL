@@ -1,9 +1,9 @@
 # Portfolio Management Improvements
 
 ## Operating Model (Recommended)
-- Keep repo-local `tasks.md` as execution source of truth.
-- Use `/home/cobra/CENTRAL/tasks.md` as the portfolio mirror and planning board.
-- Run a short sync at start/end of each work block to import status changes.
+- Use `CENTRAL/tasks/<TASK_ID>.md` as the canonical planner-owned task record.
+- Use `/home/cobra/CENTRAL/tasks.md` as the portfolio summary and quick status board.
+- Treat repo-local task boards as optional mirrors or repo-specific intake during migration.
 
 ## Cadence
 - Daily (5-10 min): refresh central board, identify blockers, pick max 1 `in_progress` per repo.
@@ -25,12 +25,12 @@ Use total score to order dispatch candidates.
 - Cross-repo dependencies should be explicit: `depends_on: repo/task-id`.
 
 ## Dispatch Contract
-- Planner dispatch: `repo=<repo_name> do task <task_id>`.
+- Planner dispatch: `repo=CENTRAL do task <task_id>` for planner-owned canonical tasks.
 - Worker closeout: `<task_id> | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>`.
-- Worker must update target repo `tasks.md` status before closeout.
+- Worker reads `CENTRAL/tasks/<TASK_ID>.md` first and uses `Target Repo` to determine where implementation changes belong.
 - Default to one task per worker at a time.
 - Treat ordered task lists as planner sequencing, not as a worker queue, unless the worker explicitly supports queued execution.
-- For repo-local boards that already encode dependencies, rely on those dependencies instead of giving workers broad multi-task bundles.
+- Use repo-local boards only when extra local roadmap context is needed.
 
 ## Worker Handoff Template
 Use this preamble when dispatching:
@@ -38,8 +38,9 @@ Use this preamble when dispatching:
 ```text
 repo=<repo_name> do task <task_id>
 
-Read <repo>/tasks.md and execute only that task.
-Before closeout, update the task status and relevant acceptance/testing checkboxes in tasks.md.
+Read /home/cobra/CENTRAL/tasks/<TASK_ID>.md and execute only that task.
+Use `Target Repo` from the canonical task file for implementation changes.
+Before closeout, update CENTRAL first, then any repo-local mirror if still maintained.
 Close out with:
 <task_id> | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 ```

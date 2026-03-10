@@ -12,5 +12,6 @@ Core docs:
 Ownership rules:
 
 - `CENTRAL` is the long-term source of truth for autonomy runbooks and skill-facing docs.
+- `CENTRAL/tasks/<TASK_ID>.md` is the canonical authored task body for planner-owned work.
 - `/home/cobra/.codex/skills/autonomy-*` should reference these docs.
 - `/home/cobra/photo_auto_tagging/docs/autonomy_skills/` is implementation-local only and should remain minimal.

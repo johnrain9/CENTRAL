@@ -3,7 +3,7 @@
 Purpose:
 
 - Turn planning intent into executable autonomy tasks with explicit dependencies.
-- Keep autonomy DB as the execution surface while markdown remains intake and mirror state during migration.
+- Keep `CENTRAL/tasks/<TASK_ID>.md` as the authored source of truth while autonomy DB remains the execution surface during migration.
 
 Bootstrap contract:
 
@@ -17,7 +17,7 @@ Deterministic responsibilities:
 - Create tasks with clear prompt bodies, repo roots, and validation notes.
 - Keep transitions explicit from `draft` to `pending`.
 - Maintain dependency edges.
-- Mirror status changes back to repo boards and `CENTRAL/tasks.md`.
+- Update the canonical CENTRAL task first, then mirror summary changes to `tasks.md` and any repo-local board if needed.
 
 Command dependencies:
 
@@ -34,12 +34,16 @@ Command dependencies:
 
 Workflow:
 
-1. Capture work from repo-local boards or `CENTRAL/tasks.md`.
-2. Draft the task in memory.
+1. Author or refine the task in `CENTRAL/tasks/<TASK_ID>.md`.
+2. Draft the autonomy prompt body from that canonical task.
 3. Create or update it in autonomy DB.
 4. Set dependencies before promotion.
 5. Promote only runnable tasks to `pending`.
-6. Mirror the result back to markdown after execution or review.
+6. Reconcile execution outcome back into the canonical CENTRAL task, then update summary or mirror surfaces.
+
+Task reference rule:
+
+- When a planner-owned task has a stable CENTRAL ID, use that ID in notes and open the canonical file before consulting repo-local boards.
 
 References:
 

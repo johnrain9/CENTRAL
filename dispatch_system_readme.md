@@ -129,7 +129,7 @@ These are the relevant skills for dispatch-system support:
 - `autonomy-triage`
   - inspect failures, retries, stale reviews, approve/reject paths
 - `multi-repo-planner`
-  - keep the central board and cross-repo priorities aligned while markdown remains a mirror during migration
+  - keep canonical CENTRAL tasks, repo targeting, and cross-repo priorities aligned during migration
 
 ## Canonical Docs
 
@@ -144,15 +144,16 @@ Canonical autonomy operator/planner/triage docs now live in `CENTRAL`:
 
 ## Planner-Owned Ingestion Workflow
 
-The planner, not the user, owns turning board items into autonomy tasks.
+The planner, not the user, owns turning canonical CENTRAL tasks into autonomy tasks.
 
 Working sequence:
 
-1. Capture intent from repo-local `tasks.md` or `CENTRAL/tasks.md`.
-2. Create or update the autonomy DB task with explicit repo root, prompt body, and validation notes.
-3. Set dependency edges before promotion.
-4. Promote the task to `pending` only when it is runnable without more user clarification.
-5. After worker completion or review outcome, mirror the final state back to markdown tracking.
+1. Author or update the canonical task in `CENTRAL/tasks/<TASK_ID>.md`.
+2. Read `Target Repo`, acceptance, and testing directly from the canonical CENTRAL task.
+3. Create or update the autonomy DB task with explicit repo root, prompt body, and validation notes derived from that task.
+4. Set dependency edges before promotion.
+5. Promote the task to `pending` only when it is runnable without more user clarification.
+6. After worker completion or review outcome, update the canonical CENTRAL task first, then any summary or repo-local mirror.
 
 Canonical commands:
 
@@ -169,14 +170,15 @@ Ownership rules:
 
 - Planner owns task creation, prompt refinement, dependency maintenance, and promotion to `pending`.
 - Worker owns implementation plus closeout evidence: tests run, commit/ref, and blocker statement if blocked.
-- Planner owns markdown mirror updates in repo boards and [`tasks.md`](/home/cobra/CENTRAL/tasks.md) after autonomy state changes.
+- Planner owns updates to canonical CENTRAL task files, then summary/mirror updates in [`tasks.md`](/home/cobra/CENTRAL/tasks.md) and any repo-local boards after autonomy state changes.
 - User should only need to request work or ask for status; the planner performs the bookkeeping.
 
 Source roles during the transition:
 
-- Repo-local markdown boards: backlog intake and human-readable repo roadmap
+- `CENTRAL/tasks/<TASK_ID>.md`: canonical planner-owned task definition and closeout record
 - autonomy DB: dispatchable execution state, dependencies, retries, approvals
-- `CENTRAL/tasks.md`: cross-repo mirror and portfolio summary
+- `CENTRAL/tasks.md`: summary index and portfolio view
+- repo-local markdown boards: optional mirrors, local intake, or repo-specific roadmap context
 
 ## Planner Rule
 
@@ -185,9 +187,9 @@ The user should rarely have to create or update dispatch tasks manually.
 Planner responsibility:
 
 - add and update support tasks
-- keep central tracking current
+- keep canonical CENTRAL task records current
 - convert planning intent into dispatchable tasks
-- decide when a task belongs in central tracking vs the autonomy DB
+- decide when a task belongs in CENTRAL canonical tracking vs the autonomy DB
 
 User responsibility:
 
@@ -234,31 +236,32 @@ Stale-review clearing rhythm:
 
 ## Source-Of-Truth Migration
 
-Phase 0: bootstrap
+Phase 0: canonical authoring bootstrap
 
-- Markdown boards remain authoritative for backlog discovery.
-- autonomy DB is authoritative only for tasks already created there.
-- Planner must mirror important state changes both ways.
+- Planner-owned tasks are authored in `CENTRAL/tasks/`.
+- autonomy DB is authoritative for runtime execution state after a canonical task is ingested there.
+- Repo boards may still provide intake and mirror context where migration is incomplete.
 
 Phase 1: planner-owned execution
 
-- New dispatchable work is created in autonomy first.
-- Repo boards remain a summarized mirror for humans and repo-specific planning notes.
-- `CENTRAL/tasks.md` mirrors cross-repo status, not low-level dependency state.
+- New dispatchable planner-owned work starts from a canonical CENTRAL task file.
+- autonomy DB mirrors that task into runnable state and review workflow.
+- Repo boards remain summarized mirrors for humans and repo-specific notes.
 
-Phase 2: autonomy-primary
+Phase 2: CENTRAL-authored, autonomy-executed steady state
 
-- autonomy DB becomes the system of record for active and queued execution work.
-- Markdown boards keep only high-level milestones, imported backlog summaries, or archived snapshots.
+- `CENTRAL/tasks/` remains the authored source of truth for planner-owned work.
+- autonomy DB remains the execution-state system of record.
+- Repo boards keep only local roadmap notes, optional mirrors, or archived snapshots.
 
 Drift resolution:
 
-- If autonomy and markdown disagree, follow the authoritative source for the current phase.
+- If autonomy and markdown disagree, keep authored task content in `CENTRAL/tasks/` and runtime state in autonomy aligned according to the current phase.
 - Planner fixes the non-authoritative surface in the same work session that discovers drift.
 - Do not resolve drift by editing SQLite directly.
 
 Rollback:
 
 - Stop creating new DB-only tasks.
-- Reassert repo markdown boards and `CENTRAL/tasks.md` as the planning source.
-- Export active autonomy tasks into markdown until tooling gaps are addressed.
+- Continue authoring planner-owned tasks in `CENTRAL/tasks/`.
+- Export active autonomy state back into CENTRAL canonical tasks and summary records until tooling gaps are addressed.

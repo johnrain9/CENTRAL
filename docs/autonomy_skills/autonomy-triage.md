@@ -17,6 +17,7 @@ Deterministic responsibilities:
 - Inspect worker artifacts and logs.
 - Pull failure context from reports and task state.
 - Keep manual decisions auditable with explicit commands and notes.
+- Use the canonical CENTRAL task file to verify intended scope and acceptance for planner-owned work.
 
 Command dependencies:
 
@@ -37,6 +38,10 @@ Decision rules:
 - Reset for transient runtime or environment failures before a clean rerun.
 - Retry only when the previous run provides enough evidence to justify another attempt.
 - Leave blocked when dependencies or external inputs still prevent progress.
+
+Task reference rule:
+
+- If the run maps to a planner-owned CENTRAL task, review `CENTRAL/tasks/<TASK_ID>.md` before approving, rejecting, or resetting so the decision stays anchored to the authored contract.
 
 References:
 

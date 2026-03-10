@@ -20,6 +20,7 @@ Deterministic responsibilities:
 - Inspect active runs and tail logs.
 - Surface completion, failure, and review-aging pressure.
 - Hand off approval and rejection decisions to explicit task commands.
+- When task context is needed for planner-owned work, open the canonical `CENTRAL/tasks/<TASK_ID>.md` record first.
 
 Command dependencies:
 
@@ -44,6 +45,10 @@ Daily rhythm:
 3. Run one cycle or start the daemon.
 4. Monitor workers and logs.
 5. Review `pending_review` aging before ending the session.
+
+Task reference rule:
+
+- Treat autonomy task state as runtime truth, but use the matching CENTRAL task file as the authored scope and acceptance reference for planner-owned tasks.
 
 References:
 

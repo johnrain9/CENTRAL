@@ -32,7 +32,7 @@ CENTRAL-OPS-01 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 - Primary repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Define the canonical task format and on-disk layout for all future planner-owned work in `CENTRAL`.
@@ -79,6 +79,13 @@ CENTRAL-OPS-01 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 ## Notes
 - This is the hard gate for the rest of the migration.
 - Do not implement the whole migration here; define the contract cleanly first.
+- Chosen layout:
+  - [`tasks.md`](/home/cobra/CENTRAL/tasks.md) remains the summary index
+  - [`tasks/CENTRAL-OPS-01.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-01.md) demonstrates the canonical per-task file format
+- Canonical schema doc:
+  - [`docs/central_task_system.md`](/home/cobra/CENTRAL/docs/central_task_system.md)
+- Reusable template:
+  - [`tasks/TASK_TEMPLATE.md`](/home/cobra/CENTRAL/tasks/TASK_TEMPLATE.md)
 
 ---
 
@@ -89,7 +96,7 @@ CENTRAL-OPS-01 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 - Secondary repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Update planner/operator skills and central docs so they reflect `CENTRAL` as the canonical task system.
@@ -120,6 +127,12 @@ python3 /home/cobra/.codex/skills/.system/skill-creator/scripts/quick_validate.p
 ## Notes
 - This task is a docs/skill-contract change, not dispatcher implementation.
 - Keep the wording explicit enough that future sessions behave correctly.
+- Completed in:
+  - [`tasks/CENTRAL-OPS-02.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-02.md)
+  - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md)
+  - [`docs/autonomy_skills/autonomy-planner.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-planner.md)
+  - [`docs/autonomy_skills/autonomy-operator.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-operator.md)
+  - [`docs/autonomy_skills/autonomy-triage.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-triage.md)
 
 ---
 
@@ -321,3 +334,46 @@ python -m autonomy.cli task list --json --status pending
 
 ## Notes
 - This is the final migration/cleanup task, not the first one to dispatch.
+
+---
+
+## Task CENTRAL-OPS-08: Harden canonical task schema for machine parsing, prioritization, and DB extensibility
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `todo`
+
+## Objective
+- Refine the canonical CENTRAL task schema so it is both human-maintainable and reliably machine-ingestable for the future CENTRAL-to-autonomy bridge and SQLite-backed runtime state.
+
+## Context
+- `CENTRAL-OPS-01` froze the first canonical human-readable schema.
+- That schema still needs hardening for automatic ingestion, dispatch ordering, explicit ownership semantics, and extensible mapping into runtime storage.
+- Runtime execution state is expected to live in the autonomy system, likely backed by SQLite, while authored planner truth remains in `CENTRAL`.
+
+## Deliverables
+1. Define a strict machine-readable metadata contract for canonical task files.
+2. Clarify `Planner Owner` and `Worker Owner` semantics and allowed values.
+3. Add canonical fields for priority/dispatch ordering and timestamps.
+4. Decide whether additional review or reconciliation lifecycle states are required.
+5. Document how canonical task metadata maps into runtime/autonomy DB fields and how optional future fields extend safely.
+6. Update the reusable task template accordingly.
+
+## Acceptance Criteria
+1. A bridge implementation can parse canonical metadata without ad hoc markdown heuristics.
+2. Dispatch order can be derived from task metadata rather than file ordering.
+3. Ownership semantics are explicit enough that planner assignment and worker assignment cannot be confused.
+4. The schema can grow without breaking existing task files.
+
+## Testing
+- Manual review of `docs/central_task_system.md`.
+- Manual review of `tasks/TASK_TEMPLATE.md`.
+- Demonstrate at least one canonical task instance matches the hardened schema.
+
+## Notes
+- This is a schema-hardening task, not the bridge implementation itself.
+- The resulting contract should feed directly into `CENTRAL-OPS-03` and `CENTRAL-OPS-04`.
+- Canonical file:
+  - [`tasks/CENTRAL-OPS-08.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-08.md)
