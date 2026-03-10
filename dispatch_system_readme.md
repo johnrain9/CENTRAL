@@ -131,6 +131,17 @@ These are the relevant skills for dispatch-system support:
 - `multi-repo-planner`
   - keep the central board and cross-repo priorities aligned while markdown remains a mirror during migration
 
+## Canonical Docs
+
+Canonical autonomy operator/planner/triage docs now live in `CENTRAL`:
+
+- [`docs/autonomy_skills/README.md`](/home/cobra/CENTRAL/docs/autonomy_skills/README.md)
+- [`docs/autonomy_skills/autonomy-operator.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-operator.md)
+- [`docs/autonomy_skills/autonomy-planner.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-planner.md)
+- [`docs/autonomy_skills/autonomy-triage.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-triage.md)
+
+`/home/cobra/photo_auto_tagging/docs/autonomy_skills/` is now implementation-local and should only keep stubs or code-adjacent notes.
+
 ## Planner-Owned Ingestion Workflow
 
 The planner, not the user, owns turning board items into autonomy tasks.

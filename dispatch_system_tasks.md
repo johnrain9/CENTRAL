@@ -290,7 +290,7 @@ python -m autonomy.cli worker list --json --profile default
 - Secondary repo: `/home/cobra/.codex/skills`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Re-home autonomy operator/planner/triage documentation so `CENTRAL` is the canonical location and `photo_auto_tagging` no longer carries the long-term source of truth for dispatch-system docs.
@@ -326,4 +326,9 @@ git -C /home/cobra/photo_auto_tagging diff --stat
 ## Notes
 - This is a documentation ownership cleanup task, not a runtime-code change.
 - Keep implementation docs near code only when they are truly implementation-local; move operator/planner truth to `CENTRAL`.
-- Completed in [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md) under `Source-Of-Truth Migration`.
+- Completed in:
+  - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md)
+  - [`docs/autonomy_skills/README.md`](/home/cobra/CENTRAL/docs/autonomy_skills/README.md)
+  - [`docs/autonomy_skills/autonomy-operator.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-operator.md)
+  - [`docs/autonomy_skills/autonomy-planner.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-planner.md)
+  - [`docs/autonomy_skills/autonomy-triage.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-triage.md)
