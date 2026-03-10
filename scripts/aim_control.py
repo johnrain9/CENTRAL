@@ -4,14 +4,12 @@
 from __future__ import annotations
 
 import http.client
-import importlib.util
 import os
 import signal
 import socket
 import subprocess
 import sys
 import time
-from argparse import ArgumentParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterable
@@ -129,6 +127,50 @@ def kill_pid(pid: int | None, *, label: str) -> None:
         return
 
 
+def command_for_pid(pid: int) -> str:
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "args="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def listener_pids(port: int) -> list[int]:
+    result = subprocess.run(
+        ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode not in {0, 1}:
+        return []
+    pids: list[int] = []
+    for raw in result.stdout.splitlines():
+        raw = raw.strip()
+        if raw.isdigit():
+            pids.append(int(raw))
+    return pids
+
+
+def is_aim_backend_process(command: str) -> bool:
+    return "uvicorn api.app:app" in command and str(REPO_DIR) in command
+
+
+def is_aim_ui_process(command: str) -> bool:
+    return "aim_control.py __serve_ui" in command
+
+
+def stop_port_listeners(port: int, matcher) -> None:
+    for pid in listener_pids(port):
+        command = command_for_pid(pid)
+        if matcher(command):
+            kill_pid(pid, label=f"port {port}")
+
+
 def wait_for_port(port: int, *, host: str = "127.0.0.1", timeout: float = 20.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -152,6 +194,8 @@ def stop_stack(*, quiet: bool = False) -> None:
     ui_pid = read_pid(UI_PID)
     kill_pid(ui_pid, label="UI")
     kill_pid(backend_pid, label="backend")
+    stop_port_listeners(BACKEND_PORT, is_aim_backend_process)
+    stop_port_listeners(read_ui_port(), is_aim_ui_process)
     for path in (BACKEND_PID, UI_PID, UI_PORT_FILE):
         path.unlink(missing_ok=True)
     if not quiet:
