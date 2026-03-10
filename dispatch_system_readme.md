@@ -77,6 +77,12 @@ python -m autonomy.cli dispatch status --profile default
 python -m autonomy.cli task eligible --json --profile default
 ```
 
+CENTRAL bridge flow:
+
+```bash
+autonomy central sync --central-root /home/cobra/CENTRAL --profile default
+```
+
 ## Shell Entry Point
 
 The preferred shell command is `dispatcher`, provided by `~/.zshrc`.

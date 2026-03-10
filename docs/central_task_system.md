@@ -1,169 +1,134 @@
 # CENTRAL Canonical Task System
 
-This document defines the canonical CENTRAL task model: storage layout, required fields, lifecycle and status rules, dependency encoding, dispatch and closeout contract, validation rules, and naming and index rules.
+This document defines the target canonical CENTRAL task model for scalable planning and dispatch.
 
-## Canonical Layout
+## Direction
 
-Use a hybrid layout:
+The long-term canonical source of truth is not markdown.
 
-- [`tasks.md`](/home/cobra/CENTRAL/tasks.md): human-readable index, portfolio summary, and quick status board
-- `tasks/<TASK_ID>.md`: canonical self-contained task body
-- task packet files such as [`central_task_system_tasks.md`](/home/cobra/CENTRAL/central_task_system_tasks.md): temporary bootstrap/context packs only, not long-term source of truth
+Target model:
 
-Why this layout:
+- `CENTRAL` owns canonical task truth
+- canonical task truth lives in a CENTRAL-managed SQLite database
+- dispatcher and planner tooling operate against structured task records
+- markdown surfaces are optional exports, summaries, templates, or migration aids only
 
-- one large file does not scale across repos
-- per-task files give workers a stable dispatch target
-- `tasks.md` remains fast to scan for portfolio status and prioritization
+Why this direction:
+
+- hundreds or thousands of tasks require indexed querying, not file scanning
+- multiple planner AIs and multiple workers need safe concurrent updates
+- dependency traversal, prioritization, retry state, review queues, and assignment state belong in structured storage
+- runtime and planning metadata must be queryable without markdown scraping heuristics
+
+## Transitional State
+
+The current repo contains markdown task files and summary boards because they were the bootstrap path.
+
+Those surfaces should be treated as one of:
+
+- migration scaffolding
+- generated summaries
+- human-readable exports
+- temporary task-definition surfaces until DB-native authoring lands
+
+They are not the desired end-state source of truth.
+
+## Canonical Target Model
+
+Canonical task records should live in a SQLite database managed under `CENTRAL`.
+
+Suggested storage split:
+
+- SQLite DB: canonical task definitions, dependencies, assignment, lifecycle, timestamps, and history pointers
+- generated summaries: high-level human-readable portfolio views
+- optional markdown exports: task snapshots or worker handoff views when useful
+
+## Required Task Record Fields
+
+Minimum canonical task fields:
+
+- `task_id`
+- `title`
+- `status`
+- `target_repo`
+- `task_type`
+- `priority`
+- `planner_owner`
+- `worker_owner`
+- `summary`
+- `objective`
+- `context`
+- `scope_boundaries`
+- `deliverables`
+- `acceptance`
+- `testing`
+- `dispatch_contract`
+- `closeout_contract`
+- `created_at`
+- `updated_at`
+- `closed_at`
+- `metadata_json`
+
+Dependency and execution settings should be normalized into related tables or structured JSON depending on final schema design.
+
+## Scalability Requirements
+
+The canonical task system must support:
+
+- multiple planner AIs updating task state safely
+- multiple workers claiming and executing tasks concurrently
+- dependency-aware eligibility queries
+- priority-based dispatch ordering
+- auditable closeout and retry history
+- generated summary views without making those views canonical
+
+Design for the operating assumption that throughput will increase by 5-10x once multi-worker dispatch is active.
 
 ## Source Of Truth
 
-- For planner-owned canonical tasks, `tasks/<TASK_ID>.md` is the source of truth.
-- [`tasks.md`](/home/cobra/CENTRAL/tasks.md) is the summary index and portfolio surface, not the canonical body.
-- Repo-local boards are mirrors or local intake only once a task has a canonical file in `CENTRAL`.
-- If `CENTRAL` and a repo-local board disagree for a canonical task, `CENTRAL` wins and the planner reconciles the mirror.
+Target source of truth:
 
-## Required Fields
+- CENTRAL SQLite DB for planner-owned task definition and planner lifecycle state
 
-Every canonical task file under `tasks/` must include these sections:
+Non-canonical surfaces:
 
-- `Task Metadata`
-- `Objective`
-- `Context`
-- `Scope Boundaries`
-- `Deliverables`
-- `Acceptance`
-- `Testing`
-- `Dependencies`
-- `Dispatch Contract`
-- `Closeout Contract`
-- `Repo Reconciliation`
-- `Validation Rules`
+- generated `tasks.md`
+- exported markdown task cards
+- repo-local mirrors or intake notes
 
-`Task Metadata` must include:
+If any generated surface disagrees with the DB, the DB wins.
 
-- `Task ID`
-- `Status`
-- `Target Repo`
-- `Task Type`
-- `Planner Owner`
-- `Worker Owner`
-- `Source Of Truth`
-- `Summary Record`
+## Dispatcher Model
 
-Allowed `Status` values:
+Target model:
 
-- `todo`
-- `in_progress`
-- `blocked`
-- `done`
+- planner creates and updates canonical tasks in CENTRAL DB
+- dispatcher reads eligible work from structured task records, directly or through the autonomy runtime
+- workers execute against the `target_repo` recorded on the task
+- planner reconciles worker outcomes back into canonical DB state
 
-Status meanings:
+Do not design around markdown file discovery as the steady-state runtime model.
 
-- `todo`: defined and not actively being worked
-- `in_progress`: a worker or planner is actively executing it
-- `blocked`: cannot make useful progress because of one concrete blocker
-- `done`: acceptance is met and closeout is recorded
+## Relationship To Autonomy
 
-## Edit Policy
+Autonomy may remain the execution engine, but the planning contract must scale.
 
-- Canonical task files are editable in place by the planner or coordinator.
-- The task body is not append-only.
-- Closeout evidence belongs in `Closeout Contract` and any later execution-history section if added by convention.
-- Material status, dependency, or scope updates should update the canonical file first and then the summary index.
+Valid end states include:
 
-## Dependency Encoding
+- autonomy runtime backed directly by CENTRAL DB
+- a one-way or two-way sync between CENTRAL DB and autonomy runtime DB
+- a unified DB with planner/runtime role separation
 
-- Dependencies are represented as a flat markdown list of task IDs under `Dependencies`.
-- Each entry should use the stable canonical ID, for example `CENTRAL-OPS-01` or `AUT-OPS-06`.
-- If a dependency is external to the canonical task system, name the concrete artifact or repo-local task ID explicitly.
-- A task is eligible only when all listed dependencies are done.
+The specific integration choice must preserve CENTRAL-owned planning authority while avoiding markdown as the canonical storage layer.
 
-## Index Rules
+## Migration Principle
 
-`tasks.md` is the summary index, not the canonical task body.
+Migration work should move from:
 
-For each planner-owned canonical task tracked there:
+- markdown-authored canonical tasks
 
-- keep the task ID and status in the summary list
-- add a link to the canonical file when the task is migrated to the new format
-- keep short scope/why lines in the index
-- do not duplicate the full task body in `tasks.md`
+to:
 
-## Dispatch Contract
+- DB-authored canonical tasks with generated markdown only where helpful
 
-Workers should be able to execute a task from the canonical file alone.
-
-Dispatch shape:
-
-```text
-repo=CENTRAL do task CENTRAL-OPS-01
-```
-
-Execution rule:
-
-- the dispatch prompt references the task ID from `CENTRAL`
-- the worker opens `CENTRAL/tasks/<TASK_ID>.md`
-- `Target Repo` inside that file tells the worker where implementation work belongs
-
-## Closeout Contract
-
-Required closeout line:
-
-```text
-<TASK_ID> | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
-```
-
-Closeout requirements:
-
-- `done` requires tests or a concrete manual-review result
-- `blocked` requires exactly one concrete unblocker statement
-- `ref` must include a branch, commit, file path, or equivalent implementation reference
-- planner reconciles the canonical file and summary index after closeout
-
-## Validation Rules
-
-- filename must exactly match `Task ID`
-- `Status` must be one of `todo`, `in_progress`, `blocked`, `done`
-- `Target Repo` must be an absolute path or a canonical repo name that resolves unambiguously
-- all required sections must exist
-- `Summary Record` must point to the summary index
-- every dependency entry must use a stable task identifier or explicit external artifact reference
-
-## Dispatcher Discovery
-
-- The dispatcher does not discover work from repo-local boards in the canonical model.
-- The future CENTRAL-to-autonomy bridge reads canonical task files in `CENTRAL/tasks/`.
-- Discovery should consider only tasks whose canonical `Status` is `todo` and whose dependencies are satisfied.
-- [`tasks.md`](/home/cobra/CENTRAL/tasks.md) is not the source for eligibility decisions; it is the human-readable index.
-
-## Repo Reconciliation
-
-- For canonical tasks, CENTRAL status is authoritative.
-- Repo-local boards may keep a mirrored summary entry for humans working inside a target repo.
-- When implementation reality changes first in the target repo, the planner updates the canonical CENTRAL task before updating any mirror.
-- Reconciliation must happen in the same work session that discovers drift.
-
-## File Naming
-
-- one task per file
-- filename must exactly match the task ID, for example `CENTRAL-OPS-01.md`
-- task IDs remain stable even if the title changes
-
-## Relationship To Repo-Local Boards
-
-- During migration, repo-local boards may still exist as mirrors or local intake.
-- Canonical planner-owned execution tasks live in `CENTRAL/tasks/`.
-- Repo-local boards should not be required to understand the full task body once a task is canonicalized in `CENTRAL`.
-
-## Example
-
-Canonical example task:
-
-- [`tasks/CENTRAL-OPS-01.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-01.md)
-
-Reusable template:
-
-- [`tasks/TASK_TEMPLATE.md`](/home/cobra/CENTRAL/tasks/TASK_TEMPLATE.md)
-
-The example task demonstrates the schema in a real instance. The template is the reusable starting point for future canonical tasks.
+Do not deepen investment in markdown-first task ingestion beyond what is needed to bridge the transition.

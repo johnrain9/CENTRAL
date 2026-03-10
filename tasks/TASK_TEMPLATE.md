@@ -11,6 +11,16 @@
 - `Source Of Truth`: this file
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
+## Execution Settings
+
+- `Priority`: `<1-100>`
+- `Task Kind`: `<read_only|mutating>`
+- `Sandbox Mode`: `<workspace-write|danger-full-access|read-only|none>`
+- `Approval Policy`: `<never|on-request|on-failure>`
+- `Additional Writable Dirs`: `[]`
+- `Timeout Seconds`: `1800`
+- `Approval Required`: `false`
+
 ## Objective
 
 <one-paragraph desired outcome>

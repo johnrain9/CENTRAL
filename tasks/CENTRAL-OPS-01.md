@@ -12,6 +12,16 @@
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 - `Bootstrap Packet`: [`central_task_system_tasks.md`](/home/cobra/CENTRAL/central_task_system_tasks.md)
 
+## Execution Settings
+
+- `Priority`: `10`
+- `Task Kind`: `read_only`
+- `Sandbox Mode`: `workspace-write`
+- `Approval Policy`: `never`
+- `Additional Writable Dirs`: `[]`
+- `Timeout Seconds`: `1800`
+- `Approval Required`: `false`
+
 ## Objective
 
 Define the canonical task format and on-disk layout for all future planner-owned work in `CENTRAL`.

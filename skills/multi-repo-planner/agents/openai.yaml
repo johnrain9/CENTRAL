@@ -1,4 +1,4 @@
 interface:
   display_name: "Multi Repo Planner"
-  short_description: "Coordinate Txx tasks across active repos with status discipline."
-  default_prompt: "Plan and dispatch Txx tasks across repositories, then enforce tasks.md status updates after worker completion."
+  short_description: "Coordinate canonical CENTRAL tasks across active repos with status discipline."
+  default_prompt: "Plan and dispatch canonical CENTRAL tasks across repositories, then update CENTRAL first and any repo-local mirrors second after worker completion."

@@ -81,12 +81,13 @@ Rationale:
 - `TASK-PLAT-01` removes the active WSL2/PowerShell planner friction as soon as the coaching chain is stabilized.
 
 ## Dispatch Guidance For This Repo
-- Use repo-local `TASKS.md` as source of truth.
-- Worker should update `TASKS.md` before closeout.
+- For planner-owned work, use the canonical CENTRAL task file as source of truth.
+- `TASKS.md` is optional repo-local roadmap context for this repo.
+- If a planner-owned task is mirrored locally, update CENTRAL first and `TASKS.md` second.
 - Preferred dispatch format:
 
 ```text
-repo=aimSoloAnalysis do task TASK-P0-10
+repo=CENTRAL do task TASK-P0-10
 ```
 
 - Preferred closeout format:

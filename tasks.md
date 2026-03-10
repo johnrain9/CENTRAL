@@ -145,14 +145,32 @@ Last sync: 2026-03-09T00:00:00-07:00
 - [done] CENTRAL-OPS-02 - Update planner skills and dispatch contracts for CENTRAL-as-source-of-truth.
   - canonical file: [tasks/CENTRAL-OPS-02.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-02.md)
   - skill/docs surfaces: `multi-repo-planner`, `autonomy-planner`, `autonomy-operator`, `autonomy-triage`, and CENTRAL autonomy runbooks
-- [todo] CENTRAL-OPS-03 - Re-root dispatcher operating model to CENTRAL-owned tasks and repo-targeted execution.
-- [todo] CENTRAL-OPS-04 - Implement CENTRAL-to-autonomy task ingestion bridge.
+- [done] CENTRAL-OPS-03 - Re-root dispatcher operating model to CENTRAL-owned tasks and repo-targeted execution.
+  - canonical file: [tasks/CENTRAL-OPS-03.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-03.md)
+  - integration model: [docs/central_autonomy_integration.md](/home/cobra/CENTRAL/docs/central_autonomy_integration.md)
+  - note: completed under markdown-first assumptions; now partially superseded by DB-canonical scaling work.
+- [done] CENTRAL-OPS-04 - Implement CENTRAL-to-autonomy task ingestion bridge.
+  - canonical file: [tasks/CENTRAL-OPS-04.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-04.md)
+  - bridge command: `autonomy central sync --central-root /home/cobra/CENTRAL`
+  - note: completed as a transitional markdown bridge; long-term direction is DB-canonical.
 - [todo] CENTRAL-OPS-05 - Migrate planner-owned active work into canonical CENTRAL task format.
 - [todo] CENTRAL-OPS-06 - Define planner-owned closeout and reconciliation workflow.
 - [todo] CENTRAL-OPS-07 - Retire repo-local boards as execution truth.
 - [todo] CENTRAL-OPS-08 - Harden canonical task schema for machine parsing, prioritization, and DB extensibility.
   - canonical file: [tasks/CENTRAL-OPS-08.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-08.md)
   - why: the current human-readable schema needs a strict machine-ingestion contract before the CENTRAL-to-autonomy bridge lands.
+- [todo] CENTRAL-OPS-09 - Redesign CENTRAL canonical task system around SQLite as source of truth.
+  - canonical file: [tasks/CENTRAL-OPS-09.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-09.md)
+  - why: planning truth must scale to hundreds of tasks and multiple planners without markdown as the canonical store.
+- [todo] CENTRAL-OPS-10 - Define multi-planner and multi-worker concurrency model for dispatcher scale.
+  - canonical file: [tasks/CENTRAL-OPS-10.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-10.md)
+  - why: 4+ concurrent workers and multiple planners need explicit claim, assignment, and reconciliation rules.
+- [todo] CENTRAL-OPS-11 - Design DB-native CENTRAL/autonomy integration and retire markdown-first bridge assumptions.
+  - canonical file: [tasks/CENTRAL-OPS-11.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-11.md)
+  - why: current sync logic is transitional and should not define the long-term runtime architecture.
+- [todo] CENTRAL-OPS-12 - Define generated views and operator surfaces for DB-canonical task management.
+  - canonical file: [tasks/CENTRAL-OPS-12.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-12.md)
+  - why: once DB is canonical, summaries, exports, and dashboards must be generated rather than hand-maintained.
 - Canonical task packet: [central_task_system_tasks.md](/home/cobra/CENTRAL/central_task_system_tasks.md)
 
 ### Intake 2026-02-28: `video_queue_auto_prompt_design.md`
