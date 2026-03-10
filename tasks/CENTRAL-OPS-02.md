@@ -8,7 +8,7 @@
 - `Task Type`: `migration`
 - `Planner Owner`: `planner/coordinator`
 - `Worker Owner`: `planner/coordinator`
-- `Source Of Truth`: this file
+- `Source Of Truth`: historical bootstrap snapshot only; DB-canonical model now supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 - `Bootstrap Packet`: [`central_task_system_tasks.md`](/home/cobra/CENTRAL/central_task_system_tasks.md)
 
@@ -55,7 +55,7 @@ Update planner/operator skills and CENTRAL runbooks so planner-owned tasks are a
 ## Dispatch Contract
 
 - Dispatch from `CENTRAL` using `repo=CENTRAL do task CENTRAL-OPS-02`.
-- Read this file as the canonical task body.
+- Read this file as a bootstrap task snapshot for historical context.
 - Apply implementation/doc changes in the skill repo and CENTRAL docs referenced here.
 
 ## Closeout Contract

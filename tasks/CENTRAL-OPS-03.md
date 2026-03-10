@@ -8,7 +8,7 @@
 - `Task Type`: `planning`
 - `Planner Owner`: `planner/coordinator`
 - `Worker Owner`: `planner/coordinator`
-- `Source Of Truth`: this file
+- `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 - `Bootstrap Packet`: [`central_task_system_tasks.md`](/home/cobra/CENTRAL/central_task_system_tasks.md)
 
@@ -62,7 +62,7 @@ Define how the dispatcher and autonomy task system consume `CENTRAL`-owned task 
 ## Dispatch Contract
 
 - Dispatch from `CENTRAL` using `repo=CENTRAL do task CENTRAL-OPS-03`.
-- This file is the canonical task body.
+- This file is a transitional bootstrap task snapshot for the DB-native integration redesign.
 
 ## Closeout Contract
 

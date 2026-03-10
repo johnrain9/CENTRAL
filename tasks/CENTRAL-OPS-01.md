@@ -8,7 +8,7 @@
 - `Task Type`: `planning`
 - `Planner Owner`: `planner/coordinator`
 - `Worker Owner`: `planner/coordinator`
-- `Source Of Truth`: this file
+- `Source Of Truth`: historical bootstrap snapshot only; DB-canonical model now supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 - `Bootstrap Packet`: [`central_task_system_tasks.md`](/home/cobra/CENTRAL/central_task_system_tasks.md)
 
@@ -49,7 +49,7 @@ Define the canonical task format and on-disk layout for all future planner-owned
 ## Acceptance
 
 1. A worker can execute `CENTRAL-OPS-01` from this file without needing a repo-local board.
-2. A planner can tell unambiguously that this file, not `tasks.md`, is the canonical record.
+2. A planner can tell unambiguously that this file is only a historical bootstrap record and not the long-term canonical DB record.
 3. The chosen layout scales beyond a handful of repos and tasks.
 
 ## Testing
@@ -65,7 +65,7 @@ Define the canonical task format and on-disk layout for all future planner-owned
 ## Dispatch Contract
 
 - Dispatch from `CENTRAL` using `repo=CENTRAL do task CENTRAL-OPS-01`.
-- The worker reads this file as the canonical task body.
+- The worker reads this file as a bootstrap task snapshot for historical context.
 - Implementation work for this task stays in `/home/cobra/CENTRAL`.
 
 ## Closeout Contract

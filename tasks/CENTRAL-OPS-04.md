@@ -8,7 +8,7 @@
 - `Task Type`: `implementation`
 - `Planner Owner`: `planner/coordinator`
 - `Worker Owner`: `planner/coordinator`
-- `Source Of Truth`: this file
+- `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 - `Bootstrap Packet`: [`central_task_system_tasks.md`](/home/cobra/CENTRAL/central_task_system_tasks.md)
 

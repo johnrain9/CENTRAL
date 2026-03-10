@@ -3,12 +3,12 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-11`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `planning`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
-- `Source Of Truth`: this file
+- `Worker Owner`: `planner/coordinator`
+- `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
 ## Execution Settings
@@ -53,6 +53,10 @@ Replace the long-term architecture assumption that CENTRAL markdown syncs into a
 
 - Manual review of integration options and selected model.
 - Demonstrate how a newly created canonical DB task becomes dispatchable.
+- Manual review complete on 2026-03-10 for:
+  - [`docs/central_autonomy_integration.md`](/home/cobra/CENTRAL/docs/central_autonomy_integration.md)
+  - shared-DB planner/runtime separation
+  - DB-native dispatcher discovery flow
 
 ## Dependencies
 
@@ -62,7 +66,7 @@ Replace the long-term architecture assumption that CENTRAL markdown syncs into a
 ## Dispatch Contract
 
 - Dispatch from `CENTRAL` using `repo=CENTRAL do task CENTRAL-OPS-11`.
-- This file is the canonical bootstrap record for the integration-design task.
+- This file is a transitional bootstrap record for the integration-design task.
 
 ## Closeout Contract
 
@@ -74,8 +78,8 @@ CENTRAL-OPS-11 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 ## Repo Reconciliation
 
-- CENTRAL is authoritative for this planning task.
-- Update this file first, then generated summaries.
+- CENTRAL DB is the target authoritative system for this integration contract.
+- Until DB-native authoring lands, treat this file as a transitional bootstrap snapshot and update generated summaries accordingly.
 
 ## Validation Rules
 

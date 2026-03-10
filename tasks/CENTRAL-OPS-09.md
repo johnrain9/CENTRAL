@@ -3,12 +3,12 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-09`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `planning`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
-- `Source Of Truth`: this file
+- `Worker Owner`: `planner/coordinator`
+- `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
 ## Execution Settings
@@ -53,6 +53,14 @@ Redefine the CENTRAL task architecture so the canonical source of truth is a SQL
 
 - Manual review of the revised architecture docs.
 - Demonstrate that every required task field has a DB home.
+- Manual review complete on 2026-03-10 for:
+  - [`docs/central_task_db_schema.md`](/home/cobra/CENTRAL/docs/central_task_db_schema.md)
+  - [`docs/central_task_system.md`](/home/cobra/CENTRAL/docs/central_task_system.md)
+  - [`docs/central_autonomy_integration.md`](/home/cobra/CENTRAL/docs/central_autonomy_integration.md)
+- Review result:
+  - accepted the DB-canonical direction
+  - accepted generated markdown only as transitional or export surfaces
+  - accepted that runtime integration must stop depending on markdown discovery
 
 ## Dependencies
 
@@ -62,7 +70,7 @@ Redefine the CENTRAL task architecture so the canonical source of truth is a SQL
 ## Dispatch Contract
 
 - Dispatch from `CENTRAL` using `repo=CENTRAL do task CENTRAL-OPS-09`.
-- This file is the canonical bootstrap record for the redesign task.
+- This file is a transitional bootstrap record for the redesign task.
 
 ## Closeout Contract
 
@@ -74,8 +82,8 @@ CENTRAL-OPS-09 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 ## Repo Reconciliation
 
-- CENTRAL is authoritative for this planning task.
-- Update this file first, then generated summaries.
+- CENTRAL DB is the target authoritative system after this redesign.
+- Until DB-native authoring lands, treat this file as a transitional bootstrap snapshot and update generated summaries accordingly.
 
 ## Validation Rules
 

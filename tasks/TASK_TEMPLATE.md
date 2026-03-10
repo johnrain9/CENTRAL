@@ -8,7 +8,7 @@
 - `Task Type`: `<planning|implementation|ops|docs|migration>`
 - `Planner Owner`: `planner/coordinator`
 - `Worker Owner`: `unassigned`
-- `Source Of Truth`: this file
+- `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
 ## Execution Settings
@@ -59,7 +59,8 @@
 
 - Dispatch from `CENTRAL` using the task ID.
 - Execute implementation work in `Target Repo`.
-- Do not rely on repo-local task files for canonical task body details.
+- Do not rely on repo-local task files for planner truth.
+- Treat this markdown file as a transitional bootstrap or export surface until DB-native authoring lands.
 
 ## Closeout Contract
 

@@ -1,120 +1,169 @@
 # CENTRAL To Autonomy Integration Model
 
-This document defines the transitional markdown-first bridge model for how canonical `CENTRAL` tasks become dispatcher-consumable autonomy tasks. It is not the final DB-canonical architecture.
+This document defines the selected DB-native integration model between CENTRAL planning state and autonomy runtime behavior.
 
-## Model
+## Selected Model
 
-- This document describes a transitional bridge from markdown-authored CENTRAL tasks into autonomy DB.
-- It remains useful for bootstrap and migration, but should be superseded by DB-canonical CENTRAL planning.
-- The dispatcher does not read markdown directly.
-- A bridge command syncs canonical `CENTRAL` tasks into autonomy DB records during the transition.
+Choose a shared-DB model.
 
-## Discovery
+- CENTRAL SQLite DB is the canonical planner source of truth.
+- autonomy is an execution subsystem operating over CENTRAL DB tables.
+- planner and runtime state remain logically separate, but they live in one canonical DB model.
+- markdown is not part of steady-state discovery, synchronization, or state mutation.
 
-Bridge discovery rules:
+This rejects:
 
-- scan `CENTRAL/tasks/*.md`
-- ignore `TASK_TEMPLATE.md`
-- parse canonical task files that match the required schema
-- use the task file itself as the source of truth for definition fields
+- markdown-first discovery
+- long-term file scanning
+- a duplicated canonical planner store inside a second runtime DB
 
-Dispatcher discovery rules:
+## Why This Model
 
-- dispatcher reads only autonomy DB tasks
-- eligible work exists in autonomy because the bridge synced it from `CENTRAL`
+It scales better because it avoids:
 
-This is the answer to: "How does dispatcher know what work exists if tasks live in CENTRAL?"
+- duplicated task definitions across two DBs
+- eventual-consistency drift between planner DB and runtime DB
+- secondary ID mapping as a core architectural requirement
+- bridge logic becoming a permanent control plane
 
-- planner authors tasks in `CENTRAL`
-- bridge syncs them into autonomy
-- dispatcher consumes autonomy DB state
+## Responsibilities
 
-## ID Mapping
+Planner surfaces own:
 
-- `CENTRAL` task ID maps 1:1 to autonomy task ID
-- the bridge creates autonomy tasks with the same custom ID
-- no secondary ID translation layer is introduced in this phase
+- task definition fields
+- planner lifecycle state
+- dependency edges
+- repo targeting
+- execution policy
+- reconciliation after review or failure analysis
 
-## Status Model
+Runtime surfaces own:
 
-Planning source of truth:
+- task claim and lease state
+- runtime status transitions
+- worker heartbeats
+- run failure or timeout markers
+- pending-review promotion and runtime evidence capture
 
-- `CENTRAL` status remains authoritative for planner lifecycle: `todo`, `in_progress`, `blocked`, `done`
+## DB Tables Used By Role
 
-Runtime source of truth:
+Planner-owned primary tables:
 
-- autonomy owns runtime states such as `pending`, `claimed`, `running`, `pending_review`, `failed`, `timeout`, `done`
+- `tasks`
+- `task_execution_settings`
+- `task_dependencies`
+- `repos`
 
-Bridge status behavior:
+Runtime-owned primary tables:
 
-- `todo` -> create or normalize autonomy task to `pending` if the task is not already active
-- `in_progress` -> keep autonomy task dispatchable; do not clobber active runtime states
-- `blocked` -> new autonomy tasks are created as `draft`; existing runtime tasks are not forced backward through invalid status transitions
-- `done` -> do not create a new autonomy task; leave existing runtime record intact for audit
+- `task_runtime_state`
+- `task_active_leases`
+- `task_events`
+- `task_artifacts`
 
-The bridge is definition-first. It does not overwrite active runtime states during sync.
+Optional integration table:
 
-## Field Mapping
+- `task_runtime_links`
+  - only needed if a temporary external runtime or split-DB deployment still exists
 
-Canonical task file to autonomy DB:
+## Dispatcher Discovery
 
-- `Task ID` -> autonomy task id
-- title heading -> autonomy title
-- `Target Repo` -> `repo_root`
-- `Task Type` -> autonomy `category` using:
-  - `implementation` -> `implementation`
-  - `truth` -> `truth`
-  - `planning|ops|docs|migration` -> `infrastructure`
-- `Priority` -> `priority`
-- `Task Kind` -> `task_kind`
-- `Sandbox Mode` -> `sandbox_mode`
-- `Approval Policy` -> `approval_policy`
-- `Additional Writable Dirs` -> `additional_writable_dirs_json`
-- `Timeout Seconds` -> `timeout_seconds`
-- `Approval Required` -> `approval_required`
-- `Testing` -> `validation_commands_json`
-- canonical file path -> `design_doc_path`
-- assembled task body sections -> `prompt_body`
+Dispatcher should discover work from DB-native queries, not file scans.
 
-## Dependencies
+Steady-state eligibility flow:
 
-- Canonical dependency list in `CENTRAL` is the authored dependency surface.
-- Dependencies that name canonical task IDs become autonomy DB dependency edges.
-- External dependencies remain text in the canonical file and prompt body; they are not materialized as DB edges.
+1. planner creates or updates a task in CENTRAL DB
+2. planner lifecycle state is `todo` or `in_progress`
+3. dependencies are satisfied in `task_dependencies`
+4. runtime state is absent or reclaimable
+5. dispatcher selects from CENTRAL DB query results
+6. dispatcher atomically creates or updates `task_runtime_state` and `task_active_leases`
 
-## Repo Targeting And Writable Dirs
+## Status Mapping
 
-- `Target Repo` defines the autonomy `repo_root`.
-- `Additional Writable Dirs` defines any extra writable paths required beyond the target repo.
-- Tasks that only read should use `Task Kind: read_only`.
-- Mutating tasks should use `Task Kind: mutating` and keep writable scope explicit.
+Planner lifecycle:
 
-## Conflict And Reconciliation Rules
+- `todo`
+- `in_progress`
+- `blocked`
+- `done`
 
-Sync direction in this phase:
+Runtime lifecycle:
 
-- canonical definition fields flow from `CENTRAL` to autonomy
-- runtime execution results do not automatically rewrite `CENTRAL`
+- `queued`
+- `claimed`
+- `running`
+- `pending_review`
+- `failed`
+- `timeout`
+- `canceled`
+- `done`
 
-Planner reconciliation in this phase:
+Rules:
 
-- planner reviews autonomy runtime state and worker closeout
-- planner updates the canonical `CENTRAL` task file and summary index
-- repo-local mirrors are updated only after `CENTRAL` is correct
+- planner lifecycle answers whether work should exist and what the planner believes about its progress
+- runtime lifecycle answers what the worker subsystem is doing now
+- runtime transitions do not silently rewrite planner lifecycle
+- planner reconciliation moves canonical planner state after inspecting runtime evidence
 
-Do not treat autonomy runtime status as permission to silently rewrite planner status in markdown.
+## Task Identity
 
-## Bridge Scope
+- use one stable `task_id` across planner and runtime tables
+- do not introduce a second mandatory task ID space
+- if a temporary external runtime still requires a separate task identifier, store it in `task_runtime_links.runtime_task_id`
+- if runtime execution needs a per-attempt or per-run identifier, treat that as execution metadata rather than a second task identity
 
-This phase implements:
+## CLI And API Boundaries
 
-- one-way definition sync from `CENTRAL` to autonomy
-- stable task ID reuse
-- idempotent create or update behavior
-- dependency synchronization for canonical task IDs
+Planner actions should be exposed through planner-facing commands or APIs that mutate planner-owned tables only.
 
-This phase does not implement:
+Examples:
 
-- automatic closeout reconciliation back into markdown
-- retirement of repo-local mirrors
-- direct dispatcher reads from markdown
+- create or update task definition
+- set dependencies
+- reprioritize or reassign
+- mark blocked
+- reconcile closeout after review
+
+Runtime and dispatcher actions should mutate runtime-owned tables only.
+
+Examples:
+
+- claim eligible task
+- renew lease heartbeat
+- move to running
+- mark pending review
+- mark failed or timeout
+- release stale lease
+
+Review actions may touch both domains in sequence:
+
+1. runtime evidence is inspected
+2. runtime state is finalized
+3. planner lifecycle is reconciled explicitly
+
+## Deprecating The Transitional Bridge
+
+The existing markdown-first bridge is compatibility-only.
+
+Deprecation plan:
+
+1. freeze features on the markdown bridge
+2. stop expanding markdown-first task ingestion
+3. implement DB-native planner and dispatcher surfaces
+4. migrate bootstrap markdown tasks into DB records
+5. retire `autonomy central sync` as a primary architecture path
+
+`autonomy central sync` may remain temporarily for migration or import, but it is not the steady-state contract.
+
+## A Newly Created Task Becoming Dispatchable
+
+Steady-state flow:
+
+1. planner inserts task row plus execution settings and dependencies in CENTRAL DB
+2. planner lifecycle is `todo`
+3. dependency query shows task eligible
+4. dispatcher claims it by creating runtime state and lease rows transactionally
+5. worker runs in the `target_repo` specified by planner-owned data
+
+No markdown export or file discovery step is required.

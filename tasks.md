@@ -139,38 +139,63 @@ Last sync: 2026-03-09T00:00:00-07:00
 ## CENTRAL Canonical Task System Tasks
 
 - [done] CENTRAL-OPS-01 - Freeze canonical CENTRAL task schema and storage model for all future planner-owned work.
-  - canonical file: [tasks/CENTRAL-OPS-01.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-01.md)
+  - bootstrap file: [tasks/CENTRAL-OPS-01.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-01.md)
   - schema: [docs/central_task_system.md](/home/cobra/CENTRAL/docs/central_task_system.md)
   - template: [tasks/TASK_TEMPLATE.md](/home/cobra/CENTRAL/tasks/TASK_TEMPLATE.md)
 - [done] CENTRAL-OPS-02 - Update planner skills and dispatch contracts for CENTRAL-as-source-of-truth.
-  - canonical file: [tasks/CENTRAL-OPS-02.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-02.md)
+  - bootstrap file: [tasks/CENTRAL-OPS-02.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-02.md)
   - skill/docs surfaces: `multi-repo-planner`, `autonomy-planner`, `autonomy-operator`, `autonomy-triage`, and CENTRAL autonomy runbooks
 - [done] CENTRAL-OPS-03 - Re-root dispatcher operating model to CENTRAL-owned tasks and repo-targeted execution.
-  - canonical file: [tasks/CENTRAL-OPS-03.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-03.md)
+  - bootstrap file: [tasks/CENTRAL-OPS-03.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-03.md)
   - integration model: [docs/central_autonomy_integration.md](/home/cobra/CENTRAL/docs/central_autonomy_integration.md)
   - note: completed under markdown-first assumptions; now partially superseded by DB-canonical scaling work.
 - [done] CENTRAL-OPS-04 - Implement CENTRAL-to-autonomy task ingestion bridge.
-  - canonical file: [tasks/CENTRAL-OPS-04.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-04.md)
+  - bootstrap file: [tasks/CENTRAL-OPS-04.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-04.md)
   - bridge command: `autonomy central sync --central-root /home/cobra/CENTRAL`
   - note: completed as a transitional markdown bridge; long-term direction is DB-canonical.
 - [todo] CENTRAL-OPS-05 - Migrate planner-owned active work into canonical CENTRAL task format.
 - [todo] CENTRAL-OPS-06 - Define planner-owned closeout and reconciliation workflow.
 - [todo] CENTRAL-OPS-07 - Retire repo-local boards as execution truth.
 - [todo] CENTRAL-OPS-08 - Harden canonical task schema for machine parsing, prioritization, and DB extensibility.
-  - canonical file: [tasks/CENTRAL-OPS-08.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-08.md)
-  - why: the current human-readable schema needs a strict machine-ingestion contract before the CENTRAL-to-autonomy bridge lands.
-- [todo] CENTRAL-OPS-09 - Redesign CENTRAL canonical task system around SQLite as source of truth.
-  - canonical file: [tasks/CENTRAL-OPS-09.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-09.md)
+  - bootstrap file: [tasks/CENTRAL-OPS-08.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-08.md)
+  - why: this is now transitional compatibility work for bootstrap markdown migration, not the end-state DB-canonical model.
+- [done] CENTRAL-OPS-09 - Redesign CENTRAL canonical task system around SQLite as source of truth.
+  - bootstrap file: [tasks/CENTRAL-OPS-09.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-09.md)
   - why: planning truth must scale to hundreds of tasks and multiple planners without markdown as the canonical store.
-- [todo] CENTRAL-OPS-10 - Define multi-planner and multi-worker concurrency model for dispatcher scale.
-  - canonical file: [tasks/CENTRAL-OPS-10.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-10.md)
+  - schema: [docs/central_task_db_schema.md](/home/cobra/CENTRAL/docs/central_task_db_schema.md)
+- [done] CENTRAL-OPS-10 - Define multi-planner and multi-worker concurrency model for dispatcher scale.
+  - bootstrap file: [tasks/CENTRAL-OPS-10.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-10.md)
   - why: 4+ concurrent workers and multiple planners need explicit claim, assignment, and reconciliation rules.
-- [todo] CENTRAL-OPS-11 - Design DB-native CENTRAL/autonomy integration and retire markdown-first bridge assumptions.
-  - canonical file: [tasks/CENTRAL-OPS-11.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-11.md)
+  - concurrency doc: [docs/central_task_concurrency.md](/home/cobra/CENTRAL/docs/central_task_concurrency.md)
+- [done] CENTRAL-OPS-11 - Design DB-native CENTRAL/autonomy integration and retire markdown-first bridge assumptions.
+  - bootstrap file: [tasks/CENTRAL-OPS-11.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-11.md)
   - why: current sync logic is transitional and should not define the long-term runtime architecture.
-- [todo] CENTRAL-OPS-12 - Define generated views and operator surfaces for DB-canonical task management.
-  - canonical file: [tasks/CENTRAL-OPS-12.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-12.md)
+  - integration doc: [docs/central_autonomy_integration.md](/home/cobra/CENTRAL/docs/central_autonomy_integration.md)
+- [done] CENTRAL-OPS-12 - Define generated views and operator surfaces for DB-canonical task management.
+  - bootstrap file: [tasks/CENTRAL-OPS-12.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-12.md)
+  - generated-view spec: [docs/central_generated_views.md](/home/cobra/CENTRAL/docs/central_generated_views.md)
   - why: once DB is canonical, summaries, exports, and dashboards must be generated rather than hand-maintained.
+- [todo] CENTRAL-OPS-13 - Reconcile and re-scope transitional CENTRAL-OPS-05 through CENTRAL-OPS-08 under the DB-canonical model.
+  - bootstrap file: [tasks/CENTRAL-OPS-13.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-13.md)
+  - why: implementation should not proceed with stale or contradictory bootstrap tasks still in the backlog.
+- [todo] CENTRAL-OPS-14 - Implement the canonical CENTRAL SQLite task database and migration scaffold.
+  - bootstrap file: [tasks/CENTRAL-OPS-14.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-14.md)
+  - why: the architecture is defined; the actual DB and migration runner now need to exist.
+- [todo] CENTRAL-OPS-15 - Implement planner-facing DB CRUD and reconciliation commands.
+  - bootstrap file: [tasks/CENTRAL-OPS-15.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-15.md)
+  - why: planners need a DB-native control plane before markdown maintenance can end.
+- [todo] CENTRAL-OPS-16 - Implement DB-generated operator views and exports.
+  - bootstrap file: [tasks/CENTRAL-OPS-16.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-16.md)
+  - why: operator surfaces should read from DB state rather than hand-maintained boards.
+- [todo] CENTRAL-OPS-17 - Implement DB-native dispatcher and runtime state integration.
+  - bootstrap file: [tasks/CENTRAL-OPS-17.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-17.md)
+  - why: dispatcher discovery and claim flow must move to DB-native runtime state.
+- [todo] CENTRAL-OPS-18 - Migrate bootstrap CENTRAL task records into the canonical DB.
+  - bootstrap file: [tasks/CENTRAL-OPS-18.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-18.md)
+  - why: live planning cannot stay on bootstrap markdown after DB foundations exist.
+- [todo] CENTRAL-OPS-19 - Retire markdown-first bridge paths and non-canonical manual task maintenance.
+  - bootstrap file: [tasks/CENTRAL-OPS-19.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-19.md)
+  - why: the end state must be DB-native planning plus optional generated exports only.
 - Canonical task packet: [central_task_system_tasks.md](/home/cobra/CENTRAL/central_task_system_tasks.md)
 
 ### Intake 2026-02-28: `video_queue_auto_prompt_design.md`
@@ -507,6 +532,6 @@ Repo-local canonical task IDs:
 
 ## Notes
 - Duplication exists by design in this first import pass (for example, video_queue-related planning appears in both photo_auto_tagging and video_queue task files).
-- Use canonical files under `CENTRAL/tasks/` as source of truth for planner-owned tasks.
+- Use the CENTRAL SQLite task DB as source of truth for planner-owned tasks; `CENTRAL/tasks/` is bootstrap or archival only.
 - Use repo-local task boards as optional mirrors or repo-specific intake until the migration is fully retired.
 - Dispatch contract: repo=<repo_name> do task Txx (or source ID for non-Txx tasks).

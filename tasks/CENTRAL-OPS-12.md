@@ -3,12 +3,12 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-12`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `planning`
 - `Planner Owner`: `planner/coordinator`
 - `Worker Owner`: `unassigned`
-- `Source Of Truth`: this file
+- `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
 ## Execution Settings
@@ -52,6 +52,12 @@ Define which human-facing views should be generated from the canonical DB so ope
 
 - Manual review of proposed views and refresh model.
 - Demonstrate that critical operator questions can be answered from generated views.
+- Manual review complete on 2026-03-10 for:
+  - [`docs/central_generated_views.md`](/home/cobra/CENTRAL/docs/central_generated_views.md)
+- Review result:
+  - accepted `tasks.md` as a generated landing page rather than canonical board
+  - accepted dedicated generated views for eligibility, blocked work, assignments, review, and per-task handoff cards
+  - accepted explicit freshness and non-canonical marking rules for all generated artifacts
 
 ## Dependencies
 
@@ -61,7 +67,7 @@ Define which human-facing views should be generated from the canonical DB so ope
 ## Dispatch Contract
 
 - Dispatch from `CENTRAL` using `repo=CENTRAL do task CENTRAL-OPS-12`.
-- This file is the canonical bootstrap record for the generated-views task.
+- This file is a transitional bootstrap record for the generated-views task.
 
 ## Closeout Contract
 
@@ -75,8 +81,10 @@ CENTRAL-OPS-12 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 - CENTRAL is authoritative for this planning task.
 - Update this file first, then generated summaries.
+- Long-term generated markdown and CLI views should derive from DB state, not this bootstrap snapshot.
 
 ## Validation Rules
 
 - filename matches `CENTRAL-OPS-12`
 - required sections are present
+- generated-view design remains aligned with DB-canonical ownership

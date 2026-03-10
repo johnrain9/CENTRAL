@@ -3,12 +3,12 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-10`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `planning`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
-- `Source Of Truth`: this file
+- `Worker Owner`: `planner/coordinator`
+- `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
 ## Execution Settings
@@ -54,6 +54,9 @@ Define claim, assignment, scheduling, and reconciliation rules that remain corre
 
 - Manual review of concurrency scenarios and failure cases.
 - Walk through at least three races: double claim, planner conflict, stale worker lease.
+- Manual review complete on 2026-03-10 for:
+  - [`docs/central_task_concurrency.md`](/home/cobra/CENTRAL/docs/central_task_concurrency.md)
+  - race outcomes for double claim, planner conflict, and stale worker lease
 
 ## Dependencies
 
@@ -62,7 +65,7 @@ Define claim, assignment, scheduling, and reconciliation rules that remain corre
 ## Dispatch Contract
 
 - Dispatch from `CENTRAL` using `repo=CENTRAL do task CENTRAL-OPS-10`.
-- This file is the canonical bootstrap record for the concurrency-model task.
+- This file is a transitional bootstrap record for the concurrency-model task.
 
 ## Closeout Contract
 
@@ -74,8 +77,8 @@ CENTRAL-OPS-10 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 ## Repo Reconciliation
 
-- CENTRAL is authoritative for this planning task.
-- Update this file first, then generated summaries.
+- CENTRAL DB is the target authoritative system for this planning contract.
+- Until DB-native authoring lands, treat this file as a transitional bootstrap snapshot and update generated summaries accordingly.
 
 ## Validation Rules
 

@@ -232,7 +232,7 @@ python -m autonomy.cli task list --json --status pending
 - Primary repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Convert the current planner-owned cross-repo work into canonical `CENTRAL` task records using the new format.
@@ -274,7 +274,7 @@ python -m autonomy.cli task list --json --status pending
 - Secondary repo: `/home/cobra/photo_auto_tagging`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Define how worker results update canonical CENTRAL tasks and how optional repo-local mirrors are reconciled.
@@ -314,7 +314,7 @@ python -m autonomy.cli task list --json --status pending
 - Secondary repos: all tracked project repos
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Complete the transition so repo-local task boards are no longer treated as execution truth.
@@ -350,7 +350,7 @@ python -m autonomy.cli task list --json --status pending
 - Primary repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Refine the canonical CENTRAL task schema so it is both human-maintainable and reliably machine-ingestable for the future CENTRAL-to-autonomy bridge and SQLite-backed runtime state.
@@ -381,8 +381,11 @@ python -m autonomy.cli task list --json --status pending
 
 ## Notes
 - This is a schema-hardening task, not the bridge implementation itself.
-- The resulting contract should feed directly into `CENTRAL-OPS-03` and `CENTRAL-OPS-04`.
-- Canonical file:
+- Transitional note:
+  - this task now exists only to support bootstrap compatibility and migration from markdown
+  - it is not the end-state architecture after `CENTRAL-OPS-09`
+- The resulting contract was useful for the transitional `CENTRAL-OPS-03` and `CENTRAL-OPS-04` markdown bridge.
+- Bootstrap task file:
   - [`tasks/CENTRAL-OPS-08.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-08.md)
 
 ---
@@ -393,7 +396,7 @@ python -m autonomy.cli task list --json --status pending
 - Primary repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Redefine the CENTRAL task architecture so the canonical source of truth is a SQLite database rather than markdown task files.
@@ -417,9 +420,18 @@ python -m autonomy.cli task list --json --status pending
 ## Testing
 - Manual review of the revised architecture docs.
 - Demonstrate that every required task field has a DB home.
+- Manual review complete on 2026-03-10:
+  - DB schema doc reviewed
+  - high-level canonical task model reviewed
+  - DB-native autonomy integration model reviewed
 
 ## Notes
 - This supersedes markdown-as-canonical assumptions from earlier bootstrap work.
+- Completed in:
+  - [`docs/central_task_db_schema.md`](/home/cobra/CENTRAL/docs/central_task_db_schema.md)
+  - [`docs/central_task_system.md`](/home/cobra/CENTRAL/docs/central_task_system.md)
+  - [`docs/central_autonomy_integration.md`](/home/cobra/CENTRAL/docs/central_autonomy_integration.md)
+  - [`tasks/CENTRAL-OPS-09.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-09.md)
 
 ---
 
@@ -429,7 +441,7 @@ python -m autonomy.cli task list --json --status pending
 - Primary repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Define claim, assignment, scheduling, and reconciliation rules that remain correct when multiple planner AIs and multiple workers operate concurrently.
@@ -454,9 +466,13 @@ python -m autonomy.cli task list --json --status pending
 ## Testing
 - Manual review of concurrency scenarios and failure cases.
 - Walk through at least three races: double claim, planner conflict, stale worker lease.
+- Manual review complete on 2026-03-10 using [`docs/central_task_concurrency.md`](/home/cobra/CENTRAL/docs/central_task_concurrency.md).
 
 ## Notes
 - This is a scaling-design task, not a runtime implementation task.
+- Completed in:
+  - [`docs/central_task_concurrency.md`](/home/cobra/CENTRAL/docs/central_task_concurrency.md)
+  - [`tasks/CENTRAL-OPS-10.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-10.md)
 
 ---
 
@@ -467,7 +483,7 @@ python -m autonomy.cli task list --json --status pending
 - Secondary repo: `/home/cobra/photo_auto_tagging`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Replace the long-term architecture assumption that CENTRAL markdown syncs into autonomy, and define the DB-native integration model instead.
@@ -491,9 +507,14 @@ python -m autonomy.cli task list --json --status pending
 ## Testing
 - Manual review of integration options and selected model.
 - Demonstrate how a newly created canonical DB task becomes dispatchable.
+- Manual review complete on 2026-03-10 using [`docs/central_autonomy_integration.md`](/home/cobra/CENTRAL/docs/central_autonomy_integration.md).
 
 ## Notes
 - This is the architecture reset required before deepening bridge implementation.
+- Completed in:
+  - [`docs/central_autonomy_integration.md`](/home/cobra/CENTRAL/docs/central_autonomy_integration.md)
+  - [`docs/central_task_db_schema.md`](/home/cobra/CENTRAL/docs/central_task_db_schema.md)
+  - [`tasks/CENTRAL-OPS-11.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-11.md)
 
 ---
 
@@ -503,7 +524,7 @@ python -m autonomy.cli task list --json --status pending
 - Primary repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Define which human-facing views should be generated from the canonical DB so operators and planners can scan the portfolio without making those views the source of truth.
@@ -529,3 +550,281 @@ python -m autonomy.cli task list --json --status pending
 
 ## Notes
 - Generated views must serve humans without becoming a second source of truth.
+- Completed in:
+  - [`tasks/CENTRAL-OPS-12.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-12.md)
+  - [`docs/central_generated_views.md`](/home/cobra/CENTRAL/docs/central_generated_views.md)
+
+---
+
+## Task CENTRAL-OPS-13: Reconcile and re-scope transitional CENTRAL-OPS-05 through CENTRAL-OPS-08 under the DB-canonical model
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `todo`
+
+## Objective
+- Clean up the remaining transitional CENTRAL planning tasks so `CENTRAL-OPS-05` through `CENTRAL-OPS-08` accurately reflect what is still needed, what is superseded, and what should be treated as migration-only work.
+
+## Context
+- `CENTRAL-OPS-09` through `CENTRAL-OPS-12` changed the long-term architecture materially.
+- Earlier bootstrap tasks still contain markdown-first assumptions, stale status text, or ambiguous scope.
+- Before implementation starts, the planner backlog needs to stop carrying contradictory work items.
+
+## Deliverables
+1. Review `CENTRAL-OPS-05` through `CENTRAL-OPS-08` against the DB-canonical architecture.
+2. Mark each task as still needed, superseded, completed, or transitional-only.
+3. Rewrite any remaining task text so it matches the DB-canonical direction.
+4. Reconcile statuses and notes consistently across bootstrap task files, `tasks.md`, and `central_task_system_tasks.md`.
+
+## Acceptance Criteria
+1. No remaining `CENTRAL-OPS-05` through `CENTRAL-OPS-08` task contradicts DB-canonical planning.
+2. Summary surfaces and bootstrap task files agree on current status and scope.
+3. The implementation tranche can proceed without ambiguity about which bootstrap tasks are still relevant.
+
+## Testing
+- Manual review of `tasks.md`.
+- Manual review of `central_task_system_tasks.md`.
+- Manual review of the affected bootstrap task files.
+
+## Notes
+- This is the cleanup gate before implementation.
+- Canonical bootstrap file:
+  - [`tasks/CENTRAL-OPS-13.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-13.md)
+
+---
+
+## Task CENTRAL-OPS-14: Implement the canonical CENTRAL SQLite task database and migration scaffold
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `todo`
+
+## Objective
+- Create the real CENTRAL SQLite task database, migrations, and bootstrap tooling so planner truth can move out of markdown and into structured storage.
+
+## Context
+- `CENTRAL-OPS-09` defined the DB-canonical architecture.
+- `CENTRAL-OPS-10` and `CENTRAL-OPS-11` defined concurrency and runtime integration expectations.
+- No actual canonical DB implementation exists yet in `CENTRAL`.
+
+## Deliverables
+1. Create the SQLite schema and migration files for the canonical CENTRAL task DB.
+2. Add a bootstrap/init command that creates or upgrades the DB safely.
+3. Add minimal repo/config plumbing so tools can locate the canonical DB reliably.
+4. Document how the DB is initialized and where it lives.
+
+## Acceptance Criteria
+1. A fresh CENTRAL checkout can initialize the canonical task DB with one command.
+2. The implemented schema matches the DB design docs closely enough for later CRUD and runtime work.
+3. Schema upgrades are handled by explicit migrations rather than ad hoc replacement.
+
+## Testing
+- Initialize the DB in a clean or temporary location.
+- Verify the expected tables exist.
+- Run the migration command twice and confirm idempotent behavior.
+
+## Notes
+- This is the real start of DB-native implementation.
+- Canonical bootstrap file:
+  - [`tasks/CENTRAL-OPS-14.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-14.md)
+
+---
+
+## Task CENTRAL-OPS-15: Implement planner-facing DB CRUD and reconciliation commands
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `todo`
+
+## Objective
+- Implement planner-facing commands or APIs that create, update, prioritize, assign, and reconcile canonical tasks directly in the CENTRAL DB.
+
+## Context
+- The DB foundation must exist before planner workflows can stop relying on markdown edits.
+- Planner-owned operations need clear boundaries from runtime-owned operations.
+- This is the control plane for future planner AI usage.
+
+## Deliverables
+1. Create planner-facing task create/update commands or APIs against the CENTRAL DB.
+2. Implement dependency management, priority updates, owner assignment, and status transitions for planner lifecycle.
+3. Implement planner-side closeout reconciliation commands for done/blocked outcomes.
+4. Document command usage for planner operation.
+
+## Acceptance Criteria
+1. A planner can create and modify canonical tasks without editing markdown files.
+2. Planner lifecycle state, dependencies, and ownership can be updated through structured commands.
+3. Closeout reconciliation can be performed against the DB without manual SQL.
+
+## Testing
+- Create a test task in the DB.
+- Update its priority, dependencies, and ownership.
+- Reconcile a closeout outcome and verify DB state changes as expected.
+
+## Notes
+- This is the planner control plane task.
+- Canonical bootstrap file:
+  - [`tasks/CENTRAL-OPS-15.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-15.md)
+
+---
+
+## Task CENTRAL-OPS-16: Implement DB-generated operator views and exports
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `todo`
+
+## Objective
+- Build the CLI/JSON/dashboard read models and any optional markdown exports that surface CENTRAL DB task state without becoming a second source of truth.
+
+## Context
+- `CENTRAL-OPS-12` defined the generated-view contract.
+- Operators need real surfaces for summary, eligible, blocked, assignments, review, and task detail.
+- These surfaces must read from DB state, not hand-maintained files.
+
+## Deliverables
+1. Implement required CLI and JSON views for summary, eligible, blocked, per-repo, assignments, review, and task detail.
+2. Implement optional markdown export generation only where useful, clearly marked non-canonical.
+3. Add freshness and non-canonical markers to generated outputs.
+4. Document how operators regenerate or query these views.
+
+## Acceptance Criteria
+1. Operators can answer the key portfolio and queue questions from DB-generated views.
+2. Generated outputs are clearly marked non-canonical.
+3. The system does not require a giant manually maintained `tasks.md` to operate.
+
+## Testing
+- Populate sample DB records and verify each required view renders correctly.
+- Verify freshness and source banners appear in generated outputs.
+- Verify optional markdown exports can be regenerated from DB state.
+
+## Notes
+- Generated views are implementation now, not just design.
+- Canonical bootstrap file:
+  - [`tasks/CENTRAL-OPS-16.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-16.md)
+
+---
+
+## Task CENTRAL-OPS-17: Implement DB-native dispatcher and runtime state integration
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+- Secondary repo: `/home/cobra/photo_auto_tagging`
+
+## Status
+- `todo`
+
+## Objective
+- Implement the DB-native runtime path for dispatcher discovery, task claim and lease management, heartbeats, stale-lease recovery, and runtime status transitions.
+
+## Context
+- `CENTRAL-OPS-10` and `CENTRAL-OPS-11` defined the concurrency and integration model.
+- The old markdown bridge is transitional and should not define steady-state runtime behavior.
+- Dispatcher/runtime logic now needs a concrete DB-native execution path.
+
+## Deliverables
+1. Implement DB-native eligibility queries for dispatcher use.
+2. Implement atomic claim and lease creation, heartbeat renewal, and stale-lease recovery.
+3. Implement runtime status transitions including review, failure, timeout, and done handling.
+4. Document how dispatcher/runtime actions interact with planner-owned state.
+
+## Acceptance Criteria
+1. Dispatcher can discover and claim eligible work from DB-native state without markdown file discovery.
+2. Double-claim protection and stale-lease handling work according to the concurrency contract.
+3. Runtime state transitions are queryable from structured DB tables.
+
+## Testing
+- Simulate eligible task discovery and claim flow.
+- Simulate heartbeat renewal and stale lease recovery.
+- Simulate runtime transitions into running, pending review, failed, timeout, and done.
+
+## Notes
+- This is the runtime execution-plane implementation task.
+- Canonical bootstrap file:
+  - [`tasks/CENTRAL-OPS-17.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-17.md)
+
+---
+
+## Task CENTRAL-OPS-18: Migrate bootstrap CENTRAL task records into the canonical DB
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `todo`
+
+## Objective
+- Import or migrate the current bootstrap CENTRAL task records into the canonical DB so live planning can stop depending on markdown-maintained state.
+
+## Context
+- The DB exists only once `CENTRAL-OPS-14` lands.
+- Current task definitions and summaries still live in bootstrap markdown surfaces.
+- Migration must preserve task identity and enough history to keep planning continuity.
+
+## Deliverables
+1. Implement a migration or import path from bootstrap CENTRAL task files and relevant packet surfaces into the DB.
+2. Preserve stable `task_id` values and key metadata during migration.
+3. Record migration provenance so imported records can be audited.
+4. Document the migration procedure and rollback considerations.
+
+## Acceptance Criteria
+1. Existing bootstrap CENTRAL tasks appear in the canonical DB with stable IDs.
+2. Migration can be audited and does not silently duplicate task records.
+3. Planning can begin reading live task state from the DB after migration.
+
+## Testing
+- Run migration against a representative bootstrap task set.
+- Verify stable IDs and critical fields in DB output.
+- Re-run migration and confirm duplicate-safe behavior.
+
+## Notes
+- This is the cutover import task.
+- Canonical bootstrap file:
+  - [`tasks/CENTRAL-OPS-18.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-18.md)
+
+---
+
+## Task CENTRAL-OPS-19: Retire markdown-first bridge paths and non-canonical manual task maintenance
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+- Secondary repo: `/home/cobra/photo_auto_tagging`
+
+## Status
+- `todo`
+
+## Objective
+- Finish the transition away from markdown-first task management by retiring bridge-first assumptions, stopping manual canonical markdown maintenance, and leaving only DB-native operation plus optional generated exports.
+
+## Context
+- The DB, planner CRUD, generated views, dispatcher integration, and migration need to exist first.
+- Transitional bootstrap tools should not become permanent architecture.
+- This task is the cutover and cleanup point.
+
+## Deliverables
+1. Retire `autonomy central sync` or equivalent markdown-first paths as primary workflow.
+2. Update docs and skills so DB-native planning and runtime operation are the canonical path.
+3. Remove or demote any remaining manual canonical markdown maintenance expectations.
+4. Preserve optional import/export or archival tooling only where still useful.
+
+## Acceptance Criteria
+1. DB-native planning and dispatch are the documented primary workflow.
+2. Operators are no longer expected to maintain canonical task state in markdown.
+3. Transitional bridge paths are clearly marked deprecated, retired, or import-only.
+
+## Testing
+- Manual review of updated docs and skill surfaces.
+- Verify primary operator and planner commands point at DB-native workflow.
+- Verify optional export/import paths remain clearly non-canonical.
+
+## Notes
+- This is the final cutover and cleanup task for the migration phase.
+- Canonical bootstrap file:
+  - [`tasks/CENTRAL-OPS-19.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-19.md)

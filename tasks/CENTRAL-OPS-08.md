@@ -8,20 +8,20 @@
 - `Task Type`: `planning`
 - `Planner Owner`: `planner/coordinator`
 - `Worker Owner`: `unassigned`
-- `Source Of Truth`: this file
+- `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 - `Schema Reference`: [`docs/central_task_system.md`](/home/cobra/CENTRAL/docs/central_task_system.md)
 
 ## Objective
 
-Refine the canonical CENTRAL task schema so it is both human-maintainable and reliably machine-ingestable for the future CENTRAL-to-autonomy bridge and SQLite-backed runtime state.
+Refine the bootstrap markdown schema so it remains machine-ingestable only for transitional migration and compatibility work while the end-state model moves to SQLite.
 
 ## Context
 
-- [`docs/central_task_system.md`](/home/cobra/CENTRAL/docs/central_task_system.md) now defines the canonical human-readable task model.
-- The current schema is good enough for planner use, but it still has gaps for automated ingestion and durable runtime state.
-- The next bridge work will need stable parsing, dispatch ordering, clear ownership semantics, and clean mapping into database fields.
-- The intended operating model is authored source in `CENTRAL`, with execution/runtime state mirrored into the autonomy system rather than planning directly in raw SQL.
+- [`docs/central_task_system.md`](/home/cobra/CENTRAL/docs/central_task_system.md) originally froze a bootstrap human-readable task model.
+- `CENTRAL-OPS-09` changed the end-state direction so planner truth is DB-canonical rather than markdown-authored.
+- Some transitional migration or compatibility tooling may still need strict parsing of legacy markdown task records.
+- Any further work here should support migration and generated or export surfaces, not deepen markdown-first architecture.
 
 ## Scope Boundaries
 
@@ -32,7 +32,7 @@ Refine the canonical CENTRAL task schema so it is both human-maintainable and re
 
 ## Deliverables
 
-1. Amend [`docs/central_task_system.md`](/home/cobra/CENTRAL/docs/central_task_system.md) with a machine-readable metadata contract, such as YAML front matter or an equally strict structured header.
+1. Amend bootstrap markdown guidance only if migration tooling still needs a strict machine-readable metadata contract.
 2. Define explicit semantics for `Planner Owner` and `Worker Owner`, including allowed values and assignment expectations.
 3. Add canonical fields for prioritization and freshness, at minimum covering dispatch ordering and timestamps.
 4. Decide whether the lifecycle must expand beyond `todo`, `in_progress`, `blocked`, `done`, and document any review/reconciliation states required.
@@ -41,7 +41,7 @@ Refine the canonical CENTRAL task schema so it is both human-maintainable and re
 
 ## Acceptance
 
-1. A bridge implementation can parse canonical task metadata without relying on ad hoc markdown scraping heuristics.
+1. Transitional migration tooling can parse bootstrap markdown task metadata without relying on ad hoc scraping heuristics.
 2. A planner can explain the difference between planning ownership and current worker assignment unambiguously.
 3. Dispatch order can be derived from canonical task data without relying on incidental file order in [`tasks.md`](/home/cobra/CENTRAL/tasks.md).
 4. The schema supports future optional fields without breaking existing task files.
@@ -61,7 +61,7 @@ Refine the canonical CENTRAL task schema so it is both human-maintainable and re
 ## Dispatch Contract
 
 - Dispatch from `CENTRAL` using `repo=CENTRAL do task CENTRAL-OPS-08`.
-- The worker reads this file as the canonical task body.
+- The worker reads this file as a transitional bootstrap task snapshot.
 - Implementation work for this task stays in `/home/cobra/CENTRAL`.
 
 ## Closeout Contract
@@ -79,9 +79,9 @@ Blocked rule:
 ## Repo Reconciliation
 
 - `CENTRAL` is authoritative for this task.
-- Update this canonical task file first.
+- Update this bootstrap task file first only while the markdown transition remains in place.
 - Update [`tasks.md`](/home/cobra/CENTRAL/tasks.md) second.
-- Update any bootstrap packet or reference doc only after the canonical record is correct.
+- Update any bootstrap packet or reference doc only after this transitional record is correct.
 
 ## Validation Rules
 
