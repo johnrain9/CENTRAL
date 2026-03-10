@@ -3,11 +3,11 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-13`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `planning`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
+- `Worker Owner`: `planner/coordinator`
 - `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
@@ -54,6 +54,11 @@ Clean up the remaining transitional CENTRAL planning tasks so `CENTRAL-OPS-05` t
 - Manual review of `tasks.md`
 - Manual review of `central_task_system_tasks.md`
 - Manual review of [`tasks/CENTRAL-OPS-05.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-05.md), [`tasks/CENTRAL-OPS-06.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-06.md), [`tasks/CENTRAL-OPS-07.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-07.md), and [`tasks/CENTRAL-OPS-08.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-08.md) if present
+- Manual review complete on 2026-03-10:
+  - `CENTRAL-OPS-05` closed as superseded by `CENTRAL-OPS-18`
+  - `CENTRAL-OPS-06` closed as completed planning-contract work; implementation moves to later DB tasks
+  - `CENTRAL-OPS-07` closed as superseded by `CENTRAL-OPS-19`
+  - `CENTRAL-OPS-08` closed as transitional-only compatibility work
 
 ## Dependencies
 
@@ -84,3 +89,10 @@ CENTRAL-OPS-13 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 - filename matches `CENTRAL-OPS-13`
 - required sections are present
+
+## Notes
+
+- `CENTRAL-OPS-05`: superseded by `CENTRAL-OPS-18`; no bootstrap task file exists
+- `CENTRAL-OPS-06`: completed as planning-contract work; later implementation belongs to `CENTRAL-OPS-15` and `CENTRAL-OPS-19`
+- `CENTRAL-OPS-07`: superseded by `CENTRAL-OPS-19`; do not dispatch separately
+- `CENTRAL-OPS-08`: retained only as a transitional bootstrap compatibility reference

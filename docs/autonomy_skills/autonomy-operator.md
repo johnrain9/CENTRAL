@@ -5,6 +5,7 @@ Purpose:
 - Keep dispatcher and worker fleet healthy during daily operation.
 - Provide a deterministic operating rhythm for claim, run, recover, and backlog review.
 - Surface stale reviews before they block throughput.
+- Treat `autonomy` as a legacy execution surface where it still exists; CENTRAL DB is the primary control plane for canonical task state.
 
 Bootstrap contract:
 
@@ -20,7 +21,7 @@ Deterministic responsibilities:
 - Inspect active runs and tail logs.
 - Surface completion, failure, and review-aging pressure.
 - Hand off approval and rejection decisions to explicit task commands.
-- When task context is needed for planner-owned work, open the canonical `CENTRAL/tasks/<TASK_ID>.md` record first.
+- When task context is needed for planner-owned work, inspect CENTRAL DB-backed task state first and treat markdown task cards as non-canonical exports only.
 
 Command dependencies:
 
@@ -48,9 +49,10 @@ Daily rhythm:
 
 Task reference rule:
 
-- Treat autonomy task state as runtime truth, but use the matching CENTRAL task file as the authored scope and acceptance reference for planner-owned tasks.
+- Treat autonomy task state as legacy runtime evidence only. For planner-owned scope and acceptance, use CENTRAL DB-backed task state first.
 
 References:
 
 - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md)
+- [`central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 - [`autonomy-triage.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-triage.md)

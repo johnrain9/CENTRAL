@@ -3,7 +3,8 @@
 Purpose:
 
 - Turn planning intent into executable autonomy tasks with explicit dependencies.
-- Keep `CENTRAL/tasks/<TASK_ID>.md` as the authored source of truth while autonomy DB remains the execution surface during migration.
+- For canonical planning, use CENTRAL DB state and the CENTRAL task CLI first.
+- Use autonomy task commands only for legacy autonomy-DB queues that still need migration support.
 
 Bootstrap contract:
 
@@ -17,7 +18,7 @@ Deterministic responsibilities:
 - Create tasks with clear prompt bodies, repo roots, and validation notes.
 - Keep transitions explicit from `draft` to `pending`.
 - Maintain dependency edges.
-- Update the canonical CENTRAL task first, then mirror summary changes to `tasks.md` and any repo-local board if needed.
+- Update CENTRAL DB first, then refresh generated summaries or exports if needed.
 
 Command dependencies:
 
@@ -34,18 +35,19 @@ Command dependencies:
 
 Workflow:
 
-1. Author or refine the task in `CENTRAL/tasks/<TASK_ID>.md`.
-2. Draft the autonomy prompt body from that canonical task.
-3. Create or update it in autonomy DB.
+1. Inspect or update the canonical task in CENTRAL DB with [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py).
+2. Draft the autonomy prompt body from canonical CENTRAL DB state only if a legacy autonomy queue still needs it.
+3. Create or update it in autonomy DB only for migration or compatibility work.
 4. Set dependencies before promotion.
 5. Promote only runnable tasks to `pending`.
-6. Reconcile execution outcome back into the canonical CENTRAL task, then update summary or mirror surfaces.
+6. Reconcile execution outcome back into CENTRAL DB, then update generated or mirror surfaces.
 
 Task reference rule:
 
-- When a planner-owned task has a stable CENTRAL ID, use that ID in notes and open the canonical file before consulting repo-local boards.
+- When a planner-owned task has a stable CENTRAL ID, use that ID in notes and query CENTRAL DB-backed task state before consulting repo-local boards or exported markdown.
 
 References:
 
 - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md)
+- [`central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 - [`autonomy-triage.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-triage.md)

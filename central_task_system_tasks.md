@@ -264,6 +264,9 @@ python -m autonomy.cli task list --json --status pending
 ## Notes
 - Do not migrate every repo-local backlog item blindly.
 - Focus first on planner-owned and cross-repo coordination tasks.
+- Reconciliation result under `CENTRAL-OPS-13`:
+  - closed as superseded by `CENTRAL-OPS-18`
+  - no bootstrap task file exists; keep this packet entry only as historical planning context
 
 ---
 
@@ -304,6 +307,9 @@ python -m autonomy.cli task list --json --status pending
 
 ## Notes
 - This is a process-contract task, not UI or DB implementation.
+- Reconciliation result under `CENTRAL-OPS-13`:
+  - closed as completed planning-contract work
+  - later DB-native implementation belongs to `CENTRAL-OPS-15` and `CENTRAL-OPS-19`
 
 ---
 
@@ -341,6 +347,9 @@ python -m autonomy.cli task list --json --status pending
 
 ## Notes
 - This is the final migration/cleanup task, not the first one to dispatch.
+- Reconciliation result under `CENTRAL-OPS-13`:
+  - closed as superseded by `CENTRAL-OPS-19`
+  - do not dispatch separately under the DB-canonical plan
 
 ---
 
@@ -562,7 +571,7 @@ python -m autonomy.cli task list --json --status pending
 - Primary repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Clean up the remaining transitional CENTRAL planning tasks so `CENTRAL-OPS-05` through `CENTRAL-OPS-08` accurately reflect what is still needed, what is superseded, and what should be treated as migration-only work.
@@ -587,10 +596,17 @@ python -m autonomy.cli task list --json --status pending
 - Manual review of `tasks.md`.
 - Manual review of `central_task_system_tasks.md`.
 - Manual review of the affected bootstrap task files.
+- Manual review complete on 2026-03-10:
+  - `CENTRAL-OPS-05` through `CENTRAL-OPS-08` classified and reconciled
+  - summary/index and packet statuses aligned
+  - `CENTRAL-OPS-08` retained only as transitional compatibility work
 
 ## Notes
 - This is the cleanup gate before implementation.
-- Canonical bootstrap file:
+- Completed in:
+  - [`tasks/CENTRAL-OPS-13.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-13.md)
+  - [`tasks/CENTRAL-OPS-08.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-08.md)
+- Bootstrap task file:
   - [`tasks/CENTRAL-OPS-13.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-13.md)
 
 ---
@@ -601,7 +617,7 @@ python -m autonomy.cli task list --json --status pending
 - Primary repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Create the real CENTRAL SQLite task database, migrations, and bootstrap tooling so planner truth can move out of markdown and into structured storage.
@@ -626,9 +642,19 @@ python -m autonomy.cli task list --json --status pending
 - Initialize the DB in a clean or temporary location.
 - Verify the expected tables exist.
 - Run the migration command twice and confirm idempotent behavior.
+- Manual verification complete on 2026-03-10 using:
+  - `python3 scripts/central_task_db.py init --db-path /tmp/central_tasks_test.db --json`
+  - `python3 scripts/central_task_db.py status --db-path /tmp/central_tasks_test.db --json`
+  - `python3 scripts/central_task_db.py init --json`
+  - `python3 scripts/central_task_db.py status --json`
 
 ## Notes
 - This is the real start of DB-native implementation.
+- Completed in:
+  - [`tasks/CENTRAL-OPS-14.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-14.md)
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`db/migrations/0001_initial.sql`](/home/cobra/CENTRAL/db/migrations/0001_initial.sql)
+  - [`docs/central_task_db_bootstrap.md`](/home/cobra/CENTRAL/docs/central_task_db_bootstrap.md)
 - Canonical bootstrap file:
   - [`tasks/CENTRAL-OPS-14.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-14.md)
 
@@ -640,7 +666,7 @@ python -m autonomy.cli task list --json --status pending
 - Primary repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Implement planner-facing commands or APIs that create, update, prioritize, assign, and reconcile canonical tasks directly in the CENTRAL DB.
@@ -665,9 +691,16 @@ python -m autonomy.cli task list --json --status pending
 - Create a test task in the DB.
 - Update its priority, dependencies, and ownership.
 - Reconcile a closeout outcome and verify DB state changes as expected.
+- Manual review complete on 2026-03-10:
+  - planner-facing DB CRUD and reconciliation commands added in [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - command usage documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 
 ## Notes
 - This is the planner control plane task.
+- Completed in:
+  - [`tasks/CENTRAL-OPS-15.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-15.md)
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 - Canonical bootstrap file:
   - [`tasks/CENTRAL-OPS-15.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-15.md)
 
@@ -679,7 +712,7 @@ python -m autonomy.cli task list --json --status pending
 - Primary repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Build the CLI/JSON/dashboard read models and any optional markdown exports that surface CENTRAL DB task state without becoming a second source of truth.
@@ -704,9 +737,16 @@ python -m autonomy.cli task list --json --status pending
 - Populate sample DB records and verify each required view renders correctly.
 - Verify freshness and source banners appear in generated outputs.
 - Verify optional markdown exports can be regenerated from DB state.
+- Manual review complete on 2026-03-10:
+  - DB-generated operator views and markdown exports implemented in [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - operator command usage documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 
 ## Notes
 - Generated views are implementation now, not just design.
+- Completed in:
+  - [`tasks/CENTRAL-OPS-16.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-16.md)
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 - Canonical bootstrap file:
   - [`tasks/CENTRAL-OPS-16.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-16.md)
 
@@ -719,7 +759,7 @@ python -m autonomy.cli task list --json --status pending
 - Secondary repo: `/home/cobra/photo_auto_tagging`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Implement the DB-native runtime path for dispatcher discovery, task claim and lease management, heartbeats, stale-lease recovery, and runtime status transitions.
@@ -744,9 +784,16 @@ python -m autonomy.cli task list --json --status pending
 - Simulate eligible task discovery and claim flow.
 - Simulate heartbeat renewal and stale lease recovery.
 - Simulate runtime transitions into running, pending review, failed, timeout, and done.
+- Manual review complete on 2026-03-10:
+  - DB-native runtime eligibility, claim, heartbeat, transition, and stale-recovery commands added in [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - runtime command usage documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 
 ## Notes
 - This is the runtime execution-plane implementation task.
+- Completed in:
+  - [`tasks/CENTRAL-OPS-17.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-17.md)
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 - Canonical bootstrap file:
   - [`tasks/CENTRAL-OPS-17.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-17.md)
 
@@ -758,7 +805,7 @@ python -m autonomy.cli task list --json --status pending
 - Primary repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Import or migrate the current bootstrap CENTRAL task records into the canonical DB so live planning can stop depending on markdown-maintained state.
@@ -783,9 +830,16 @@ python -m autonomy.cli task list --json --status pending
 - Run migration against a representative bootstrap task set.
 - Verify stable IDs and critical fields in DB output.
 - Re-run migration and confirm duplicate-safe behavior.
+- Manual review complete on 2026-03-10:
+  - bootstrap import from task files and packet-only records implemented as `migrate-bootstrap` in [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - migration and rollback usage documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 
 ## Notes
 - This is the cutover import task.
+- Completed in:
+  - [`tasks/CENTRAL-OPS-18.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-18.md)
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 - Canonical bootstrap file:
   - [`tasks/CENTRAL-OPS-18.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-18.md)
 
@@ -798,7 +852,7 @@ python -m autonomy.cli task list --json --status pending
 - Secondary repo: `/home/cobra/photo_auto_tagging`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Finish the transition away from markdown-first task management by retiring bridge-first assumptions, stopping manual canonical markdown maintenance, and leaving only DB-native operation plus optional generated exports.
@@ -823,8 +877,25 @@ python -m autonomy.cli task list --json --status pending
 - Manual review of updated docs and skill surfaces.
 - Verify primary operator and planner commands point at DB-native workflow.
 - Verify optional export/import paths remain clearly non-canonical.
+- Manual review complete on 2026-03-10:
+  - canonical autonomy docs and packaged skills updated to point at CENTRAL DB-native workflow
+  - `autonomy central sync` demoted to deprecated import-only status in docs and CLI help
+  - remaining manual canonical markdown maintenance expectations removed from skill/runbook surfaces
 
 ## Notes
 - This is the final cutover and cleanup task for the migration phase.
+- Completed in:
+  - [`tasks/CENTRAL-OPS-19.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-19.md)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
+  - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md)
+  - [`docs/autonomy_skills/README.md`](/home/cobra/CENTRAL/docs/autonomy_skills/README.md)
+  - [`docs/autonomy_skills/autonomy-planner.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-planner.md)
+  - [`docs/autonomy_skills/autonomy-operator.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-operator.md)
+  - [`docs/autonomy_skills/autonomy-triage.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-triage.md)
+  - [`/home/cobra/.codex/skills/autonomy-planner/SKILL.md`](/home/cobra/.codex/skills/autonomy-planner/SKILL.md)
+  - [`/home/cobra/.codex/skills/autonomy-operator/SKILL.md`](/home/cobra/.codex/skills/autonomy-operator/SKILL.md)
+  - [`/home/cobra/.codex/skills/autonomy-triage/SKILL.md`](/home/cobra/.codex/skills/autonomy-triage/SKILL.md)
+  - [`/home/cobra/photo_auto_tagging/autonomy/cli.py`](/home/cobra/photo_auto_tagging/autonomy/cli.py)
+  - [`/home/cobra/photo_auto_tagging/autonomy/central_sync.py`](/home/cobra/photo_auto_tagging/autonomy/central_sync.py)
 - Canonical bootstrap file:
   - [`tasks/CENTRAL-OPS-19.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-19.md)

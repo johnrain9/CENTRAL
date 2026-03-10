@@ -4,6 +4,7 @@ Purpose:
 
 - Diagnose failed runs and stalled review items from CLI-visible evidence.
 - Choose an explicit next action: approve, reject, reset, retry, or leave blocked.
+- Treat `autonomy` review state as legacy runtime evidence, not canonical planner truth.
 
 Bootstrap contract:
 
@@ -17,7 +18,7 @@ Deterministic responsibilities:
 - Inspect worker artifacts and logs.
 - Pull failure context from reports and task state.
 - Keep manual decisions auditable with explicit commands and notes.
-- Use the canonical CENTRAL task file to verify intended scope and acceptance for planner-owned work.
+- Use CENTRAL DB-backed task state to verify intended scope and acceptance for planner-owned work.
 
 Command dependencies:
 
@@ -41,9 +42,10 @@ Decision rules:
 
 Task reference rule:
 
-- If the run maps to a planner-owned CENTRAL task, review `CENTRAL/tasks/<TASK_ID>.md` before approving, rejecting, or resetting so the decision stays anchored to the authored contract.
+- If the run maps to a planner-owned CENTRAL task, review CENTRAL DB-backed task state first so the decision stays anchored to the canonical contract.
 
 References:
 
 - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md)
+- [`central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 - [`autonomy-operator.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-operator.md)

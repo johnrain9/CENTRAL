@@ -3,11 +3,11 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-08`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `planning`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
+- `Worker Owner`: `planner/coordinator`
 - `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 - `Schema Reference`: [`docs/central_task_system.md`](/home/cobra/CENTRAL/docs/central_task_system.md)
@@ -52,6 +52,10 @@ Refine the bootstrap markdown schema so it remains machine-ingestable only for t
 - Manual review of [`docs/central_task_system.md`](/home/cobra/CENTRAL/docs/central_task_system.md)
 - Manual review of [`tasks/TASK_TEMPLATE.md`](/home/cobra/CENTRAL/tasks/TASK_TEMPLATE.md)
 - Confirm at least one canonical task file can be interpreted using the hardened metadata contract alone
+- Manual review complete on 2026-03-10 for:
+  - transitional bootstrap markdown scope
+  - DB-canonical supersession from `CENTRAL-OPS-09`
+  - remaining value only for migration or compatibility tooling
 
 ## Dependencies
 

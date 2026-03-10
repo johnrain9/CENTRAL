@@ -3,11 +3,11 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-16`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `implementation`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
+- `Worker Owner`: `planner/coordinator`
 - `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
@@ -54,6 +54,13 @@ Build the CLI/JSON/dashboard read models and any optional markdown exports that 
 - Populate sample DB records and verify each required view renders correctly
 - Verify freshness and source banners appear in generated outputs
 - Verify optional markdown exports can be regenerated from DB state
+- Manual review complete on 2026-03-10:
+  - DB-generated summary, eligible, blocked, repo, assignments, review, and task-card views implemented in [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - markdown export commands and operator usage documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
+
+Review result:
+- accepted CLI and JSON read models as the primary operator surfaces
+- accepted markdown exports only as generated, non-canonical outputs
 
 ## Dependencies
 
@@ -77,6 +84,9 @@ CENTRAL-OPS-16 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 - CENTRAL DB is authoritative; views are derived outputs.
 - Update this bootstrap task file and any generated summaries after implementation.
+- Implementation now lives in:
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 
 ## Validation Rules
 

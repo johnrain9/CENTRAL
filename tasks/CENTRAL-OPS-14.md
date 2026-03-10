@@ -3,11 +3,11 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-14`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `implementation`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
+- `Worker Owner`: `planner/coordinator`
 - `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
@@ -54,6 +54,16 @@ Create the real CENTRAL SQLite task database, migrations, and bootstrap tooling 
 - Initialize the DB in a clean or temporary location
 - Verify the expected tables exist
 - Run the migration command twice and confirm idempotent behavior
+- Manual verification complete on 2026-03-10:
+  - `python3 scripts/central_task_db.py init --db-path /tmp/central_tasks_test.db --json`
+  - `python3 scripts/central_task_db.py init --db-path /tmp/central_tasks_test.db --json`
+  - `python3 scripts/central_task_db.py status --db-path /tmp/central_tasks_test.db --json`
+  - `python3 scripts/central_task_db.py init --json`
+  - `python3 scripts/central_task_db.py status --json`
+- Verification result:
+  - migration `0001_initial.sql` applied cleanly
+  - second init run was idempotent
+  - expected canonical tables existed in both the temp DB and the default repo DB
 
 ## Dependencies
 
@@ -78,6 +88,10 @@ CENTRAL-OPS-14 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 - CENTRAL DB is the target authoritative system for planner truth.
 - Until DB-native authoring lands fully, update this bootstrap task file and generated summaries after implementation.
+- Bootstrap implementation now lives in:
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`db/migrations/0001_initial.sql`](/home/cobra/CENTRAL/db/migrations/0001_initial.sql)
+  - [`docs/central_task_db_bootstrap.md`](/home/cobra/CENTRAL/docs/central_task_db_bootstrap.md)
 
 ## Validation Rules
 

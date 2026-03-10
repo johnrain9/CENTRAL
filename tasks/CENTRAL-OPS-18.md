@@ -3,11 +3,11 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-18`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `migration`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
+- `Worker Owner`: `planner/coordinator`
 - `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
@@ -54,6 +54,13 @@ Import or migrate the current bootstrap CENTRAL task records into the canonical 
 - Run migration against a representative bootstrap task set
 - Verify stable IDs and critical fields in DB output
 - Re-run migration and confirm duplicate-safe behavior
+- Manual review complete on 2026-03-10:
+  - bootstrap migration/import path implemented as `migrate-bootstrap` in [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - migration procedure and rollback guidance documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
+
+Review result:
+- accepted bootstrap import from task files plus packet-only records as sufficient cutover scaffolding
+- accepted duplicate-safe skip behavior as the default migration posture
 
 ## Dependencies
 
@@ -77,6 +84,9 @@ CENTRAL-OPS-18 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 - CENTRAL DB becomes the live planning store after successful migration.
 - Any remaining bootstrap markdown should be treated as import/export or archival material only.
+- Implementation now lives in:
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 
 ## Validation Rules
 

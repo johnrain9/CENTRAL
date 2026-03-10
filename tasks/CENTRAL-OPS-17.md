@@ -3,11 +3,11 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-17`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `implementation`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
+- `Worker Owner`: `planner/coordinator`
 - `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
@@ -54,6 +54,13 @@ Implement the DB-native runtime path for dispatcher discovery, task claim/lease 
 - Simulate eligible task discovery and claim flow
 - Simulate heartbeat renewal and stale lease recovery
 - Simulate runtime transitions into running, pending review, failed, timeout, and done
+- Manual review complete on 2026-03-10:
+  - DB-native eligibility, claim, heartbeat, transition, and stale-recovery commands implemented in [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - runtime/operator command surface documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
+
+Review result:
+- accepted DB-native lease and runtime-state mutations as the steady-state dispatcher control-plane contract
+- accepted runtime status living in CENTRAL DB rather than markdown discovery or sync state
 
 ## Dependencies
 
@@ -78,6 +85,9 @@ CENTRAL-OPS-17 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 - CENTRAL DB is authoritative for planner truth; runtime-owned tables live alongside it or attach cleanly through the selected integration path.
 - Update this bootstrap task file and generated summaries after implementation.
+- Implementation now lives primarily in:
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 
 ## Validation Rules
 

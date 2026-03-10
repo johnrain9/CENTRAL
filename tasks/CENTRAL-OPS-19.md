@@ -3,11 +3,11 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-19`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `migration`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
+- `Worker Owner`: `planner/coordinator`
 - `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
@@ -54,6 +54,14 @@ Finish the transition away from markdown-first task management by retiring bridg
 - Manual review of updated docs and skill surfaces
 - Verify primary operator/planner commands point at DB-native workflow
 - Verify optional export/import paths remain clearly non-canonical
+- Manual review complete on 2026-03-10:
+  - skill docs and canonical autonomy runbooks now point to [`central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md) for canonical CENTRAL workflows
+  - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md) now treats `autonomy central sync` as deprecated import-only
+  - legacy autonomy CLI help now warns that `central sync` is deprecated and import-only
+
+Review result:
+- accepted CENTRAL DB as the documented primary workflow for planning, runtime, and generated views
+- accepted markdown task files and summaries as bootstrap, export, or archival surfaces only
 
 ## Dependencies
 
@@ -79,6 +87,18 @@ CENTRAL-OPS-19 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 - CENTRAL DB is the authoritative planning system.
 - Markdown surfaces should remain optional exports, imports, or archival material only after this task.
+- Implementation now lives in:
+  - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
+  - [`docs/autonomy_skills/README.md`](/home/cobra/CENTRAL/docs/autonomy_skills/README.md)
+  - [`docs/autonomy_skills/autonomy-planner.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-planner.md)
+  - [`docs/autonomy_skills/autonomy-operator.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-operator.md)
+  - [`docs/autonomy_skills/autonomy-triage.md`](/home/cobra/CENTRAL/docs/autonomy_skills/autonomy-triage.md)
+  - [`/home/cobra/.codex/skills/autonomy-planner/SKILL.md`](/home/cobra/.codex/skills/autonomy-planner/SKILL.md)
+  - [`/home/cobra/.codex/skills/autonomy-operator/SKILL.md`](/home/cobra/.codex/skills/autonomy-operator/SKILL.md)
+  - [`/home/cobra/.codex/skills/autonomy-triage/SKILL.md`](/home/cobra/.codex/skills/autonomy-triage/SKILL.md)
+  - [`/home/cobra/photo_auto_tagging/autonomy/cli.py`](/home/cobra/photo_auto_tagging/autonomy/cli.py)
+  - [`/home/cobra/photo_auto_tagging/autonomy/central_sync.py`](/home/cobra/photo_auto_tagging/autonomy/central_sync.py)
 
 ## Validation Rules
 

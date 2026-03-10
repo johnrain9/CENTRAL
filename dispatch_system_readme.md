@@ -2,7 +2,8 @@
 
 ## Purpose
 
-This is the operator and planner entrypoint for the autonomy dispatch system.
+This is the legacy autonomy runtime runbook.
+Canonical CENTRAL planning, runtime state, generated views, and bootstrap import now live in the CENTRAL DB workflow documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md).
 
 Current implementation lives in:
 
@@ -77,11 +78,14 @@ python -m autonomy.cli dispatch status --profile default
 python -m autonomy.cli task eligible --json --profile default
 ```
 
-CENTRAL bridge flow:
+Deprecated CENTRAL bridge flow:
 
 ```bash
 autonomy central sync --central-root /home/cobra/CENTRAL --profile default
 ```
+
+Use this only for transitional bootstrap import into the legacy autonomy DB.
+It is no longer the primary workflow.
 
 ## Shell Entry Point
 
@@ -135,7 +139,7 @@ These are the relevant skills for dispatch-system support:
 - `autonomy-triage`
   - inspect failures, retries, stale reviews, approve/reject paths
 - `multi-repo-planner`
-  - keep canonical CENTRAL tasks, repo targeting, and cross-repo priorities aligned during migration
+  - keep canonical CENTRAL DB tasks, repo targeting, and cross-repo priorities aligned
 
 ## Canonical Docs
 
@@ -148,42 +152,41 @@ Canonical autonomy operator/planner/triage docs now live in `CENTRAL`:
 
 `/home/cobra/photo_auto_tagging/docs/autonomy_skills/` is now implementation-local and should only keep stubs or code-adjacent notes.
 
-## Planner-Owned Ingestion Workflow
+## Canonical CENTRAL DB Workflow
 
-The planner, not the user, owns turning canonical CENTRAL tasks into autonomy tasks.
+The planner, not the user, owns maintaining canonical CENTRAL task state in the CENTRAL DB.
 
 Working sequence:
 
-1. Author or update the canonical task in `CENTRAL/tasks/<TASK_ID>.md`.
-2. Read `Target Repo`, acceptance, and testing directly from the canonical CENTRAL task.
-3. Create or update the autonomy DB task with explicit repo root, prompt body, and validation notes derived from that task.
-4. Set dependency edges before promotion.
-5. Promote the task to `pending` only when it is runnable without more user clarification.
-6. After worker completion or review outcome, update the canonical CENTRAL task first, then any summary or repo-local mirror.
+1. Create or update the canonical task in CENTRAL DB with [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py).
+2. Query generated views from CENTRAL DB for summary, eligibility, blocked work, assignments, review, and task detail.
+3. Use CENTRAL DB runtime commands for claim, heartbeat, transition, and stale-lease recovery.
+4. Use bootstrap markdown only for import, export, or archival needs.
+5. After worker completion or review outcome, reconcile planner state in CENTRAL DB first, then refresh generated summaries or exports.
 
 Canonical commands:
 
 ```bash
-autonomy task create "Title" --category implementation --repo-root "/abs/repo" --prompt-body "..." --status draft --profile default
-autonomy task update T000123 --prompt-body "..." --profile default
-autonomy task set-dependencies T000123 --dependency "T000100,T000101" --profile default
-autonomy task start T000123 --profile default
-autonomy task eligible --json --profile default
-autonomy task blocked --json --profile default
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-create --input /path/to/task.json --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-update --task-id CENTRAL-OPS-20 --expected-version 1 --input /path/to/patch.json --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-summary --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py runtime-eligible --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py runtime-claim --worker-id worker-01 --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py migrate-bootstrap --json
 ```
 
 Ownership rules:
 
-- Planner owns task creation, prompt refinement, dependency maintenance, and promotion to `pending`.
+- Planner owns DB-native task creation, prompt refinement, dependency maintenance, and reconciliation.
 - Worker owns implementation plus closeout evidence: tests run, commit/ref, and blocker statement if blocked.
-- Planner owns updates to canonical CENTRAL task files, then summary/mirror updates in [`tasks.md`](/home/cobra/CENTRAL/tasks.md) and any repo-local boards after autonomy state changes.
+- Planner owns updates to CENTRAL DB first, then generated summaries or repo-local mirrors only when still useful.
 - User should only need to request work or ask for status; the planner performs the bookkeeping.
 
 Source roles during the transition:
 
-- `CENTRAL/tasks/<TASK_ID>.md`: canonical planner-owned task definition and closeout record
-- autonomy DB: dispatchable execution state, dependencies, retries, approvals
-- `CENTRAL/tasks.md`: summary index and portfolio view
+- CENTRAL SQLite DB: canonical planner truth, dependencies, ownership, runtime state, and reconciliation
+- [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py): canonical planner, operator, runtime, and migration command surface
+- markdown task files and `tasks.md`: bootstrap import, generated export, or archival surfaces only
 - repo-local markdown boards: optional mirrors, local intake, or repo-specific roadmap context
 
 ## Planner Rule
@@ -193,7 +196,7 @@ The user should rarely have to create or update dispatch tasks manually.
 Planner responsibility:
 
 - add and update support tasks
-- keep canonical CENTRAL task records current
+- keep canonical CENTRAL DB task records current
 - convert planning intent into dispatchable tasks
 - decide when a task belongs in CENTRAL canonical tracking vs the autonomy DB
 

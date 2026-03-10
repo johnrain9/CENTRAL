@@ -3,11 +3,11 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-15`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `implementation`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
+- `Worker Owner`: `planner/coordinator`
 - `Source Of Truth`: transitional bootstrap snapshot only; DB-canonical model supersedes markdown
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
@@ -54,6 +54,13 @@ Implement planner-facing commands or APIs that create, update, prioritize, assig
 - Create a test task in the DB
 - Update its priority, dependencies, and ownership
 - Reconcile a closeout outcome and verify DB state changes as expected
+- Manual review complete on 2026-03-10:
+  - planner-facing create, update, list, show, and reconcile commands implemented in [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - command usage documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
+
+Review result:
+- accepted DB-native planner CRUD and reconciliation as the canonical planner control plane
+- accepted optimistic planner version checks and active-lease guardrails for planner updates
 
 ## Dependencies
 
@@ -76,6 +83,9 @@ CENTRAL-OPS-15 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 - CENTRAL DB is the authoritative system for planner truth.
 - Update this bootstrap task file and any generated summaries after implementation.
+- Implementation now lives in:
+  - [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py)
+  - [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md)
 
 ## Validation Rules
 
