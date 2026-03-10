@@ -26,7 +26,7 @@ AUT-OPS-01 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 - Secondary touchpoint: `/home/cobra/CENTRAL` only if operator docs need a matching update
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Make `autonomy ...` the real shell-visible operator command instead of relying on `python -m autonomy.cli ...` from an activated repo venv.
@@ -64,6 +64,9 @@ autonomy dispatch status --profile default
 ## Notes
 - Do not break existing `python -m autonomy.cli ...` fallback behavior.
 - Prefer the smallest change that makes the canonical command real.
+- CENTRAL implementation:
+  - [`scripts/dispatcher_control.py`](/home/cobra/CENTRAL/scripts/dispatcher_control.py) now prefers `.venv/bin/autonomy` and falls back to `python -m autonomy.cli`.
+  - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md) now documents the editable-install bootstrap path and supported shell contract.
 
 ---
 
@@ -74,7 +77,7 @@ autonomy dispatch status --profile default
 - Secondary repo: `/home/cobra/photo_auto_tagging`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Define and document how planner-owned work moves from repo-local markdown boards into autonomy DB tasks, including who owns updates and when markdown stops being the primary execution surface.
@@ -117,6 +120,7 @@ python -m autonomy.cli task blocked --json
 ## Notes
 - This is a planning/documentation task first, not a full migration implementation.
 - Keep it concrete enough that a later task can automate the flow.
+- Completed in [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md) under `Planner-Owned Ingestion Workflow`.
 
 ---
 
@@ -128,7 +132,7 @@ python -m autonomy.cli task blocked --json
 - Mirror/update repo: `/home/cobra/CENTRAL`
 
 ## Status
-- `todo`
+- `in_progress`
 
 ## Objective
 - Align autonomy skill docs and repo docs with the actual local runtime path, including init requirements, repo venv expectations, and the `dispatcher` launcher.
@@ -167,6 +171,10 @@ python -m autonomy.cli dispatch status --profile default
 ## Notes
 - Keep docs explicit about current reality, not idealized future state.
 - If `autonomy` console-script installation is fixed first, docs may describe that as preferred and module path as fallback.
+- CENTRAL mirror/update completed in [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md).
+- Remaining external write surface:
+  - `/home/cobra/.codex/skills/autonomy-*`
+  - `/home/cobra/photo_auto_tagging/docs/autonomy_skills/*`
 
 ---
 
@@ -177,7 +185,7 @@ python -m autonomy.cli dispatch status --profile default
 - Secondary repo: `/home/cobra/photo_auto_tagging`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Create the operator runbook for `pending_review`, failure triage, retry, reject, approve, and stale-review clearing.
@@ -222,6 +230,7 @@ python -m autonomy.cli worker list --json --profile default
 ## Notes
 - This is primarily an operational-doc task.
 - Keep it auditable and deterministic.
+- Completed in [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md) under `Review And Retry Runbook`.
 
 ---
 
@@ -232,7 +241,7 @@ python -m autonomy.cli worker list --json --profile default
 - Secondary repo: `/home/cobra/photo_auto_tagging`
 
 ## Status
-- `todo`
+- `done`
 
 ## Objective
 - Decide and document the migration path from repo markdown task boards to autonomy DB-backed planning/execution.
@@ -270,3 +279,4 @@ python -m autonomy.cli worker list --json --profile default
 
 ## Notes
 - This is a design/planning task, not a schema/code migration task.
+- Completed in [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md) under `Source-Of-Truth Migration`.

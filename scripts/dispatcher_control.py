@@ -14,6 +14,7 @@ from pathlib import Path
 
 REPO_DIR = Path("/home/cobra/photo_auto_tagging")
 VENV_PYTHON = REPO_DIR / ".venv" / "bin" / "python"
+AUTONOMY_BIN = REPO_DIR / ".venv" / "bin" / "autonomy"
 PROFILE = os.environ.get("AUTONOMY_PROFILE", "default")
 PROFILE_DIR = Path.home() / ".autonomy" / "profiles" / PROFILE
 STATE_DIR = PROFILE_DIR / ".worker-state"
@@ -35,7 +36,13 @@ def ensure_runtime() -> None:
 
 
 def autonomy_cmd(*args: str) -> list[str]:
+    if AUTONOMY_BIN.exists():
+        return [str(AUTONOMY_BIN), *args]
     return [str(VENV_PYTHON), "-m", "autonomy.cli", *args]
+
+
+def autonomy_exec() -> str:
+    return str(AUTONOMY_BIN if AUTONOMY_BIN.exists() else VENV_PYTHON)
 
 
 def run_capture(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -171,7 +178,7 @@ def show_logs(follow: bool = False) -> int:
     ensure_runtime()
     init_profile()
     if follow:
-        os.execv(str(VENV_PYTHON), autonomy_cmd("dispatch", "tail", "--profile", PROFILE, "--follow"))
+        os.execv(autonomy_exec(), autonomy_cmd("dispatch", "tail", "--profile", PROFILE, "--follow"))
     print(tail_file(LOG_PATH))
     return 0
 
