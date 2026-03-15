@@ -11,6 +11,8 @@ Bootstrap contract:
 
 - Primary shell entrypoint: `dispatcher ...`
 - Concurrency control: `dispatcher start --max-workers <n>` for an immediate override, or `dispatcher config --max-workers <n>` to persist the launcher default
+- Model control: `dispatcher start --codex-model <model>` for an immediate override, or `dispatcher config --codex-model <model>` to persist the dispatcher default
+- Model precedence: task `execution.metadata.codex_model` overrides the dispatcher default; otherwise the dispatcher uses its explicit fallback `gpt-5-codex`
 - Primary CLI surface inside `/home/cobra/photo_auto_tagging/.venv`: `autonomy ...`
 - If `autonomy` is missing after activation, run `./.venv/bin/python -m pip install -e .`
 - Use `python -m autonomy.cli ...` only as a fallback
@@ -44,11 +46,12 @@ Daily rhythm:
 
 1. Check dispatcher state with `dispatcher status`.
 2. Inspect active runs with `dispatcher workers --json` to confirm heartbeat freshness, log recency, and stuck-suspect heuristics.
-3. Confirm worker concurrency from `configured_max_workers` / `next_start_max_workers` in the status payload when changing throughput.
-4. Review queue pressure with `autonomy report summary --json --profile default`.
-5. Run one cycle or start the daemon.
-6. Tail logs only when `dispatcher workers` points to a suspect task/run.
-7. Review `pending_review` aging before ending the session.
+3. Treat `runtime_paths.worker_results_dir` and each worker entry's `result.path` as the canonical structured worker-output surface; do not expect a separate `.worker-reports` directory.
+4. Confirm worker concurrency from `configured_max_workers` / `next_start_max_workers` in the status payload when changing throughput.
+5. Review queue pressure with `autonomy report summary --json --profile default`.
+6. Run one cycle or start the daemon.
+7. Tail logs only when `dispatcher workers` points to a suspect task/run.
+8. Review `pending_review` aging before ending the session.
 
 Task reference rule:
 

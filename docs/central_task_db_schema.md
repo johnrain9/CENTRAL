@@ -41,6 +41,31 @@ Indexes:
 
 - unique index on `repo_root`
 
+### `repo_aliases`
+
+Purpose:
+
+- store explicit planner-facing repo aliases without changing canonical `repo_id`
+- support deterministic lookup across human-friendly naming variants
+
+Columns:
+
+- `alias_id` `INTEGER PRIMARY KEY`
+- `repo_id` `TEXT NOT NULL`
+- `alias` `TEXT NOT NULL`
+- `normalized_alias` `TEXT NOT NULL`
+- `created_at` `TEXT NOT NULL`
+- `updated_at` `TEXT NOT NULL`
+
+Foreign keys:
+
+- `repo_id -> repos.repo_id`
+
+Indexes:
+
+- unique index on `(repo_id, alias)`
+- index on `normalized_alias`
+
 ### `tasks`
 
 Purpose:

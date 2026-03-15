@@ -89,8 +89,36 @@ Recommended operator flow:
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py repo-upsert \
   --repo-id CENTRAL \
   --repo-root /home/cobra/CENTRAL \
-  --display-name CENTRAL
+  --display-name CENTRAL \
+  --alias central
 ```
+
+Registry helpers:
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py repo-list
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py repo-list --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py repo-show --repo CENTRAL --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py repo-resolve --repo moto-helper --json
+```
+
+`repo-list` is the canonical fast path for operators and planners that need the current tracked repo registry. It returns `repo_id`, `display_name`, `repo_root`, and active state; with `--json`, it also includes metadata, creation/update timestamps, aliases, and lookup context for debugging.
+
+`repo-show` returns the full canonical record for one repo reference, resolving aliases/display names/root variants via the same lookup rules as `repo-resolve`.
+
+Lookup rules:
+
+- canonical `repo_id` remains the only stored task target identity
+- planner-facing `--repo-id` filters and task payload `target_repo_id` fields accept canonical IDs, explicit aliases, display names, and repo-root basename variants
+- lookup first prefers exact matches, then normalized matches that ignore case plus separator differences such as spaces, `_`, and `-`
+- if multiple repos match the same normalized reference, the command fails explicitly instead of guessing
+
+Preferred naming pattern:
+
+- keep `repo_id` stable and canonical
+- add `--alias` entries for common human-facing variants or legacy names
+- use `repo-show` to inspect one repo's canonical identity for operator or planner debugging
+- use `repo-resolve` when you are unsure which canonical `repo_id` a variant maps to
 
 ### Create a task
 
@@ -134,6 +162,24 @@ Expected JSON shape:
   "dependencies": ["CENTRAL-OPS-14"]
 }
 ```
+
+### Scaffold a task draft from planner defaults
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py planner-new \
+  --title "Fix planner-new scaffold" \
+  --repo CENTRAL \
+  --task-type implementation \
+  --json > /tmp/task.json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-create --input /tmp/task.json
+```
+
+`planner-new`:
+
+- allocates the next `task_id` in the selected series without manual ID probing
+- fills required fields with sensible planner defaults
+- writes a schema-valid draft JSON payload
+- supports direct piping (`--json`) into `task-create --input -`
 
 ### Update a task with optimistic concurrency
 
@@ -179,7 +225,51 @@ This updates planner-owned lifecycle state and records planner closeout metadata
 ```bash
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-show --task-id CENTRAL-OPS-20 --json
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-list --planner-status todo
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-list --repo-id moto helper
 ```
+
+### Ask for the next task ID in a series
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-id-next --series CENTRAL-OPS
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-id-next --series AUT-OPS --json
+```
+
+Behavior:
+
+- uses a monotonic high-water mark for the series instead of backfilling historical gaps
+- includes active reservations in the calculation, so planners do not need repeated `task-show` existence checks
+- defaults to `CENTRAL-OPS` if `--series` is omitted
+
+### Reserve a short contiguous task-ID range
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-id-reserve \
+  --series CENTRAL-OPS \
+  --count 3 \
+  --reserved-for "dispatcher worker adoption series" \
+  --note "laying out a tightly related task family"
+```
+
+Behavior:
+
+- reserves the next contiguous range after the current task/reservation high-water mark
+- enforces a small-range cap of 10 IDs per reservation
+- defaults reservations to a 48-hour expiration window unless `--hours` is provided
+- records reservation metadata and audit events in the canonical DB
+
+### Inspect reservation visibility and reconciliation state
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-id-reservations
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-id-reservations --all --include-events --json
+```
+
+Semantics:
+
+- active reservations stay visible until they either expire or every reserved ID has been created as a task
+- `task-id-next`, `task-id-reserve`, and `task-id-reservations` reconcile expired/completed reservations before returning results
+- completed reservations remain in history for audit, while expired reservations release unused IDs back to the series
 
 ## Operator Views
 
@@ -189,7 +279,7 @@ Implemented DB-generated read models:
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-summary
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-eligible
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-blocked
-python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-repo --repo-id CENTRAL
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-repo --repo-id central
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-assignments
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-review
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-task-card --task-id CENTRAL-OPS-20
@@ -200,6 +290,24 @@ Rules:
 - these surfaces read from DB state only
 - JSON output is available with `--json`
 - terminal output includes a generated/non-canonical banner
+- `view-summary` and `view-review` surface planner/runtime mismatches so terminal `done` drift is visible instead of silent
+
+## Repo Health
+
+Repo health aggregation for the initial dispatcher and app adapters lives outside the DB CLI:
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/repo_health.py snapshot
+python3 /home/cobra/CENTRAL/scripts/repo_health.py snapshot --json
+```
+
+This command aggregates:
+
+- live CENTRAL dispatcher/runtime, test, queue, and smoke evidence
+- repo-local adapter output from `/home/cobra/aimSoloAnalysis/tools/repo_health_adapter.py`, normalized into the canonical repo-health contract
+- repo-local adapter output from `/home/cobra/motoHelper/tools/repo_health_adapter.py`, normalized into the canonical repo-health contract
+
+The operator view reports `working_status`, `evidence_quality`, and explicit coverage semantics per repo. Contract and onboarding details are documented in `/home/cobra/CENTRAL/docs/repo_health.md`.
 
 ## Markdown Exports
 
@@ -243,6 +351,7 @@ For normal operator use, prefer the wrapper commands:
 ```bash
 dispatcher start --max-workers 3
 dispatcher config --max-workers 3
+dispatcher config --codex-model gpt-5-codex
 dispatcher status
 dispatcher workers
 ```
@@ -250,12 +359,16 @@ dispatcher workers
 Launcher rules:
 
 - `dispatcher start --max-workers <n>` applies an immediate worker limit
+- `dispatcher start --codex-model <model>` applies an immediate dispatcher-wide default Codex model
 - `dispatcher config --max-workers <n>` persists the default launcher limit
+- `dispatcher config --codex-model <model>` persists the default launcher Codex model
+- worker model precedence is: task `execution.metadata.codex_model`, then dispatcher default, then the built-in fallback `gpt-5-codex`
 - `dispatcher status` shows the active daemon limit plus the next-start default/source
-- `dispatcher workers --json` is the canonical worker inspection surface for operators and future skills
+- `dispatcher workers --json` is the canonical worker inspection surface for operators and future skills, including active-run Codex model metadata
 - `dispatcher stop` and `dispatcher restart` perform a fast handoff: active workers keep running, lease metadata preserves adoption state, and the next dispatcher adopts them on startup
 - graceful handoff extends active leases for a short restart window; if no dispatcher returns before that grace expires, stale-lease recovery can reclaim the task
 - `CENTRAL_DISPATCHER_MAX_WORKERS=<n>` overrides launcher defaults for the current shell session
+- `CENTRAL_DISPATCHER_CODEX_MODEL=<model>` overrides the saved default Codex model for the current shell session
 
 ### Inspect active and recent workers
 
@@ -271,15 +384,18 @@ python3 /home/cobra/CENTRAL/scripts/central_runtime.py worker-status --task-id C
 The structured payload includes:
 
 - active and recent task/run identity
+- canonical runtime paths, including `runtime_paths.worker_results_dir`
 - current runtime status and lease owner
 - heartbeat freshness and lease expiry timing
 - log file path, recency, size, and growth since the previous inspection
+- result file metadata for the canonical `.worker-results` location
 - concise heuristics for `healthy`, `low_activity`, `potentially_stuck`, `recently_finished`, or `recent_issue`
 
 Routine guidance:
 
 - start with `dispatcher workers`
 - switch to `--json` when a skill or automation needs structured state
+- use `runtime_paths.worker_results_dir` and each worker entry's `result.path` when you need the structured JSON output for a run
 - tail raw logs only after the worker-status output identifies the task or run worth inspecting
 
 Restart handoff guidance:
@@ -338,7 +454,9 @@ Runtime rules implemented here:
 - atomic double-claim protection via transactional claim plus primary-key lease row
 - heartbeat renewal extends `lease_expires_at`
 - stale recovery returns work to reclaimable `queued` runtime state and records an audit event
-- runtime transitions stay in runtime-owned tables; planner lifecycle is reconciled separately
+- runtime transitions stay in runtime-owned tables; `runtime_status=done` now auto-reconciles planner status to `done` when no review is required
+- `pending_review` remains unreconciled until review is completed explicitly
+- mismatched terminal planner/runtime combinations are surfaced in operator views and dispatcher logs
 
 ## Bootstrap Migration
 

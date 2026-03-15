@@ -1,6 +1,7 @@
 # Voice PTT
 
-`voice-ptt` is a workstation-local background daemon for direct voice input into terminal and chat apps.
+`voice-ptt` is the Linux v1/reference workstation-local background daemon for direct voice input into terminal and chat apps.
+This is the `CENTRAL-OPS-27` implementation. Portable v2 architecture and Windows/WSL notes now live in `/home/cobra/CENTRAL/docs/voice_ptt_v2.md`.
 
 ## What It Does
 
@@ -22,14 +23,17 @@
 
 ## Startup Wiring
 
-The install flow uses two startup paths:
+The install flow uses one reliable startup path:
 
-1. A user `systemd` service with `Restart=always`.
-2. A desktop autostart entry that calls `voice-ptt-launch` at login.
+1. A desktop autostart entry that calls `voice-ptt-launch` at login.
+2. `voice-ptt-launch` imports the live graphical environment into the user `systemd` manager and starts `voice-ptt.service`.
+3. Once started, the service keeps `Restart=always` for crash recovery inside that login session.
 
-The launcher tries `systemctl --user start voice-ptt.service` first. If the user bus is not ready yet, it falls back to starting the daemon directly. The daemon uses `/tmp/voice-ptt.lock` so duplicate launches collapse to one live instance.
+The default-target user-service symlink is intentionally removed during install. That older wiring caused pre-login restart loops on machines where the user manager came up before X11/XWayland access was actually available.
 
-When login autostart launches `voice-ptt-launch`, it also imports the current graphical session environment into the user `systemd` manager before starting the service. That makes `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, and `OPENAI_API_KEY` available to the resident daemon.
+The launcher tries `systemctl --user start voice-ptt.service` first. If the user bus is not ready yet, it falls back to starting the daemon directly. The daemon uses `/tmp/voice-ptt.lock` so duplicate launches collapse to one live instance. The launcher also runs `systemctl --user reset-failed voice-ptt.service` before start so stale failures from earlier boot attempts do not block login startup.
+
+When login autostart launches `voice-ptt-launch`, it imports the current graphical session environment into the user `systemd` manager. That makes `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, and `OPENAI_API_KEY` available to the resident daemon when those variables exist in the login session.
 
 Refresh the live wiring with:
 
@@ -40,7 +44,6 @@ Refresh the live wiring with:
 That script links:
 
 - `~/.config/systemd/user/voice-ptt.service`
-- `~/.config/systemd/user/default.target.wants/voice-ptt.service`
 - `~/.config/autostart/voice-ptt.desktop`
 - `~/.local/bin/voice-ptt-launch`
 
@@ -109,8 +112,11 @@ python3 /home/cobra/CENTRAL/tools/voice_ptt/voice_ptt.py --self-check
 
 - command availability for `ffmpeg`, `paplay`, and the active backend client
 - whether `DISPLAY` is set
+- whether `XAUTHORITY` and `WAYLAND_DISPLAY` are set
 - whether the daemon can connect to X11/XWayland
 - whether the OpenAI API key is visible through `api_key_env` or `api_key_file`
+
+If `DISPLAY` is present but X11 still fails, the tool now calls that out as a desktop-access problem rather than a generic missing-display problem. On this workstation that exact failure mode showed up with `DISPLAY=:0` present but no working X11/XWayland connection.
 
 Foreground debug run:
 
@@ -144,10 +150,31 @@ tail -f /tmp/voice-ptt.log
 
 No extra Python packages are required.
 
+## Tested 2026-03-15
+
+Validated from `/home/cobra/CENTRAL` on the Linux workstation:
+
+- `python3 -m unittest tests.test_voice_ptt_v2` passed.
+- `python3 /home/cobra/CENTRAL/tools/voice_ptt/voice_ptt.py --self-check` confirmed `ffmpeg`, `paplay`, and `curl` were present.
+- The resident service wiring existed at `~/.config/systemd/user/voice-ptt.service` and `~/.local/bin/voice-ptt-launch`.
+- The prior service log showed a restart loop caused by repeated `Unable to open DISPLAY for global hotkey control` failures before desktop access was available.
+
+Not validated end to end on 2026-03-15 from this shell:
+
+- start beep
+- stop beep
+- live microphone recording
+- real transcript round-trip
+- clipboard ownership
+- synthetic paste into a focused app
+
+Exact blocker: this shell had `DISPLAY=:0`, but both `xdpyinfo -display :0` and the daemon self-check failed to open X11, and `~/.Xauthority` was absent. That means the daemon could not reach the active desktop from the available environment, so hotkey/clipboard/paste could not be field-validated here.
+
 ## Troubleshooting
 
 - `Unable to open DISPLAY for global hotkey control`
   - The daemon needs a live X11/XWayland display. Start it from the graphical session, not a headless shell.
+  - If `DISPLAY` is already set, run `python3 /home/cobra/CENTRAL/tools/voice_ptt/voice_ptt.py --self-check` and confirm whether `XAUTHORITY` or X11/XWayland access is missing.
 - `voice-ptt daemon is already running`
   - Another instance owns `/tmp/voice-ptt.lock`. Stop the existing process or remove the stale lock after verifying no daemon is live.
 - `OpenAI backend selected but no API key was found`

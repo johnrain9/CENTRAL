@@ -5,11 +5,17 @@
 This is the CENTRAL-native dispatcher runbook.
 Canonical CENTRAL planning, runtime state, generated views, and bootstrap import live in the CENTRAL DB workflow documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md).
 
-Current implementation lives in:
+Current implementation lives in this repository today:
 
 - repo: `/home/cobra/CENTRAL`
 - runtime script: `/home/cobra/CENTRAL/scripts/central_runtime.py`
 - launcher wrapper: `/home/cobra/CENTRAL/scripts/dispatcher_control.py`
+
+Dispatch extraction target:
+
+- keep this document as the owner of planning and repo-health aggregation responsibility.
+- move runtime code + scripts into a dedicated `dispatcher` repo when ready.
+- keep control-plane monitoring in CENTRAL using `CENTRAL_DISPATCHER_ROOT` and script overrides in `scripts/repo_health.py` and `dispatcher status` wrappers.
 
 ## Runtime Contract
 
@@ -32,6 +38,9 @@ Notes:
 - Set `CENTRAL_WORKER_MODE=stub` for isolated smoke runs or `CENTRAL_WORKER_MODE=codex` for real worker execution.
 - `dispatcher start --max-workers <n>` or `python3 /home/cobra/CENTRAL/scripts/central_runtime.py daemon --max-workers <n>` sets dispatcher concurrency.
 - `dispatcher config --max-workers <n>` persists the launcher default worker limit for later starts and restarts.
+- `dispatcher config --codex-model <model>` persists the dispatcher-wide default Codex model.
+- `CENTRAL_DISPATCHER_CODEX_MODEL=<model>` overrides the saved default model for the current shell session.
+- Worker model precedence is: task `execution.metadata.codex_model`, then dispatcher default, then the built-in fallback `gpt-5-codex`.
 
 ## Manual CLI Flow
 
@@ -47,11 +56,11 @@ Dispatch execution:
 
 ```bash
 python3 /home/cobra/CENTRAL/scripts/central_runtime.py run-once
-python3 /home/cobra/CENTRAL/scripts/central_runtime.py daemon --max-workers 3
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py daemon --max-workers 3 --default-codex-model gpt-5-codex
 python3 /home/cobra/CENTRAL/scripts/central_runtime.py stop
 ```
 
-Worker and report inspection:
+Worker inspection and review queues:
 
 ```bash
 dispatcher workers
@@ -66,6 +75,7 @@ Preferred routine inspection path:
 
 - use `dispatcher workers` for the operator summary
 - use `dispatcher workers --json` or `python3 /home/cobra/CENTRAL/scripts/central_runtime.py worker-status --json` for tool/skill integrations
+- treat `/home/cobra/CENTRAL/state/central_runtime/.worker-results` as the canonical structured worker-output directory
 - treat manual log tailing as a follow-up step only when the structured worker status points to a suspect run
 
 Runtime smoke and self-check:
@@ -105,13 +115,16 @@ Supported commands:
 dispatcher
 dispatcher start
 dispatcher start --max-workers 3
+dispatcher start --codex-model gpt-5-codex
 dispatcher restart
 dispatcher restart --max-workers 3
+dispatcher restart --codex-model gpt-5-codex
 dispatcher stop
 dispatcher status
 dispatcher workers
 dispatcher config
 dispatcher config --max-workers 3
+dispatcher config --codex-model gpt-5-codex
 dispatcher logs
 dispatcher follow
 dispatcher once
@@ -123,16 +136,32 @@ Behavior:
 - auto-runs CENTRAL DB init if needed
 - launches CENTRAL-native `daemon` in the background
 - `dispatcher start --max-workers <n>` launches the daemon with `<n>` workers
+- `dispatcher start --codex-model <model>` applies an immediate dispatcher-wide default Codex model
 - `dispatcher workers` reports active and recent worker runs with heartbeat freshness, log recency, and stuck-suspect heuristics
+- `dispatcher workers --json` exposes `runtime_paths.worker_results_dir` plus per-run `result.path` metadata plus active-run Codex model metadata for the canonical structured output surface
 - `dispatcher config --max-workers <n>` saves the default worker limit to `/home/cobra/CENTRAL/state/central_runtime/dispatcher-config.json`
+- `dispatcher config --codex-model <model>` saves the default Codex model to `/home/cobra/CENTRAL/state/central_runtime/dispatcher-config.json`
 - `dispatcher restart` preserves the currently running worker limit unless a new `--max-workers` value, environment override, or saved config replaces it
+- `dispatcher restart` preserves the currently running default Codex model unless a new `--codex-model` value, environment override, or saved config replaces it
 - `dispatcher stop` and `dispatcher restart` are restart-safe handoff operations: the daemon exits promptly, active workers keep running, and the next dispatcher instance adopts them from persisted lease metadata
-- active worker supervision metadata is persisted in `task_active_leases.lease_metadata_json`, including run id, worker pid, process identity, and prompt/log/result paths needed for adoption
+- active worker supervision metadata is persisted in `task_active_leases.lease_metadata_json`, including run id, worker pid, process identity, prompt/log/result paths, and the selected Codex model needed for adoption and audit
 - a graceful stop extends active leases for a short handoff window; if no dispatcher returns before that grace expires, normal stale-lease recovery rules still apply
 - `CENTRAL_DISPATCHER_MAX_WORKERS=<n>` overrides the saved/default worker limit for the current shell session
+- `CENTRAL_DISPATCHER_CODEX_MODEL=<model>` overrides the saved/default Codex model for the current shell session
 - writes launcher output to CENTRAL runtime state
 - uses the CENTRAL runtime lock file as the source of truth for running state
-- `dispatcher status` shows both the active daemon worker limit and the next-start launcher default/source
+- `dispatcher status` shows both the active daemon worker limit/model and the next-start launcher defaults/sources
+
+### Extracted Dispatcher Boundary
+
+- CENTRAL owns portfolio planning, task truth, repo index, and health questioning (`is the dispatcher working?`).
+- runtime execution and `dispatcher` process operations stay in the extracted runtime repo as its peer service.
+- CENTRAL should only treat runtime as an observed peer; it should not assume dispatcher internals are in-tree.
+- run repo-health snapshot for `dispatcher` with explicit boundaries, for example:
+
+```bash
+CENTRAL_DISPATCHER_ROOT=/path/to/dispatcher-repo python3 /home/cobra/CENTRAL/scripts/repo_health.py snapshot --repo dispatcher
+```
 
 Restart-safe operator path:
 
@@ -152,7 +181,7 @@ Default CENTRAL runtime paths:
 - launcher log: `/home/cobra/CENTRAL/state/central_runtime/dispatcher-launcher.log`
 - launcher config: `/home/cobra/CENTRAL/state/central_runtime/dispatcher-config.json`
 - worker prompts: `/home/cobra/CENTRAL/state/central_runtime/.worker-prompts`
-- worker results: `/home/cobra/CENTRAL/state/central_runtime/.worker-results`
+- worker results: `/home/cobra/CENTRAL/state/central_runtime/.worker-results` (canonical structured worker output)
 - worker logs: `/home/cobra/CENTRAL/state/central_runtime/.worker-logs`
 - worker supervision metadata: persisted in CENTRAL DB lease rows, not only in daemon memory
 

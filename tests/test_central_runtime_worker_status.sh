@@ -199,6 +199,7 @@ python3 "$runtime_cli" worker-status \
 
 python3 - "$idle_json" "$active_json" "$recent_json" "$stuck_json" <<'PY'
 import json
+from pathlib import Path
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -212,6 +213,8 @@ with open(sys.argv[4], encoding="utf-8") as handle:
 
 assert idle["summary"]["overall_status"] == "idle", idle
 assert idle["summary"]["active_count"] == 0, idle
+assert idle["runtime_paths"]["worker_results_dir"].endswith(".worker-results"), idle
+assert Path(idle["runtime_paths"]["worker_results_dir"]).exists(), idle
 
 assert active["summary"]["active_count"] == 1, active
 active_worker = active["active_workers"][0]
@@ -219,13 +222,20 @@ assert active_worker["task_id"] == "CENTRAL-OPS-9100", active_worker
 assert active_worker["runtime_status"] in {"claimed", "running"}, active_worker
 assert active_worker["run_id"], active_worker
 assert active_worker["heartbeat"]["age_seconds"] is not None, active_worker
-assert active_worker["log"]["exists"] is True, active_worker
+assert active_worker["prompt"]["exists"] is True, active_worker
+assert Path(active_worker["result"]["path"]).suffix == ".json", active_worker
+assert ".worker-results" in Path(active_worker["result"]["path"]).parts, active_worker
 assert active_worker["observed_state"] in {"healthy", "low_activity"}, active_worker
 
 recent_worker = next(worker for worker in recent["recent_workers"] if worker["task_id"] == "CENTRAL-OPS-9100")
 assert recent["summary"]["active_count"] == 0, recent
 assert recent_worker["runtime_status"] == "done", recent_worker
 assert recent_worker["run_id"], recent_worker
+assert recent_worker["result"]["exists"] is True, recent_worker
+result_path = Path(recent_worker["result"]["path"])
+assert result_path.suffix == ".json", recent_worker
+assert ".worker-results" in result_path.parts, recent_worker
+assert "CENTRAL-OPS-9100" in result_path.parts, recent_worker
 
 assert stuck["summary"]["overall_status"] == "potentially_stuck", stuck
 assert stuck["summary"]["active_count"] == 1, stuck
@@ -234,5 +244,7 @@ assert stuck_worker["task_id"] == "CENTRAL-OPS-9101", stuck_worker
 assert stuck_worker["observed_state"] == "potentially_stuck", stuck_worker
 assert stuck_worker["heartbeat"]["seconds_until_lease_expiry"] is not None and stuck_worker["heartbeat"]["seconds_until_lease_expiry"] < 0, stuck_worker
 PY
+
+test ! -e "$state_dir/.worker-reports"
 
 echo "central runtime worker-status smoke passed"

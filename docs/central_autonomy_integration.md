@@ -103,8 +103,9 @@ Rules:
 
 - planner lifecycle answers whether work should exist and what the planner believes about its progress
 - runtime lifecycle answers what the worker subsystem is doing now
-- runtime transitions do not silently rewrite planner lifecycle
-- planner reconciliation moves canonical planner state after inspecting runtime evidence
+- runtime `done` auto-reconciles planner lifecycle to `done` when the task does not require review
+- `pending_review` does not auto-reconcile planner lifecycle
+- planner reconciliation still handles review-required, blocked, failed, and timeout outcomes after inspecting runtime evidence
 
 ## Task Identity
 

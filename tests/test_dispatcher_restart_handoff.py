@@ -77,6 +77,12 @@ class DispatcherRestartHandoffTest(unittest.TestCase):
         try:
             task_db.apply_migrations(conn, task_db.load_migrations(task_db.resolve_migrations_dir(None)))
             with conn:
+                task_db.ensure_repo(
+                    conn,
+                    repo_id="CENTRAL",
+                    repo_root=str(REPO_ROOT),
+                    display_name="CENTRAL",
+                )
                 task_db.create_task(conn, worker_task_payload(), actor_kind="self_check", actor_id="central.runtime")
         finally:
             conn.close()

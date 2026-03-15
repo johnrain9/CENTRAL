@@ -22,6 +22,7 @@ import_user_env() {
 
 if [[ -x "$SYSTEMCTL_BIN" ]]; then
   import_user_env || true
+  "$SYSTEMCTL_BIN" --user reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
   if "$SYSTEMCTL_BIN" --user start "$SERVICE_NAME" >/dev/null 2>&1; then
     exit 0
   fi

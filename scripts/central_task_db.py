@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sqlite3
 import sys
 import uuid
@@ -30,7 +31,16 @@ DEFAULT_DURABILITY_DIR = REPO_ROOT / "durability" / "central_db"
 PLANNER_STATUSES = {"todo", "in_progress", "blocked", "done"}
 RUNTIME_STATUSES = {"queued", "claimed", "running", "pending_review", "failed", "timeout", "canceled", "done"}
 ACTIVE_RUNTIME_STATUSES = {"claimed", "running", "pending_review"}
+TERMINAL_RUNTIME_STATUSES = {"pending_review", "failed", "timeout", "canceled", "done"}
+AUTO_RECONCILE_PLANNER_STATUSES = {"todo", "in_progress"}
+TASK_ID_RESERVATION_STATUSES = {"active", "completed", "expired"}
+DEFAULT_TASK_ID_SERIES = "CENTRAL-OPS"
+DEFAULT_TASK_ID_RESERVATION_HOURS = 48
+MAX_TASK_ID_RESERVATION_COUNT = 10
 TASK_FILE_NAME_RE = re.compile(r"^CENTRAL-OPS-[0-9]+\\.md$")
+TASK_ID_RE = re.compile(r"^(?P<series>[A-Z0-9]+(?:-[A-Z0-9]+)*)-(?P<number>[0-9]+)$")
+TASK_ID_SERIES_RE = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)*$")
+REPO_LOOKUP_TOKEN_RE = re.compile(r"[^a-z0-9]+")
 SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
 KEY_VALUE_RE = re.compile(r"^- `([^`]+)`: (.+)$", re.MULTILINE)
 TASK_PACKET_RE = re.compile(r"^## Task (CENTRAL-OPS-[0-9]+): (.+)$", re.MULTILINE)
@@ -176,7 +186,16 @@ def fetch_tables(conn: sqlite3.Connection) -> list[str]:
 
 def require_initialized_db(conn: sqlite3.Connection, db_path: Path) -> None:
     tables = set(fetch_tables(conn))
-    required = {"repos", "tasks", "task_execution_settings", "task_dependencies", "task_events"}
+    required = {
+        "repos",
+        "repo_aliases",
+        "tasks",
+        "task_execution_settings",
+        "task_dependencies",
+        "task_events",
+        "task_id_reservations",
+        "task_id_reservation_events",
+    }
     if not required.issubset(tables):
         die(f"database not initialized at {db_path}; run init first")
 
@@ -270,6 +289,87 @@ def normalize_repo_id(repo_root: str, fallback: str | None = None) -> str:
     if fallback:
         return fallback
     die(f"could not derive repo_id from repo root {repo_root!r}")
+
+
+def normalize_repo_lookup_key(value: str) -> str:
+    return REPO_LOOKUP_TOKEN_RE.sub("", value.strip().casefold())
+
+
+def normalize_repo_root_key(value: str) -> str:
+    return str(Path(value).expanduser()).rstrip("/\\").casefold()
+
+
+def normalize_repo_aliases(aliases: Iterable[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for alias in aliases:
+        cleaned = str(alias).strip()
+        if not cleaned:
+            die("repo aliases cannot be blank")
+        if not normalize_repo_lookup_key(cleaned):
+            die(f"repo alias must contain letters or digits: {alias!r}")
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        normalized.append(cleaned)
+    return normalized
+
+
+def shell_join(parts: Iterable[str]) -> str:
+    return " ".join(shlex.quote(part) for part in parts if part)
+
+
+def build_repo_onboarding_command(
+    *,
+    repo_id: str | None,
+    repo_root: str | None,
+    display_name: str | None = None,
+    aliases: Iterable[str] | None = None,
+    command_name: str = "repo-onboard",
+) -> str:
+    resolved_repo_id = (repo_id or "").strip()
+    resolved_repo_root = (repo_root or "").strip()
+    if not resolved_repo_id and resolved_repo_root:
+        resolved_repo_id = normalize_repo_id(resolved_repo_root, fallback="REPO_ID")
+    if not resolved_repo_id:
+        resolved_repo_id = "REPO_ID"
+    if not resolved_repo_root:
+        resolved_repo_root = "/abs/path/to/repo"
+    resolved_display_name = (display_name or resolved_repo_id).strip() or resolved_repo_id
+    command = [
+        "python3",
+        str(SCRIPT_PATH),
+        command_name,
+        "--repo-id",
+        resolved_repo_id,
+        "--repo-root",
+        resolved_repo_root,
+    ]
+    if resolved_display_name and resolved_display_name != resolved_repo_id:
+        command.extend(["--display-name", resolved_display_name])
+    for alias in normalize_repo_aliases(aliases or []):
+        command.extend(["--alias", alias])
+    return shell_join(command)
+
+
+def normalize_task_id_series(series: str | None) -> str:
+    candidate = (series or DEFAULT_TASK_ID_SERIES).strip().upper()
+    if not candidate or not TASK_ID_SERIES_RE.match(candidate):
+        die(f"invalid task ID series: {series!r}")
+    return candidate
+
+
+def parse_task_id(task_id: str) -> tuple[str, int]:
+    match = TASK_ID_RE.match(task_id.strip().upper())
+    if match is None:
+        die(f"invalid task_id: {task_id!r}")
+    return match.group("series"), int(match.group("number"))
+
+
+def make_task_id(series: str, number: int) -> str:
+    if number <= 0:
+        die(f"task numbers must be positive: {number}")
+    return f"{normalize_task_id_series(series)}-{number}"
 
 
 def now_iso() -> str:
@@ -526,6 +626,21 @@ def ensure_repo(
     metadata: dict[str, Any] | None = None,
 ) -> None:
     timestamp = now_iso()
+    existing = conn.execute(
+        "SELECT display_name, metadata_json FROM repos WHERE repo_id = ?",
+        (repo_id,),
+    ).fetchone()
+    resolved_display_name = (
+        display_name
+        or (str(existing["display_name"]) if existing is not None and existing["display_name"] is not None else repo_id)
+    )
+    resolved_metadata = (
+        metadata
+        if metadata is not None
+        else parse_json_text(str(existing["metadata_json"]), default={})
+        if existing is not None
+        else {}
+    )
     conn.execute(
         """
         INSERT INTO repos (repo_id, display_name, repo_root, is_active, metadata_json, created_at, updated_at)
@@ -538,12 +653,323 @@ def ensure_repo(
         """,
         (
             repo_id,
-            display_name or repo_id,
+            resolved_display_name,
             repo_root,
-            compact_json(metadata or {}),
+            compact_json(resolved_metadata),
             timestamp,
             timestamp,
         ),
+    )
+
+
+def replace_repo_aliases(conn: sqlite3.Connection, *, repo_id: str, aliases: Iterable[str]) -> list[str]:
+    normalized_aliases = normalize_repo_aliases(aliases)
+    timestamp = now_iso()
+    conn.execute("DELETE FROM repo_aliases WHERE repo_id = ?", (repo_id,))
+    for alias in normalized_aliases:
+        conn.execute(
+            """
+            INSERT INTO repo_aliases (repo_id, alias, normalized_alias, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (repo_id, alias, normalize_repo_lookup_key(alias), timestamp, timestamp),
+        )
+    return normalized_aliases
+
+
+def load_repo_aliases_map(
+    conn: sqlite3.Connection,
+    *,
+    repo_ids: Iterable[str] | None = None,
+) -> dict[str, list[str]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if repo_ids is not None:
+        repo_ids = list(repo_ids)
+        if not repo_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in repo_ids)
+        clauses.append(f"repo_id IN ({placeholders})")
+        params.extend(repo_ids)
+    query = "SELECT repo_id, alias FROM repo_aliases"
+    if clauses:
+        query += f" WHERE {' AND '.join(clauses)}"
+    query += " ORDER BY repo_id ASC, alias ASC"
+    rows = conn.execute(query, tuple(params)).fetchall()
+    aliases: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        aliases[str(row["repo_id"])].append(str(row["alias"]))
+    return dict(aliases)
+
+
+def build_repo_payload(
+    row: sqlite3.Row,
+    *,
+    aliases: list[str] | None = None,
+    lookup: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "repo_id": str(row["repo_id"]),
+        "display_name": str(row["display_name"]),
+        "repo_root": str(row["repo_root"]),
+        "is_active": bool(row["is_active"]),
+        "metadata": parse_json_text(row["metadata_json"], default={}),
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
+        "aliases": aliases or [],
+    }
+    if lookup is not None:
+        payload["lookup"] = lookup
+    return payload
+
+
+def fetch_repo_payload(conn: sqlite3.Connection, repo_id: str) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM repos WHERE repo_id = ?", (repo_id,)).fetchone()
+    if row is None:
+        return None
+    aliases = load_repo_aliases_map(conn, repo_ids=[repo_id]).get(repo_id, [])
+    return build_repo_payload(row, aliases=aliases)
+
+
+def fetch_repo_registry(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute("SELECT * FROM repos ORDER BY repo_id ASC").fetchall()
+    alias_map = load_repo_aliases_map(conn, repo_ids=[str(row["repo_id"]) for row in rows])
+    return [
+        build_repo_payload(row, aliases=alias_map.get(str(row["repo_id"]), []))
+        for row in rows
+    ]
+
+
+def iter_repo_lookup_candidates(repo: dict[str, Any]) -> Iterable[tuple[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    raw_values = [
+        ("repo_id", str(repo["repo_id"])),
+        ("display_name", str(repo["display_name"])),
+        ("repo_root", str(repo["repo_root"])),
+    ]
+    root_name = Path(str(repo["repo_root"])).name.strip()
+    if root_name:
+        raw_values.append(("repo_root_basename", root_name))
+    raw_values.extend(("alias", alias) for alias in repo.get("aliases", []))
+    for kind, value in raw_values:
+        cleaned = str(value).strip()
+        key = (kind, cleaned)
+        if not cleaned or key in seen:
+            continue
+        seen.add(key)
+        yield kind, cleaned
+
+
+def format_repo_reference_matches(matches: dict[str, set[str]]) -> str:
+    return ", ".join(
+        f"{repo_id} ({'/'.join(sorted(kinds))})"
+        for repo_id, kinds in sorted(matches.items())
+    )
+
+
+def resolve_repo_reference(
+    conn: sqlite3.Connection,
+    reference: str,
+    *,
+    field: str = "repo",
+    allow_missing: bool = False,
+) -> dict[str, Any] | None:
+    query = reference.strip()
+    if not query:
+        die(f"{field} reference cannot be blank")
+    registry = fetch_repo_registry(conn)
+    if not registry:
+        if allow_missing:
+            return None
+        die(f"no repos are registered; cannot resolve {field} reference {reference!r}")
+
+    query_key = normalize_repo_lookup_key(query)
+    query_root_key = normalize_repo_root_key(query) if "/" in query or "\\" in query else None
+    exact_matches: dict[str, set[str]] = defaultdict(set)
+    normalized_matches: dict[str, set[str]] = defaultdict(set)
+    for repo in registry:
+        repo_id = str(repo["repo_id"])
+        for kind, candidate in iter_repo_lookup_candidates(repo):
+            if kind == "repo_root":
+                if candidate == query or (query_root_key is not None and normalize_repo_root_key(candidate) == query_root_key):
+                    exact_matches[repo_id].add(kind)
+                continue
+            if candidate == query:
+                exact_matches[repo_id].add(kind)
+            if query_key and normalize_repo_lookup_key(candidate) == query_key:
+                normalized_matches[repo_id].add(kind)
+
+    for match_quality, matches in (("exact", exact_matches), ("normalized", normalized_matches)):
+        if not matches:
+            continue
+        if len(matches) > 1:
+            die(
+                f"ambiguous {field} reference {reference!r}: "
+                f"{format_repo_reference_matches(matches)}. Use a canonical repo_id."
+            )
+        repo_id, kinds = next(iter(matches.items()))
+        repo = next(item for item in registry if str(item["repo_id"]) == repo_id)
+        repo["lookup"] = {
+            "reference": reference,
+            "match_quality": match_quality,
+            "matched_by": sorted(kinds),
+        }
+        return repo
+
+    if allow_missing:
+        return None
+    known_repo_ids = ", ".join(str(repo["repo_id"]) for repo in registry)
+    die(f"unknown {field} reference {reference!r}; known repo_ids: {known_repo_ids}")
+
+
+def resolve_repo_filter(conn: sqlite3.Connection, repo_reference: str | None) -> str | None:
+    if repo_reference is None:
+        return None
+    resolved = resolve_repo_reference(conn, repo_reference, field="repo")
+    return None if resolved is None else str(resolved["repo_id"])
+
+
+def registered_repo_ids(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute("SELECT repo_id FROM repos ORDER BY repo_id ASC").fetchall()
+    return [str(row["repo_id"]) for row in rows]
+
+
+def known_repo_ids_summary(conn: sqlite3.Connection) -> str:
+    repo_ids = registered_repo_ids(conn)
+    return ", ".join(repo_ids) if repo_ids else "(none)"
+
+
+def die_repo_onboarding_required(
+    conn: sqlite3.Connection,
+    *,
+    operation: str,
+    repo_id: str | None,
+    repo_root: str | None,
+    reason: str,
+    aliases: Iterable[str] | None = None,
+) -> "None":
+    command = build_repo_onboarding_command(
+        repo_id=repo_id,
+        repo_root=repo_root,
+        aliases=aliases,
+    )
+    verify_reference = repo_id or repo_root or "REPO_ID"
+    lines = [
+        f"repo onboarding required before {operation}.",
+        reason,
+        f"Register the repo first: {command}",
+        f"Verify the canonical identity: {shell_join(['python3', str(SCRIPT_PATH), 'repo-resolve', '--repo', verify_reference])}",
+        f"Known repo_ids: {known_repo_ids_summary(conn)}",
+    ]
+    die("\n".join(lines))
+
+
+def resolve_task_repo_target(conn: sqlite3.Connection, normalized: dict[str, Any]) -> dict[str, Any] | None:
+    target_repo_root = normalized.get("target_repo_root")
+    target_repo_id = normalized.get("target_repo_id")
+    resolved_by_root = None
+    resolved_by_id = None
+    if target_repo_root is not None:
+        resolved_by_root = resolve_repo_reference(
+            conn,
+            str(target_repo_root),
+            field="target_repo_root",
+            allow_missing=True,
+        )
+    if target_repo_id is not None:
+        resolved_by_id = resolve_repo_reference(
+            conn,
+            str(target_repo_id),
+            field="target_repo_id",
+            allow_missing=True,
+        )
+    if resolved_by_root and resolved_by_id and resolved_by_root["repo_id"] != resolved_by_id["repo_id"]:
+        die(
+            "conflicting repo target references: "
+            f"target_repo_id={target_repo_id!r} resolved to {resolved_by_id['repo_id']} "
+            f"but target_repo_root={target_repo_root!r} resolved to {resolved_by_root['repo_id']}"
+        )
+    operation = "planner task creation/update"
+    if target_repo_id is not None and resolved_by_id is None and resolved_by_root is not None:
+        die_repo_onboarding_required(
+            conn,
+            operation=operation,
+            repo_id=str(resolved_by_root["repo_id"]),
+            repo_root=str(resolved_by_root["repo_root"]),
+            aliases=[str(target_repo_id)],
+            reason=(
+                f"target_repo_id {target_repo_id!r} is not registered for canonical repo "
+                f"{resolved_by_root['repo_id']!r} at {resolved_by_root['repo_root']!r}. "
+                "Use the canonical repo_id or add the alias explicitly."
+            ),
+        )
+    if target_repo_root is not None and resolved_by_root is None and resolved_by_id is not None:
+        die_repo_onboarding_required(
+            conn,
+            operation=operation,
+            repo_id=str(resolved_by_id["repo_id"]),
+            repo_root=str(resolved_by_id["repo_root"]),
+            reason=(
+                f"target_repo_root {target_repo_root!r} is not the canonical repo_root for "
+                f"{resolved_by_id['repo_id']!r}. Registered repo_root: {resolved_by_id['repo_root']!r}. "
+                "Update the registry first if the repo moved."
+            ),
+        )
+    resolved = resolved_by_root or resolved_by_id
+    if resolved is None:
+        die_repo_onboarding_required(
+            conn,
+            operation=operation,
+            repo_id=str(target_repo_id) if target_repo_id is not None else None,
+            repo_root=str(target_repo_root) if target_repo_root is not None else None,
+            reason=(
+                f"target repo is not registered: target_repo_id={target_repo_id!r}, "
+                f"target_repo_root={target_repo_root!r}."
+            ),
+        )
+    normalized["target_repo_id"] = str(resolved["repo_id"])
+    normalized["target_repo_root"] = str(resolved["repo_root"])
+    normalized["target_repo_display_name"] = str(resolved["display_name"])
+    return resolved
+
+
+def render_repo_rows(rows: list[dict[str, Any]]) -> str:
+    return render_table(
+        [
+            {
+                "repo_id": row["repo_id"],
+                "display_name": row["display_name"],
+                "repo_root": row["repo_root"],
+                "active": "yes" if row["is_active"] else "no",
+                "aliases": ", ".join(row.get("aliases", [])),
+            }
+            for row in rows
+        ],
+        [
+            ("repo_id", "repo_id"),
+            ("display_name", "display_name"),
+            ("repo_root", "repo_root"),
+            ("active", "active"),
+            ("aliases", "aliases"),
+        ],
+    )
+
+
+def render_repo_detail(row: dict[str, Any]) -> str:
+    metadata = row.get("metadata") or {}
+    metadata_text = json.dumps(metadata, indent=2, sort_keys=True) if metadata else "(none)"
+    return "\n".join(
+        [
+            f"repo_id: {row['repo_id']}",
+            f"display_name: {row['display_name']}",
+            f"repo_root: {row['repo_root']}",
+            f"active: {'yes' if row['is_active'] else 'no'}",
+            f"aliases: {', '.join(row.get('aliases', [])) or '(none)'}",
+            "metadata:",
+            "\n  ".join(metadata_text.splitlines()),
+            f"created_at: {row['created_at']}",
+            f"updated_at: {row['updated_at']}",
+        ]
     )
 
 
@@ -562,6 +988,23 @@ def insert_event(
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         (task_id, event_type, actor_kind, actor_id, compact_json(payload or {}), now_iso()),
+    )
+
+
+def insert_task_id_reservation_event(
+    conn: sqlite3.Connection,
+    *,
+    reservation_id: str,
+    event_type: str,
+    actor_id: str,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO task_id_reservation_events (reservation_id, event_type, actor_id, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (reservation_id, event_type, actor_id, compact_json(payload or {}), now_iso()),
     )
 
 
@@ -666,6 +1109,305 @@ def fetch_active_lease(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row | 
     return conn.execute("SELECT * FROM task_active_leases WHERE task_id = ?", (task_id,)).fetchone()
 
 
+def parse_iso8601(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def fetch_task_numbers_for_series(conn: sqlite3.Connection, series: str) -> set[int]:
+    normalized_series = normalize_task_id_series(series)
+    rows = conn.execute(
+        "SELECT task_id FROM tasks WHERE task_id LIKE ?",
+        (f"{normalized_series}-%",),
+    ).fetchall()
+    numbers: set[int] = set()
+    for row in rows:
+        task_series, task_number = parse_task_id(str(row["task_id"]))
+        if task_series == normalized_series:
+            numbers.add(task_number)
+    return numbers
+
+
+def fetch_task_id_reservation_events(
+    conn: sqlite3.Connection,
+    reservation_ids: Iterable[str],
+    *,
+    limit_per_reservation: int = 10,
+) -> dict[str, list[dict[str, Any]]]:
+    reservation_ids = [item for item in reservation_ids if item]
+    if not reservation_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in reservation_ids)
+    rows = conn.execute(
+        f"""
+        SELECT event_id, reservation_id, event_type, actor_id, payload_json, created_at
+        FROM task_id_reservation_events
+        WHERE reservation_id IN ({placeholders})
+        ORDER BY event_id DESC
+        """,
+        tuple(reservation_ids),
+    ).fetchall()
+    events_by_reservation: dict[str, list[dict[str, Any]]] = {reservation_id: [] for reservation_id in reservation_ids}
+    for row in rows:
+        reservation_id = str(row["reservation_id"])
+        bucket = events_by_reservation.setdefault(reservation_id, [])
+        if len(bucket) >= limit_per_reservation:
+            continue
+        bucket.append(
+            {
+                "event_id": row["event_id"],
+                "event_type": row["event_type"],
+                "actor_id": row["actor_id"],
+                "payload": parse_json_text(row["payload_json"], default={}),
+                "created_at": row["created_at"],
+            }
+        )
+    return events_by_reservation
+
+
+def fetch_task_id_reservation_rows(
+    conn: sqlite3.Connection,
+    *,
+    series: str | None = None,
+    status: str | None = None,
+    reservation_id: str | None = None,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if reservation_id is not None:
+        clauses.append("reservation_id = ?")
+        params.append(reservation_id)
+    if series is not None:
+        clauses.append("series = ?")
+        params.append(normalize_task_id_series(series))
+    if status is not None:
+        if status not in TASK_ID_RESERVATION_STATUSES:
+            die(f"invalid reservation status: {status}")
+        clauses.append("status = ?")
+        params.append(status)
+    query = """
+        SELECT *
+        FROM task_id_reservations
+    """
+    if clauses:
+        query += f" WHERE {' AND '.join(clauses)}"
+    query += " ORDER BY created_at DESC, reservation_id DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    return conn.execute(query, tuple(params)).fetchall()
+
+
+def build_task_id_reservation_payload(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    include_events: bool = False,
+    events: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    series = str(row["series"])
+    start_number = int(row["start_number"])
+    end_number = int(row["end_number"])
+    task_numbers = fetch_task_numbers_for_series(conn, series)
+    reserved_numbers = list(range(start_number, end_number + 1))
+    existing_numbers = sorted(number for number in reserved_numbers if number in task_numbers)
+    open_numbers = sorted(number for number in reserved_numbers if number not in task_numbers)
+    payload = {
+        "reservation_id": row["reservation_id"],
+        "series": series,
+        "range_start": start_number,
+        "range_end": end_number,
+        "range_label": f"{series}-{start_number}..{series}-{end_number}",
+        "count": len(reserved_numbers),
+        "task_ids": [make_task_id(series, number) for number in reserved_numbers],
+        "existing_task_ids": [make_task_id(series, number) for number in existing_numbers],
+        "open_task_ids": [make_task_id(series, number) for number in open_numbers],
+        "filled_count": len(existing_numbers),
+        "open_count": len(open_numbers),
+        "status": row["status"],
+        "reserved_by": row["reserved_by"],
+        "reserved_for": row["reserved_for"],
+        "note": row["note"],
+        "metadata": parse_json_text(row["metadata_json"], default={}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "expires_at": row["expires_at"],
+        "resolved_at": row["resolved_at"],
+    }
+    if include_events:
+        payload["events"] = (events or {}).get(str(row["reservation_id"]), [])
+    return payload
+
+
+def reconcile_task_id_reservations(
+    conn: sqlite3.Connection,
+    *,
+    series: str | None = None,
+    actor_id: str,
+) -> list[dict[str, Any]]:
+    rows = fetch_task_id_reservation_rows(conn, series=series, status="active")
+    if not rows:
+        return []
+    now_value = now_iso()
+    now_dt = parse_iso8601(now_value)
+    task_numbers_by_series: dict[str, set[int]] = {}
+    updates: list[dict[str, Any]] = []
+    for row in rows:
+        row_series = str(row["series"])
+        if row_series not in task_numbers_by_series:
+            task_numbers_by_series[row_series] = fetch_task_numbers_for_series(conn, row_series)
+        task_numbers = task_numbers_by_series[row_series]
+        reserved_numbers = list(range(int(row["start_number"]), int(row["end_number"]) + 1))
+        existing_task_ids = [make_task_id(row_series, number) for number in reserved_numbers if number in task_numbers]
+        missing_task_ids = [make_task_id(row_series, number) for number in reserved_numbers if number not in task_numbers]
+        new_status: str | None = None
+        event_type: str | None = None
+        if not missing_task_ids:
+            new_status = "completed"
+            event_type = "planner.task_id_reservation_completed"
+        elif parse_iso8601(str(row["expires_at"])) <= now_dt:
+            new_status = "expired"
+            event_type = "planner.task_id_reservation_expired"
+        if new_status is None or new_status == str(row["status"]):
+            continue
+        conn.execute(
+            """
+            UPDATE task_id_reservations
+            SET status = ?, updated_at = ?, resolved_at = ?
+            WHERE reservation_id = ?
+            """,
+            (new_status, now_value, now_value, row["reservation_id"]),
+        )
+        insert_task_id_reservation_event(
+            conn,
+            reservation_id=str(row["reservation_id"]),
+            event_type=event_type,
+            actor_id=actor_id,
+            payload={
+                "series": row_series,
+                "existing_task_ids": existing_task_ids,
+                "open_task_ids": missing_task_ids,
+            },
+        )
+        updates.append(
+            {
+                "reservation_id": row["reservation_id"],
+                "status": new_status,
+                "existing_task_ids": existing_task_ids,
+                "open_task_ids": missing_task_ids,
+            }
+        )
+    return updates
+
+
+def next_task_id_payload(conn: sqlite3.Connection, *, series: str, actor_id: str) -> dict[str, Any]:
+    normalized_series = normalize_task_id_series(series)
+    reconcile_task_id_reservations(conn, series=normalized_series, actor_id=actor_id)
+    task_numbers = fetch_task_numbers_for_series(conn, normalized_series)
+    reservation_rows = fetch_task_id_reservation_rows(conn, series=normalized_series, status="active")
+    highest_existing_number = max(task_numbers, default=0)
+    highest_active_reservation_number = max((int(row["end_number"]) for row in reservation_rows), default=0)
+    next_number = max(highest_existing_number, highest_active_reservation_number) + 1
+    return {
+        "series": normalized_series,
+        "strategy": "monotonic_high_watermark",
+        "next_number": next_number,
+        "next_task_id": make_task_id(normalized_series, next_number),
+        "highest_existing_number": highest_existing_number,
+        "highest_active_reservation_number": highest_active_reservation_number,
+        "active_reservation_count": len(reservation_rows),
+    }
+
+
+def reserve_task_id_range(
+    conn: sqlite3.Connection,
+    *,
+    series: str,
+    count: int,
+    reserved_by: str,
+    reserved_for: str | None,
+    note: str | None,
+    reservation_hours: int,
+) -> dict[str, Any]:
+    normalized_series = normalize_task_id_series(series)
+    if count <= 0:
+        die("reservation count must be positive")
+    if count > MAX_TASK_ID_RESERVATION_COUNT:
+        die(f"reservation count exceeds max {MAX_TASK_ID_RESERVATION_COUNT}")
+    if reservation_hours <= 0:
+        die("reservation duration must be positive hours")
+    begin_immediate(conn)
+    next_payload = next_task_id_payload(conn, series=normalized_series, actor_id=reserved_by)
+    start_number = int(next_payload["next_number"])
+    end_number = start_number + count - 1
+    existing_numbers = fetch_task_numbers_for_series(conn, normalized_series)
+    if any(number in existing_numbers for number in range(start_number, end_number + 1)):
+        conn.rollback()
+        die(f"reservation range collides with existing tasks in {normalized_series}")
+    active_rows = fetch_task_id_reservation_rows(conn, series=normalized_series, status="active")
+    for row in active_rows:
+        if start_number <= int(row["end_number"]) and end_number >= int(row["start_number"]):
+            conn.rollback()
+            die(f"reservation range overlaps active reservation {row['reservation_id']}")
+    created_at = now_iso()
+    expires_at = datetime.fromtimestamp(
+        parse_iso8601(created_at).timestamp() + reservation_hours * 3600,
+        tz=timezone.utc,
+    ).replace(microsecond=0).isoformat()
+    reservation_id = f"{normalized_series}-{start_number}-{end_number}-{uuid.uuid4().hex[:8]}"
+    conn.execute(
+        """
+        INSERT INTO task_id_reservations (
+            reservation_id,
+            series,
+            start_number,
+            end_number,
+            reserved_by,
+            reserved_for,
+            note,
+            status,
+            metadata_json,
+            created_at,
+            updated_at,
+            expires_at,
+            resolved_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL)
+        """,
+        (
+            reservation_id,
+            normalized_series,
+            start_number,
+            end_number,
+            reserved_by,
+            reserved_for,
+            note,
+            compact_json({"source": "planner_cli"}),
+            created_at,
+            created_at,
+            expires_at,
+        ),
+    )
+    insert_task_id_reservation_event(
+        conn,
+        reservation_id=reservation_id,
+        event_type="planner.task_id_reservation_created",
+        actor_id=reserved_by,
+        payload={
+            "series": normalized_series,
+            "start_number": start_number,
+            "end_number": end_number,
+            "reserved_for": reserved_for,
+            "note": note,
+            "expires_at": expires_at,
+        },
+    )
+    conn.commit()
+    row = fetch_task_id_reservation_rows(conn, reservation_id=reservation_id, limit=1)[0]
+    events = fetch_task_id_reservation_events(conn, [reservation_id], limit_per_reservation=10)
+    return build_task_id_reservation_payload(conn, row, include_events=True, events=events)
+
+
 def load_dependencies(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
     task_ids = list(task_ids)
     if not task_ids:
@@ -739,6 +1481,46 @@ def fetch_artifacts(conn: sqlite3.Connection, task_id: str) -> list[dict[str, An
         }
         for row in rows
     ]
+
+
+def detect_status_mismatch(
+    *,
+    task_id: str,
+    planner_status: str,
+    runtime_status: str | None,
+) -> dict[str, Any] | None:
+    if runtime_status is None or runtime_status not in TERMINAL_RUNTIME_STATUSES:
+        return None
+    if runtime_status == "done":
+        if planner_status == "done":
+            return None
+        severity = "warning" if planner_status in AUTO_RECONCILE_PLANNER_STATUSES else "error"
+        return {
+            "task_id": task_id,
+            "severity": severity,
+            "code": "runtime_done_planner_not_done",
+            "summary": f"runtime finished with done while planner remained {planner_status}",
+            "operator_action": "inspect dispatcher auto-reconcile logs and rerun closeout only if the runtime result is trustworthy",
+        }
+    if runtime_status == "pending_review":
+        if planner_status == "done":
+            return {
+                "task_id": task_id,
+                "severity": "error",
+                "code": "pending_review_planner_done",
+                "summary": "runtime requires review but planner is already done",
+                "operator_action": "re-open planner state or finish the review path explicitly",
+            }
+        return None
+    if planner_status == "done":
+        return {
+            "task_id": task_id,
+            "severity": "error",
+            "code": f"planner_done_runtime_{runtime_status}",
+            "summary": f"planner is done while runtime ended as {runtime_status}",
+            "operator_action": "inspect runtime evidence and reconcile the planner closeout or reopen the task",
+        }
+    return None
 
 
 def fetch_task_snapshots(
@@ -881,6 +1663,11 @@ def fetch_task_snapshots(
                 "dependencies": dependencies,
                 "blocking_dependency_ids": blocker_ids,
                 "dependency_blocked": bool(blocker_ids),
+                "status_mismatch": detect_status_mismatch(
+                    task_id=str(row["task_id"]),
+                    planner_status=str(row["planner_status"]),
+                    runtime_status=str(row["runtime_status"]) if row["runtime_status"] is not None else None,
+                ),
             }
         )
     return snapshots
@@ -1044,13 +1831,9 @@ def merge_task_metadata(existing_raw: str, incoming: dict[str, Any] | None) -> d
 
 def create_task(conn: sqlite3.Connection, payload: dict[str, Any], *, actor_kind: str, actor_id: str) -> dict[str, Any]:
     normalized = validate_task_payload(payload, for_update=False)
+    resolve_task_repo_target(conn, normalized)
+    task_series, _ = parse_task_id(normalized["task_id"])
     timestamp = now_iso()
-    ensure_repo(
-        conn,
-        repo_id=normalized["target_repo_id"],
-        repo_root=normalized["target_repo_root"],
-        display_name=normalized.get("target_repo_display_name") or normalized["target_repo_id"],
-    )
     conn.execute(
         """
         INSERT INTO tasks (
@@ -1125,6 +1908,7 @@ def create_task(conn: sqlite3.Connection, payload: dict[str, Any], *, actor_kind
             "dependencies": normalized["dependencies"],
         },
     )
+    reconcile_task_id_reservations(conn, series=task_series, actor_id=actor_id)
     return fetch_task_snapshots(conn, task_id=normalized["task_id"])[0]
 
 
@@ -1139,6 +1923,8 @@ def update_task(
     allow_active_lease: bool,
 ) -> dict[str, Any]:
     normalized = validate_task_payload(payload, for_update=True)
+    if "target_repo_id" in normalized or "target_repo_root" in normalized:
+        resolve_task_repo_target(conn, normalized)
     current_row = fetch_task_row(conn, task_id)
     if current_row is None:
         die(f"task not found: {task_id}")
@@ -1185,29 +1971,6 @@ def update_task(
         merged["closed_at"] = merged["updated_at"]
     elif "planner_status" in normalized and normalized["planner_status"] != "done":
         merged["closed_at"] = None
-
-    if "target_repo_id" in normalized:
-        repo_root = normalized.get("target_repo_root") or str(current_row["target_repo_id"])
-        if "target_repo_root" not in normalized:
-            repo_existing = conn.execute(
-                "SELECT repo_root, display_name FROM repos WHERE repo_id = ?",
-                (normalized["target_repo_id"],),
-            ).fetchone()
-            if repo_existing is not None:
-                repo_root = str(repo_existing["repo_root"])
-        ensure_repo(
-            conn,
-            repo_id=normalized["target_repo_id"],
-            repo_root=repo_root,
-            display_name=normalized.get("target_repo_display_name") or normalized["target_repo_id"],
-        )
-    elif "target_repo_root" in normalized:
-        ensure_repo(
-            conn,
-            repo_id=str(current_row["target_repo_id"]),
-            repo_root=normalized["target_repo_root"],
-            display_name=normalized.get("target_repo_display_name") or str(current_row["target_repo_id"]),
-        )
 
     cursor = conn.execute(
         """
@@ -1384,6 +2147,106 @@ def reconcile_task(
     return fetch_task_snapshots(conn, task_id=task_id)[0]
 
 
+def auto_reconcile_runtime_success(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    summary: str,
+    notes: str | None,
+    tests: str | None,
+    artifacts: list[str],
+    actor_id: str,
+    run_id: str | None,
+) -> dict[str, Any]:
+    begin_immediate(conn)
+    snapshots = fetch_task_snapshots(conn, task_id=task_id)
+    if not snapshots:
+        conn.rollback()
+        raise RuntimeError(f"task not found: {task_id}")
+    snapshot = snapshots[0]
+    runtime = snapshot.get("runtime") or {}
+    runtime_status = str(runtime.get("runtime_status") or "")
+    planner_status = str(snapshot.get("planner_status") or "")
+    if runtime_status != "done":
+        conn.rollback()
+        raise RuntimeError(f"task {task_id} is not eligible for auto-reconcile from runtime_status={runtime_status or 'none'}")
+    if planner_status == "done":
+        conn.rollback()
+        return snapshot
+    if planner_status not in AUTO_RECONCILE_PLANNER_STATUSES:
+        conn.rollback()
+        raise RuntimeError(f"task {task_id} cannot auto-reconcile planner_status={planner_status} from runtime_status=done")
+
+    current_row = fetch_task_row(conn, task_id)
+    if current_row is None:
+        conn.rollback()
+        raise RuntimeError(f"task not found: {task_id}")
+    closeout_summary = summary.strip() or "runtime completed successfully"
+    closeout_notes = notes.strip() if notes else None
+    closeout_tests = tests.strip() if tests else None
+    updated_at = now_iso()
+    metadata = merge_task_metadata(current_row["metadata_json"], None)
+    metadata["closeout"] = {
+        "outcome": "done",
+        "summary": closeout_summary,
+        "notes": closeout_notes,
+        "tests": closeout_tests,
+        "reconciled_at": updated_at,
+        "actor_id": actor_id,
+        "source": "runtime_auto_reconcile",
+        "runtime_status": runtime_status,
+        "runtime_finished_at": runtime.get("finished_at"),
+        "runtime_run_id": run_id,
+    }
+    next_version = int(current_row["version"]) + 1
+    conn.execute(
+        """
+        UPDATE tasks
+        SET planner_status = 'done',
+            version = ?,
+            worker_owner = NULL,
+            updated_at = ?,
+            closed_at = ?,
+            metadata_json = ?
+        WHERE task_id = ? AND version = ?
+        """,
+        (
+            next_version,
+            updated_at,
+            updated_at,
+            compact_json(metadata),
+            task_id,
+            int(current_row["version"]),
+        ),
+    )
+    for artifact in artifacts:
+        insert_artifact(
+            conn,
+            task_id=task_id,
+            artifact_kind="planner_closeout",
+            path_or_uri=artifact,
+            label=Path(artifact).name,
+            metadata={"reconciled_by": actor_id, "outcome": "done", "source": "runtime_auto_reconcile"},
+        )
+    insert_event(
+        conn,
+        task_id=task_id,
+        event_type="planner.task_auto_reconciled",
+        actor_kind="runtime",
+        actor_id=actor_id,
+        payload={
+            "outcome": "done",
+            "summary": closeout_summary,
+            "notes": closeout_notes,
+            "tests": closeout_tests,
+            "artifacts": artifacts,
+            "run_id": run_id,
+        },
+    )
+    conn.commit()
+    return fetch_task_snapshots(conn, task_id=task_id)[0]
+
+
 def summarize_portfolio(conn: sqlite3.Connection) -> dict[str, Any]:
     generated_at = now_iso()
     snapshots = fetch_task_snapshots(conn)
@@ -1393,6 +2256,7 @@ def summarize_portfolio(conn: sqlite3.Connection) -> dict[str, Any]:
     per_repo: dict[str, dict[str, int]] = defaultdict(lambda: {"total": 0, "eligible": 0, "blocked": 0, "pending_review": 0, "running": 0})
     blocked_rows: list[dict[str, Any]] = []
     review_rows: list[dict[str, Any]] = []
+    mismatch_rows: list[dict[str, Any]] = []
     for snapshot in snapshots:
         planner_counts[snapshot["planner_status"]] = planner_counts.get(snapshot["planner_status"], 0) + 1
         runtime_status = snapshot["runtime"]["runtime_status"] if snapshot["runtime"] else None
@@ -1410,6 +2274,8 @@ def summarize_portfolio(conn: sqlite3.Connection) -> dict[str, Any]:
             review_rows.append(snapshot)
         if runtime_status == "running":
             repo_summary["running"] += 1
+        if snapshot["status_mismatch"]:
+            mismatch_rows.append(snapshot)
     return {
         "generated_at": generated_at,
         "planner_counts": planner_counts,
@@ -1434,6 +2300,18 @@ def summarize_portfolio(conn: sqlite3.Connection) -> dict[str, Any]:
             ),
             default=None,
         ),
+        "mismatch_count": len(mismatch_rows),
+        "mismatches": [
+            {
+                "task_id": row["task_id"],
+                "repo": row["target_repo_id"],
+                "planner_status": row["planner_status"],
+                "runtime_status": row["runtime"]["runtime_status"] if row["runtime"] else None,
+                "severity": row["status_mismatch"]["severity"],
+                "summary": row["status_mismatch"]["summary"],
+            }
+            for row in mismatch_rows[:10]
+        ],
         "per_repo": [
             {
                 "repo_id": repo_id,
@@ -1457,6 +2335,12 @@ def format_summary_text(summary: dict[str, Any]) -> str:
     lines.append(
         f"Pending review: {summary['pending_review_count']} (oldest {summary['oldest_pending_review_at'] or 'n/a'})"
     )
+    lines.append(f"Mismatches: {summary['mismatch_count']}")
+    if summary["mismatches"]:
+        for mismatch in summary["mismatches"]:
+            lines.append(
+                f"- [{mismatch['severity']}] {mismatch['task_id']} planner={mismatch['planner_status']} runtime={mismatch['runtime_status']} | {mismatch['summary']}"
+            )
     lines.append("")
     lines.append("Top eligible:")
     for item in summary["top_eligible"]:
@@ -1534,17 +2418,27 @@ def format_review_rows(snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for snapshot in snapshots:
         runtime = snapshot["runtime"]
-        if runtime is None or runtime["runtime_status"] not in {"pending_review", "failed", "timeout"}:
+        mismatch = snapshot["status_mismatch"]
+        if (
+            mismatch is None
+            and (runtime is None or runtime["runtime_status"] not in {"pending_review", "failed", "timeout"})
+        ):
             continue
         rows.append(
             {
                 "task_id": snapshot["task_id"],
                 "repo": snapshot["target_repo_id"],
-                "runtime_status": runtime["runtime_status"],
+                "runtime_status": runtime["runtime_status"] if runtime else "",
                 "planner_status": snapshot["planner_status"],
-                "age_at": runtime.get("pending_review_at") or runtime.get("last_transition_at") or "",
-                "claimed_by": runtime.get("claimed_by") or "",
-                "last_error": runtime.get("last_runtime_error") or "",
+                "age_at": (
+                    (runtime.get("pending_review_at") or runtime.get("last_transition_at") or "")
+                    if runtime
+                    else ""
+                ),
+                "claimed_by": runtime.get("claimed_by") or "" if runtime else "",
+                "last_error": runtime.get("last_runtime_error") or "" if runtime else "",
+                "severity": mismatch["severity"] if mismatch else "review",
+                "status_warning": mismatch["summary"] if mismatch else "",
                 "title": snapshot["title"],
             }
         )
@@ -1560,6 +2454,7 @@ def render_task_card(snapshot: dict[str, Any]) -> dict[str, Any]:
         "priority": snapshot["priority"],
         "planner_status": snapshot["planner_status"],
         "runtime_status": snapshot["runtime"]["runtime_status"] if snapshot["runtime"] else None,
+        "status_mismatch": snapshot["status_mismatch"],
         "target_repo_id": snapshot["target_repo_id"],
         "target_repo_root": snapshot["target_repo_root"],
         "planner_owner": snapshot["planner_owner"],
@@ -1800,7 +2695,8 @@ def runtime_claim(
     lease_seconds: int,
     task_id: str | None,
     actor_id: str,
-) -> dict[str, Any]:
+    raise_on_empty: bool = True,
+) -> dict[str, Any] | None:
     begin_immediate(conn)
     snapshots = fetch_task_snapshots(conn, task_id=task_id) if task_id else fetch_task_snapshots(conn)
     ordered = order_eligible_snapshots(snapshots)
@@ -1808,7 +2704,9 @@ def runtime_claim(
         ordered = [snapshot for snapshot in ordered if snapshot["task_id"] == task_id]
     if not ordered:
         conn.rollback()
-        die("no eligible task available to claim")
+        if raise_on_empty:
+            die("no eligible task available to claim")
+        return None
     snapshot = ordered[0]
     claimed_at = now_iso()
     lease_expires_at = datetime.fromisoformat(claimed_at.replace("Z", "+00:00"))
@@ -2515,12 +3413,47 @@ def command_repo_upsert(args: argparse.Namespace) -> int:
                 repo_id=args.repo_id,
                 repo_root=args.repo_root,
                 display_name=args.display_name or args.repo_id,
-                metadata=parse_json_text(args.metadata_json, default={}),
+                metadata=None if args.metadata_json is None else parse_json_text(args.metadata_json, default={}),
             )
-        payload = row_to_dict(conn.execute("SELECT * FROM repos WHERE repo_id = ?", (args.repo_id,)).fetchone())
+            if args.alias is not None:
+                replace_repo_aliases(conn, repo_id=args.repo_id, aliases=args.alias)
+        payload = fetch_repo_payload(conn, args.repo_id)
     finally:
         conn.close()
-    return print_or_json(payload, as_json=args.json, formatter=lambda row: render_table([row], [("repo_id", "repo_id"), ("display_name", "display_name"), ("repo_root", "repo_root"), ("active", "is_active")]))
+    if payload is None:
+        die(f"repo not found after upsert: {args.repo_id}")
+    return print_or_json(payload, as_json=args.json, formatter=lambda row: render_repo_rows([row]))
+
+
+def command_repo_list(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        payload = fetch_repo_registry(conn)
+    finally:
+        conn.close()
+    return print_or_json(payload, as_json=args.json, formatter=render_repo_rows)
+
+
+def command_repo_resolve(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        payload = resolve_repo_reference(conn, args.repo, field="repo")
+    finally:
+        conn.close()
+    if payload is None:
+        die(f"repo not found: {args.repo}")
+    return print_or_json(payload, as_json=args.json, formatter=lambda row: render_repo_rows([row]))
+
+
+def command_repo_show(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        payload = resolve_repo_reference(conn, args.repo, field="repo")
+    finally:
+        conn.close()
+    if payload is None:
+        die(f"repo not found: {args.repo}")
+    return print_or_json(payload, as_json=args.json, formatter=render_repo_detail)
 
 
 def command_task_create(args: argparse.Namespace) -> int:
@@ -2574,6 +3507,75 @@ def command_task_reconcile(args: argparse.Namespace) -> int:
     return print_or_json(render_task_card(snapshot), as_json=args.json, formatter=json_dumps)
 
 
+def command_planner_new(args: argparse.Namespace) -> int:
+    repo_reference = (args.repo or "CENTRAL").strip()
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        resolved_repo = resolve_repo_reference(
+            conn,
+            repo_reference,
+            field="target_repo",
+            allow_missing=True,
+        )
+        if resolved_repo is None:
+            die_repo_onboarding_required(
+                conn,
+                operation="planner task scaffold creation",
+                repo_id=repo_reference,
+                repo_root=None,
+                reason=f"target repo is not registered: {repo_reference!r}.",
+                aliases=[repo_reference],
+            )
+        with conn:
+            next_payload = next_task_id_payload(conn, series=args.series, actor_id=args.actor_id)
+            task_id = str(next_payload["next_task_id"])
+            payload = {
+                "task_id": task_id,
+                "title": args.title,
+                "summary": markdown_summary(args.objective or args.title, fallback=args.title),
+                "objective_md": args.objective or f"Implement and verify {args.title}.",
+                "context_md": args.context or "Context is TBD.",
+                "scope_md": args.scope or "Scope is narrow and aligned to this task.",
+                "deliverables_md": args.deliverables or "- [ ] Implement requested changes.\n- [ ] Add/update verification and docs where needed.",
+                "acceptance_md": args.acceptance or "- [ ] Task matches objective.\n- [ ] Planner and runtime expectations are satisfied.",
+                "testing_md": args.testing or "Run task-specific checks and record outcomes.",
+                "dispatch_md": args.dispatch or f"Dispatch from CENTRAL using repo={repo_reference} do task {task_id}.",
+                "closeout_md": args.closeout or f"Summarize results and closeout evidence for {task_id}.",
+                "reconciliation_md": args.reconciliation or "Reconcile planner and runtime state according to normal closeout policy.",
+                "planner_status": args.planner_status,
+                "priority": args.priority,
+                "task_type": args.task_type,
+                "planner_owner": args.planner_owner,
+                "worker_owner": None,
+                "target_repo_id": str(resolved_repo["repo_id"]),
+                "target_repo_root": str(resolved_repo["repo_root"]),
+                "target_repo_display_name": str(resolved_repo["display_name"]),
+                "approval_required": args.approval_required,
+                "source_kind": "planner_scaffold",
+                "metadata": {
+                    "planner_new_series": args.series,
+                    "planner_new_next_number": next_payload["next_number"],
+                },
+                "execution": {
+                    "task_kind": args.task_kind,
+                    "sandbox_mode": args.sandbox_mode,
+                    "approval_policy": args.approval_policy,
+                    "additional_writable_dirs": args.additional_writable_dir or [],
+                    "timeout_seconds": args.timeout_seconds,
+                    "metadata": {
+                        "generated_by": "planner-new",
+                        "planner_new_allocation": next_payload,
+                    },
+                },
+                "dependencies": args.depends_on,
+            }
+            payload = validate_task_payload(payload, for_update=False)
+            resolve_task_repo_target(conn, payload)
+    finally:
+        conn.close()
+    return print_or_json(payload, as_json=True, formatter=json_dumps)
+
+
 def command_task_show(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
@@ -2591,7 +3593,8 @@ def command_task_show(args: argparse.Namespace) -> int:
 def command_task_list(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
-        snapshots = fetch_task_snapshots(conn, repo_id=args.repo_id, planner_status=args.planner_status)
+        repo_id = resolve_repo_filter(conn, args.repo_id)
+        snapshots = fetch_task_snapshots(conn, repo_id=repo_id, planner_status=args.planner_status)
         rows = [
             {
                 "task_id": snapshot["task_id"],
@@ -2611,6 +3614,119 @@ def command_task_list(args: argparse.Namespace) -> int:
     return print_or_json(rows, as_json=args.json, formatter=lambda data: render_table(data, [("task_id", "task_id"), ("p", "priority"), ("planner", "planner_status"), ("runtime", "runtime_status"), ("repo", "repo"), ("version", "version"), ("title", "title")]))
 
 
+def command_task_id_next(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        with conn:
+            payload = next_task_id_payload(conn, series=args.series, actor_id=args.actor_id)
+    finally:
+        conn.close()
+    return print_or_json(
+        payload,
+        as_json=args.json,
+        formatter=lambda data: "\n".join(
+            [
+                f"Series:                    {data['series']}",
+                f"Strategy:                  {data['strategy']}",
+                f"Next Task ID:              {data['next_task_id']}",
+                f"Highest Existing Number:   {data['highest_existing_number']}",
+                f"Highest Active Reserved:   {data['highest_active_reservation_number']}",
+                f"Active Reservation Count:  {data['active_reservation_count']}",
+            ]
+        ),
+    )
+
+
+def command_task_id_reserve(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        payload = reserve_task_id_range(
+            conn,
+            series=args.series,
+            count=args.count,
+            reserved_by=args.actor_id,
+            reserved_for=args.reserved_for,
+            note=args.note,
+            reservation_hours=args.hours,
+        )
+    finally:
+        conn.close()
+    return print_or_json(
+        payload,
+        as_json=args.json,
+        formatter=lambda data: "\n".join(
+            [
+                f"Reservation ID:  {data['reservation_id']}",
+                f"Series:          {data['series']}",
+                f"Range:           {data['range_label']}",
+                f"Status:          {data['status']}",
+                f"Reserved By:     {data['reserved_by']}",
+                f"Reserved For:    {data['reserved_for'] or '(unspecified)'}",
+                f"Expires At:      {data['expires_at']}",
+            ]
+        ),
+    )
+
+
+def command_task_id_reservations(args: argparse.Namespace) -> int:
+    if args.all and args.status is not None:
+        die("--all cannot be combined with --status")
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        with conn:
+            reconcile_task_id_reservations(conn, series=args.series, actor_id=args.actor_id)
+        status = None if args.all else (args.status or "active")
+        rows = fetch_task_id_reservation_rows(
+            conn,
+            series=args.series,
+            status=status,
+            reservation_id=args.reservation_id,
+            limit=args.limit,
+        )
+        events = fetch_task_id_reservation_events(
+            conn,
+            [str(row["reservation_id"]) for row in rows],
+            limit_per_reservation=10,
+        )
+        payload = [
+            build_task_id_reservation_payload(conn, row, include_events=args.include_events, events=events)
+            for row in rows
+        ]
+    finally:
+        conn.close()
+    return print_or_json(
+        payload,
+        as_json=args.json,
+        formatter=lambda data: render_table(
+            [
+                {
+                    "reservation_id": row["reservation_id"],
+                    "series": row["series"],
+                    "range": row["range_label"],
+                    "status": row["status"],
+                    "open": row["open_count"],
+                    "filled": row["filled_count"],
+                    "expires_at": row["expires_at"],
+                    "reserved_by": row["reserved_by"],
+                    "reserved_for": row["reserved_for"] or "",
+                }
+                for row in data
+            ],
+            [
+                ("reservation_id", "reservation_id"),
+                ("series", "series"),
+                ("range", "range"),
+                ("status", "status"),
+                ("open", "open"),
+                ("filled", "filled"),
+                ("expires_at", "expires_at"),
+                ("reserved_by", "reserved_by"),
+                ("reserved_for", "reserved_for"),
+            ],
+        ),
+    )
+
+
 def command_view_summary(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
@@ -2623,7 +3739,8 @@ def command_view_summary(args: argparse.Namespace) -> int:
 def command_view_eligible(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
-        snapshots = fetch_task_snapshots(conn, repo_id=args.repo_id)
+        repo_id = resolve_repo_filter(conn, args.repo_id)
+        snapshots = fetch_task_snapshots(conn, repo_id=repo_id)
         rows = format_eligible_rows(snapshots)
     finally:
         conn.close()
@@ -2642,7 +3759,8 @@ def command_view_blocked(args: argparse.Namespace) -> int:
 def command_view_repo(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
-        snapshots = fetch_task_snapshots(conn, repo_id=args.repo_id)
+        repo_id = resolve_repo_filter(conn, args.repo_id)
+        snapshots = fetch_task_snapshots(conn, repo_id=repo_id)
         rows = [
             {
                 "task_id": snapshot["task_id"],
@@ -2677,7 +3795,30 @@ def command_view_review(args: argparse.Namespace) -> int:
         rows = format_review_rows(fetch_task_snapshots(conn))
     finally:
         conn.close()
-    return print_or_json(rows, as_json=args.json, formatter=lambda data: "\n".join([generated_banner(now_iso()), "", render_table(data, [("task_id", "task_id"), ("repo", "repo"), ("runtime", "runtime_status"), ("planner", "planner_status"), ("age_at", "age_at"), ("claimed_by", "claimed_by"), ("last_error", "last_error")])]))
+    return print_or_json(
+        rows,
+        as_json=args.json,
+        formatter=lambda data: "\n".join(
+            [
+                generated_banner(now_iso()),
+                "",
+                render_table(
+                    data,
+                    [
+                        ("task_id", "task_id"),
+                        ("repo", "repo"),
+                        ("severity", "severity"),
+                        ("runtime", "runtime_status"),
+                        ("planner", "planner_status"),
+                        ("age_at", "age_at"),
+                        ("claimed_by", "claimed_by"),
+                        ("warning", "status_warning"),
+                        ("last_error", "last_error"),
+                    ],
+                ),
+            ]
+        ),
+    )
 
 
 def command_view_task_card(args: argparse.Namespace) -> int:
@@ -2798,7 +3939,16 @@ def command_export_markdown_bundle(args: argparse.Namespace) -> int:
         _render_simple_markdown(
             "Review Queue",
             review_rows,
-            [("task_id", "task_id"), ("repo", "repo"), ("runtime", "runtime_status"), ("planner", "planner_status"), ("age_at", "age_at"), ("claimed_by", "claimed_by")],
+            [
+                ("task_id", "task_id"),
+                ("repo", "repo"),
+                ("severity", "severity"),
+                ("runtime", "runtime_status"),
+                ("planner", "planner_status"),
+                ("age_at", "age_at"),
+                ("claimed_by", "claimed_by"),
+                ("warning", "status_warning"),
+            ],
         ),
     )
     write_output(
@@ -2843,19 +3993,22 @@ def command_export_repo_md(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
         generated_at = now_iso()
-        snapshots = fetch_task_snapshots(conn, repo_id=args.repo_id)
+        repo_id = resolve_repo_filter(conn, args.repo_id)
+        if repo_id is None:
+            die("repo reference is required")
+        snapshots = fetch_task_snapshots(conn, repo_id=repo_id)
     finally:
         conn.close()
     output_path = (
         Path(args.output).expanduser().resolve()
         if args.output
-        else (DEFAULT_GENERATED_DIR / "per_repo" / f"{args.repo_id}.md")
+        else (DEFAULT_GENERATED_DIR / "per_repo" / f"{repo_id}.md")
     )
-    write_output(output_path, render_repo_markdown(args.repo_id, snapshots, generated_at=generated_at))
+    write_output(output_path, render_repo_markdown(repo_id, snapshots, generated_at=generated_at))
     payload = {
         "generated_at": generated_at,
         "output_path": str(output_path),
-        "repo_id": args.repo_id,
+        "repo_id": repo_id,
         "task_count": len(snapshots),
     }
     return print_or_json(payload, as_json=args.json, formatter=json_dumps)
@@ -2864,7 +4017,8 @@ def command_export_repo_md(args: argparse.Namespace) -> int:
 def command_runtime_eligible(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
-        rows = format_eligible_rows(fetch_task_snapshots(conn, repo_id=args.repo_id))
+        repo_id = resolve_repo_filter(conn, args.repo_id)
+        rows = format_eligible_rows(fetch_task_snapshots(conn, repo_id=repo_id))
     finally:
         conn.close()
     if args.limit is not None:
@@ -3009,23 +4163,83 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_argument(snapshot_restore_parser)
     snapshot_restore_parser.set_defaults(func=command_snapshot_restore)
 
-    repo_upsert_parser = subparsers.add_parser("repo-upsert", help="Create or update a repo row in the CENTRAL DB.")
-    add_db_argument(repo_upsert_parser)
-    repo_upsert_parser.add_argument("--repo-id", required=True)
-    repo_upsert_parser.add_argument("--repo-root", required=True)
-    repo_upsert_parser.add_argument("--display-name")
-    repo_upsert_parser.add_argument("--metadata-json", help="JSON metadata object.")
-    add_json_argument(repo_upsert_parser)
-    repo_upsert_parser.set_defaults(func=command_repo_upsert)
+    for command_name, help_text in [
+        ("repo-onboard", "Register or refresh a canonical repo before planner task creation or dispatch."),
+        ("repo-upsert", "Create or update a repo row in the CENTRAL DB."),
+    ]:
+        repo_upsert_parser = subparsers.add_parser(command_name, help=help_text)
+        add_db_argument(repo_upsert_parser)
+        repo_upsert_parser.add_argument("--repo-id", required=True)
+        repo_upsert_parser.add_argument("--repo-root", required=True)
+        repo_upsert_parser.add_argument("--display-name")
+        repo_upsert_parser.add_argument("--alias", action="append", default=None, help="Repeatable repo alias list. Replaces existing aliases when provided.")
+        repo_upsert_parser.add_argument("--metadata-json", help="JSON metadata object.")
+        add_json_argument(repo_upsert_parser)
+        repo_upsert_parser.set_defaults(func=command_repo_upsert)
 
-    task_create_parser = subparsers.add_parser("task-create", help="Create a planner-owned task from JSON input.")
+    repo_list_parser = subparsers.add_parser("repo-list", help="List canonical repos plus configured aliases.")
+    add_db_argument(repo_list_parser)
+    add_json_argument(repo_list_parser)
+    repo_list_parser.set_defaults(func=command_repo_list)
+
+    repo_resolve_parser = subparsers.add_parser("repo-resolve", help="Resolve a repo alias or variant to the canonical repo record.")
+    add_db_argument(repo_resolve_parser)
+    repo_resolve_parser.add_argument("--repo", required=True)
+    add_json_argument(repo_resolve_parser)
+    repo_resolve_parser.set_defaults(func=command_repo_resolve)
+
+    repo_show_parser = subparsers.add_parser("repo-show", help="Show canonical repository details from a repo reference.")
+    add_db_argument(repo_show_parser)
+    repo_show_parser.add_argument("--repo", required=True, help="Canonical repo_id or registered alias/root/display-name.")
+    add_json_argument(repo_show_parser)
+    repo_show_parser.set_defaults(func=command_repo_show)
+
+    task_create_parser = subparsers.add_parser("task-create", help="Create a planner-owned task from JSON input. Target repos must already be onboarded.")
     add_db_argument(task_create_parser)
     task_create_parser.add_argument("--input", required=True, help="Path to JSON payload, or - for stdin.")
     task_create_parser.add_argument("--actor-id", default="planner/coordinator")
     add_json_argument(task_create_parser)
     task_create_parser.set_defaults(func=command_task_create)
 
-    task_update_parser = subparsers.add_parser("task-update", help="Update a planner-owned task from JSON input.")
+    planner_new_parser = subparsers.add_parser(
+        "planner-new",
+        help="Generate a planner-ready task payload scaffold with auto task-ID allocation.",
+    )
+    add_db_argument(planner_new_parser)
+    planner_new_parser.add_argument("--title", required=True, help="Task title used for summary and output title.")
+    planner_new_parser.add_argument("--series", default=DEFAULT_TASK_ID_SERIES, help="Task ID series for auto-allocation.")
+    planner_new_parser.add_argument("--repo", default="CENTRAL", help="Canonical repo_id or alias used for target_repo_id/root.")
+    planner_new_parser.add_argument("--objective", help="Objective markdown.")
+    planner_new_parser.add_argument("--context", help="Context markdown.")
+    planner_new_parser.add_argument("--scope", help="Scope markdown.")
+    planner_new_parser.add_argument("--deliverables", help="Deliverables markdown.")
+    planner_new_parser.add_argument("--acceptance", help="Acceptance criteria markdown.")
+    planner_new_parser.add_argument("--testing", help="Testing markdown.")
+    planner_new_parser.add_argument("--dispatch", help="Dispatch contract markdown.")
+    planner_new_parser.add_argument("--closeout", help="Closeout markdown.")
+    planner_new_parser.add_argument("--reconciliation", help="Reconciliation markdown.")
+    planner_new_parser.add_argument("--planner-status", choices=sorted(PLANNER_STATUSES), default="todo")
+    planner_new_parser.add_argument("--priority", type=int, default=100)
+    planner_new_parser.add_argument("--task-type", default="mutating")
+    planner_new_parser.add_argument("--planner-owner", default="planner/coordinator")
+    planner_new_parser.add_argument("--approval-required", action="store_true", help="Mark task as approval-required.")
+    planner_new_parser.add_argument("--task-kind", default="mutating")
+    planner_new_parser.add_argument("--sandbox-mode", default="workspace-write")
+    planner_new_parser.add_argument("--approval-policy", default="never")
+    planner_new_parser.add_argument("--timeout-seconds", type=int, default=1800)
+    planner_new_parser.add_argument(
+        "--additional-writable-dir",
+        action="append",
+        default=[],
+        dest="additional_writable_dir",
+        help="Repeatable path to add to execution.additional_writable_dirs.",
+    )
+    planner_new_parser.add_argument("--depends-on", action="append", default=[], help="Repeatable dependency task ID.")
+    planner_new_parser.add_argument("--actor-id", default="planner/coordinator")
+    add_json_argument(planner_new_parser)
+    planner_new_parser.set_defaults(func=command_planner_new)
+
+    task_update_parser = subparsers.add_parser("task-update", help="Update a planner-owned task from JSON input. Repo target changes must resolve to registered repos.")
     add_db_argument(task_update_parser)
     task_update_parser.add_argument("--task-id", required=True)
     task_update_parser.add_argument("--expected-version", required=True, type=int)
@@ -3060,6 +4274,45 @@ def build_parser() -> argparse.ArgumentParser:
     task_list_parser.add_argument("--planner-status", choices=sorted(PLANNER_STATUSES))
     add_json_argument(task_list_parser)
     task_list_parser.set_defaults(func=command_task_list)
+
+    task_id_next_parser = subparsers.add_parser(
+        "task-id-next",
+        help="Show the next planner task ID for a series using the current task/reservation high-water mark.",
+    )
+    add_db_argument(task_id_next_parser)
+    task_id_next_parser.add_argument("--series", default=DEFAULT_TASK_ID_SERIES)
+    task_id_next_parser.add_argument("--actor-id", default="planner/coordinator")
+    add_json_argument(task_id_next_parser)
+    task_id_next_parser.set_defaults(func=command_task_id_next)
+
+    task_id_reserve_parser = subparsers.add_parser(
+        "task-id-reserve",
+        help="Reserve a short contiguous planner task-ID range for a series.",
+    )
+    add_db_argument(task_id_reserve_parser)
+    task_id_reserve_parser.add_argument("--series", default=DEFAULT_TASK_ID_SERIES)
+    task_id_reserve_parser.add_argument("--count", required=True, type=int)
+    task_id_reserve_parser.add_argument("--hours", type=int, default=DEFAULT_TASK_ID_RESERVATION_HOURS)
+    task_id_reserve_parser.add_argument("--reserved-for", help="Short description of the planned task family.")
+    task_id_reserve_parser.add_argument("--note", help="Optional planner note recorded with the reservation.")
+    task_id_reserve_parser.add_argument("--actor-id", default="planner/coordinator")
+    add_json_argument(task_id_reserve_parser)
+    task_id_reserve_parser.set_defaults(func=command_task_id_reserve)
+
+    task_id_reservations_parser = subparsers.add_parser(
+        "task-id-reservations",
+        help="List task-ID reservations and their current fulfillment state.",
+    )
+    add_db_argument(task_id_reservations_parser)
+    task_id_reservations_parser.add_argument("--series")
+    task_id_reservations_parser.add_argument("--status", choices=sorted(TASK_ID_RESERVATION_STATUSES))
+    task_id_reservations_parser.add_argument("--reservation-id")
+    task_id_reservations_parser.add_argument("--all", action="store_true")
+    task_id_reservations_parser.add_argument("--include-events", action="store_true")
+    task_id_reservations_parser.add_argument("--limit", type=int, default=25)
+    task_id_reservations_parser.add_argument("--actor-id", default="planner/coordinator")
+    add_json_argument(task_id_reservations_parser)
+    task_id_reservations_parser.set_defaults(func=command_task_id_reservations)
 
     view_summary_parser = subparsers.add_parser("view-summary", help="Show portfolio summary generated from DB state.")
     add_db_argument(view_summary_parser)

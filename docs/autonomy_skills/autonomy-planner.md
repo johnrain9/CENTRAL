@@ -36,6 +36,7 @@ Command dependencies:
 Workflow:
 
 1. Inspect or update the canonical task in CENTRAL DB with [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py).
+   For numbering, use `task-id-next` or `task-id-reserve` instead of repeated `task-show` existence probes.
 2. Draft the autonomy prompt body from canonical CENTRAL DB state only if a legacy autonomy queue still needs it.
 3. Create or update it in autonomy DB only for migration or compatibility work.
 4. Set dependencies before promotion.

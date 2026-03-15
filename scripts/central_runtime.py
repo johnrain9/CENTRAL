@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import abc
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -24,6 +26,11 @@ DEFAULT_DB_PATH = REPO_ROOT / "state" / "central_tasks.db"
 AUTONOMY_ROOT = Path("/home/cobra/photo_auto_tagging")
 AUTONOMY_SCHEMA_PATH = AUTONOMY_ROOT / "autonomy" / "schemas" / "worker_result.schema.json"
 AUTONOMY_PROFILE = os.environ.get("AUTONOMY_PROFILE")
+DEFAULT_CODEX_MODEL = "gpt-5-codex"
+DEFAULT_CODEX_MODEL_ENV = "CENTRAL_DISPATCHER_CODEX_MODEL"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+DEFAULT_CLAUDE_MODEL_ENV = "CENTRAL_DISPATCHER_CLAUDE_MODEL"
+DEFAULT_WORKER_MODEL_ENV = "CENTRAL_DISPATCHER_WORKER_MODEL"
 
 if str(SCRIPT_PATH.parent) not in sys.path:
     sys.path.insert(0, str(SCRIPT_PATH.parent))
@@ -53,7 +60,6 @@ class RuntimePaths:
     worker_logs_dir: Path
     worker_results_dir: Path
     worker_prompts_dir: Path
-    worker_reports_dir: Path
 
 
 @dataclass
@@ -73,9 +79,12 @@ class ActiveWorker:
     last_heartbeat_monotonic: float
     timeout_seconds: int
     adopted: bool = False
+    selected_worker_model: str | None = None
+    selected_worker_model_source: str | None = None
+    selected_worker_backend: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class DispatcherConfig:
     db_path: Path
     state_dir: Path
@@ -85,6 +94,28 @@ class DispatcherConfig:
     status_heartbeat_seconds: float
     stale_recovery_seconds: float
     worker_mode: str
+    default_worker_model: str | None = None
+    default_codex_model: str = DEFAULT_CODEX_MODEL
+
+    def __post_init__(self) -> None:
+        # Unify: if only one is set, sync them
+        if self.default_worker_model and not self.default_codex_model:
+            object.__setattr__(self, "default_codex_model", self.default_worker_model)
+        elif self.default_codex_model and not self.default_worker_model:
+            object.__setattr__(self, "default_worker_model", self.default_codex_model)
+        elif not self.default_worker_model and not self.default_codex_model:
+            object.__setattr__(self, "default_worker_model", DEFAULT_CODEX_MODEL)
+            object.__setattr__(self, "default_codex_model", DEFAULT_CODEX_MODEL)
+
+
+@dataclass(frozen=True)
+class ModelSelection:
+    value: str
+    source: str
+
+
+# Backward-compatible alias
+CodexModelSelection = ModelSelection
 
 
 def resolve_state_dir(explicit: str | None) -> Path:
@@ -105,19 +136,38 @@ def build_runtime_paths(state_dir: Path) -> RuntimePaths:
         worker_logs_dir=state_dir / ".worker-logs",
         worker_results_dir=state_dir / ".worker-results",
         worker_prompts_dir=state_dir / ".worker-prompts",
-        worker_reports_dir=state_dir / ".worker-reports",
     )
 
 
+def cleanup_legacy_runtime_dirs(paths: RuntimePaths) -> None:
+    legacy_reports_dir = paths.state_dir / ".worker-reports"
+    if legacy_reports_dir.exists() and legacy_reports_dir.is_dir() and not legacy_reports_dir.is_symlink():
+        try:
+            legacy_reports_dir.rmdir()
+        except OSError:
+            pass
+
+
 def ensure_runtime_dirs(paths: RuntimePaths) -> None:
+    cleanup_legacy_runtime_dirs(paths)
     for path in [
         paths.state_dir,
         paths.worker_logs_dir,
         paths.worker_results_dir,
         paths.worker_prompts_dir,
-        paths.worker_reports_dir,
     ]:
         path.mkdir(parents=True, exist_ok=True)
+
+
+def runtime_paths_payload(paths: RuntimePaths) -> dict[str, str]:
+    return {
+        "state_dir": str(paths.state_dir),
+        "lock_path": str(paths.lock_path),
+        "log_path": str(paths.log_path),
+        "worker_logs_dir": str(paths.worker_logs_dir),
+        "worker_prompts_dir": str(paths.worker_prompts_dir),
+        "worker_results_dir": str(paths.worker_results_dir),
+    }
 
 
 def json_dumps(payload: Any) -> str:
@@ -220,6 +270,8 @@ def acquire_lock(paths: RuntimePaths, config: DispatcherConfig) -> None:
             "status_heartbeat_seconds": config.status_heartbeat_seconds,
             "stale_recovery_seconds": config.stale_recovery_seconds,
             "worker_mode": config.worker_mode,
+            "default_codex_model": config.default_codex_model,
+            "default_worker_model": config.default_worker_model or config.default_codex_model,
         },
     )
 
@@ -240,13 +292,25 @@ def release_lock(paths: RuntimePaths) -> None:
 
 
 class DaemonLog:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+
     def __init__(self, paths: RuntimePaths):
         self.path = paths.log_path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.use_color = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
     def emit(self, level: str, subsystem: str, message: str) -> None:
-        line = f"{datetime.now().strftime('%H:%M:%S')} {level} [{subsystem}] {message}"
-        print(line)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        line = f"{timestamp} {level} [{subsystem}] {message}"
+        print(self._format_console_line(timestamp, level, subsystem, message))
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
@@ -255,6 +319,88 @@ class DaemonLog:
             return ""
         data = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
         return "\n".join(data[-lines:])
+
+    def _style(self, text: str, *codes: str) -> str:
+        if not self.use_color:
+            return text
+        return "".join(codes) + text + self.RESET
+
+    def _kv(self, message: str) -> dict[str, str]:
+        return {key: value for key, value in re.findall(r"([A-Za-z_]+)=([^ ]+)", message)}
+
+    def _prefix(self, timestamp: str, level: str, subsystem: str) -> str:
+        level_color = {
+            "INF": self.CYAN,
+            "WRN": self.YELLOW,
+            "ERR": self.RED,
+        }.get(level, self.BLUE)
+        ts = self._style(timestamp, self.DIM)
+        lvl = self._style(level, self.BOLD, level_color)
+        sub = self._style(f"[{subsystem}]", self.MAGENTA)
+        return f"{ts} {lvl} {sub}"
+
+    def _format_console_line(self, timestamp: str, level: str, subsystem: str, message: str) -> str:
+        prefix = self._prefix(timestamp, level, subsystem)
+        if subsystem != "central.dispatcher":
+            return f"{prefix} {message}"
+
+        fields = self._kv(message)
+        if message.startswith("heartbeat "):
+            return (
+                f"{prefix} "
+                f"{self._style('HEARTBEAT', self.BOLD, self.BLUE)} "
+                f"state={self._style(fields.get('state', '-'), self.BOLD)} "
+                f"workers={self._style(fields.get('workers', '-'), self.BOLD, self.CYAN)} "
+                f"idle={self._style(fields.get('idle_slots', '-'), self.YELLOW)} "
+                f"tasks={self._style(fields.get('running_tasks', '-'), self.GREEN)} "
+                f"eligible={self._style(fields.get('eligible', '-'), self.CYAN)} "
+                f"next={self._style(fields.get('next', '-'), self.GREEN)} "
+                f"leases={self._style(fields.get('leases', '-'), self.CYAN)} "
+                f"review={self._style(fields.get('review', '-'), self.YELLOW)} "
+                f"failed={self._style(fields.get('failed', '-'), self.RED if fields.get('failed', '0') != '0' else self.GREEN)} "
+                f"mismatch={self._style(fields.get('mismatch', '-'), self.RED if fields.get('mismatch', '0') != '0' else self.GREEN)}"
+            )
+        if message.startswith("worker_spawned "):
+            line = (
+                f"{prefix} "
+                f"{self._style('START', self.BOLD, self.GREEN)} "
+                f"task={self._style(fields.get('task', '-'), self.BOLD, self.GREEN)} "
+                f"run={self._style(fields.get('run', '-'), self.CYAN)} "
+                f"pid={self._style(fields.get('pid', '-'), self.YELLOW)} "
+                f"mode={self._style(fields.get('mode', '-'), self.BLUE)}"
+            )
+            if fields.get("model"):
+                line += f" model={self._style(fields.get('model', '-'), self.BOLD, self.CYAN)}"
+            return line
+        if message.startswith("worker_finished "):
+            status = fields.get("runtime_status", "-")
+            status_color = self.GREEN if status in {"done", "pending_review"} else self.RED
+            return (
+                f"{prefix} "
+                f"{self._style('FINISH', self.BOLD, status_color)} "
+                f"task={self._style(fields.get('task', '-'), self.BOLD)} "
+                f"run={self._style(fields.get('run', '-'), self.CYAN)} "
+                f"status={self._style(status, self.BOLD, status_color)}"
+            )
+        if message.startswith("stale_recovery "):
+            return (
+                f"{prefix} "
+                f"{self._style('RECOVER', self.BOLD, self.YELLOW)} "
+                f"recovered={self._style(fields.get('recovered', '-'), self.BOLD, self.YELLOW)}"
+            )
+        if message.startswith("dispatcher_started"):
+            return f"{prefix} {self._style('DISPATCHER STARTED', self.BOLD, self.GREEN)} {message}"
+        if message.startswith("dispatcher_stopped"):
+            return f"{prefix} {self._style('DISPATCHER STOPPED', self.BOLD, self.YELLOW)}"
+        if message.startswith("worker_spawn_error") or message.startswith("worker_timeout") or message.startswith("worker_heartbeat_error"):
+            return f"{prefix} {self._style('ISSUE', self.BOLD, self.RED)} {message}"
+        if message.startswith("dispatcher_handoff_prepared") or message.startswith("worker_adopted"):
+            return f"{prefix} {self._style('HANDOFF', self.BOLD, self.YELLOW)} {message}"
+        if message.startswith("worker_auto_reconciled"):
+            return f"{prefix} {self._style('RECONCILE', self.BOLD, self.GREEN)} {message}"
+        if message.startswith("worker_auto_reconcile_failed"):
+            return f"{prefix} {self._style('RECONCILE', self.BOLD, self.RED)} {message}"
+        return f"{prefix} {message}"
 
 
 def connect_initialized(db_path: Path):
@@ -279,10 +425,95 @@ def extract_markdown_items(text: str) -> list[str]:
     return [item for item in items if item]
 
 
-def build_worker_task(snapshot: dict[str, Any]) -> dict[str, Any]:
+def normalize_optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def normalize_codex_model(value: Any, *, label: str) -> str:
+    text = normalize_optional_string(value)
+    if text is None:
+        die(f"{label} must be a non-empty string")
+    return text
+
+
+def resolve_default_codex_model(explicit: str | None) -> str:
+    if explicit is not None:
+        return normalize_codex_model(explicit, label="default codex model")
+    env_value = normalize_optional_string(os.environ.get(DEFAULT_CODEX_MODEL_ENV))
+    if env_value is not None:
+        return env_value
+    return DEFAULT_CODEX_MODEL
+
+
+def resolve_worker_codex_model(snapshot: dict[str, Any], dispatcher_default_codex_model: str) -> ModelSelection:
+    execution = snapshot.get("execution") or {}
+    execution_metadata = execution.get("metadata") or {}
+    task_override = normalize_optional_string(execution_metadata.get("codex_model"))
+    if task_override is not None:
+        return ModelSelection(value=task_override, source="task_override")
+    return ModelSelection(
+        value=normalize_codex_model(dispatcher_default_codex_model, label="dispatcher default codex model"),
+        source="dispatcher_default",
+    )
+
+
+def resolve_default_claude_model(explicit: str | None) -> str:
+    if explicit is not None:
+        return normalize_codex_model(explicit, label="default claude model")
+    env_value = normalize_optional_string(os.environ.get(DEFAULT_CLAUDE_MODEL_ENV))
+    if env_value is not None:
+        return env_value
+    return DEFAULT_CLAUDE_MODEL
+
+
+def resolve_worker_claude_model(snapshot: dict[str, Any], dispatcher_default_claude_model: str) -> ModelSelection:
+    execution = snapshot.get("execution") or {}
+    execution_metadata = execution.get("metadata") or {}
+    task_override = normalize_optional_string(execution_metadata.get("claude_model"))
+    if task_override is not None:
+        return ModelSelection(value=task_override, source="task_override")
+    return ModelSelection(
+        value=normalize_codex_model(dispatcher_default_claude_model, label="dispatcher default claude model"),
+        source="dispatcher_default",
+    )
+
+
+def resolve_default_worker_model(worker_mode: str, explicit: str | None) -> str:
+    """Resolve the default model for whatever backend is configured."""
+    # Check generic env var first
+    generic_env = normalize_optional_string(os.environ.get(DEFAULT_WORKER_MODEL_ENV))
+    if explicit is not None:
+        return explicit
+    if generic_env is not None:
+        return generic_env
+    if worker_mode == "claude":
+        return resolve_default_claude_model(None)
+    return resolve_default_codex_model(None)
+
+
+def resolve_task_worker_backend(snapshot: dict[str, Any], dispatcher_default: str) -> str:
+    """Allow per-task backend override via execution.metadata.worker_backend."""
+    execution = snapshot.get("execution") or {}
+    execution_metadata = execution.get("metadata") or {}
+    override = normalize_optional_string(execution_metadata.get("worker_backend"))
+    if override is not None and override in ("codex", "claude", "stub"):
+        return override
+    return dispatcher_default
+
+
+def build_worker_task(snapshot: dict[str, Any], dispatcher_default_codex_model: str, *, worker_mode: str = "codex", dispatcher_default_worker_model: str | None = None) -> dict[str, Any]:
     execution = snapshot.get("execution") or {}
     metadata = snapshot.get("metadata") or {}
     execution_metadata = execution.get("metadata") or {}
+    effective_backend = resolve_task_worker_backend(snapshot, worker_mode)
+    if effective_backend == "claude":
+        claude_default = dispatcher_default_worker_model or resolve_default_claude_model(None)
+        worker_model = resolve_worker_claude_model(snapshot, claude_default)
+    else:
+        codex_model = resolve_worker_codex_model(snapshot, dispatcher_default_codex_model)
     deliverables = extract_markdown_items(snapshot.get("deliverables_md", "")) or [snapshot.get("deliverables_md", "").strip()]
     scope_notes = extract_markdown_items(snapshot.get("scope_md", "")) or [snapshot.get("scope_md", "").strip()]
     validation_commands = extract_markdown_items(snapshot.get("testing_md", "")) or [snapshot.get("testing_md", "").strip()]
@@ -303,7 +534,7 @@ def build_worker_task(snapshot: dict[str, Any]) -> dict[str, Any]:
     task_category = snapshot.get("task_type") or "implementation"
     if task_category not in {"implementation", "truth"}:
         task_category = "infrastructure"
-    return {
+    result = {
         "id": snapshot["task_id"],
         "title": snapshot["title"],
         "category": task_category,
@@ -314,12 +545,26 @@ def build_worker_task(snapshot: dict[str, Any]) -> dict[str, Any]:
         "scope_notes_json": json.dumps(scope_notes),
         "validation_commands_json": json.dumps(validation_commands),
         "design_doc_path": metadata.get("design_doc_path"),
-        "codex_profile": execution_metadata.get("codex_profile") or AUTONOMY_PROFILE,
-        "codex_model": execution_metadata.get("codex_model"),
+        "worker_backend": effective_backend,
         "sandbox_mode": execution.get("sandbox_mode"),
         "approval_policy": execution.get("approval_policy"),
         "additional_writable_dirs_json": json.dumps(execution.get("additional_writable_dirs") or []),
     }
+    # Add backend-specific model fields
+    if effective_backend == "claude":
+        result["worker_model"] = worker_model.value
+        result["worker_model_source"] = worker_model.source
+    elif effective_backend == "codex":
+        result["codex_profile"] = execution_metadata.get("codex_profile") or AUTONOMY_PROFILE
+        result["codex_model"] = codex_model.value
+        result["codex_model_source"] = codex_model.source
+        # Generic aliases for codex
+        result["worker_model"] = codex_model.value
+        result["worker_model_source"] = codex_model.source
+    else:
+        result["worker_model"] = None
+        result["worker_model_source"] = None
+    return result
 
 
 def load_autonomy_runner():
@@ -328,6 +573,18 @@ def load_autonomy_runner():
     from autonomy import runner as autonomy_runner  # type: ignore
 
     return autonomy_runner
+
+
+def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: str) -> list[str]:
+    """Build the command list for a Claude Code worker."""
+    cmd = [
+        "claude",
+        "-p",
+        "--dangerously-skip-permissions",
+        "--model", model,
+        "--output-format", "json",
+    ]
+    return cmd
 
 
 def build_stub_command(snapshot: dict[str, Any], run_id: str, result_path: Path) -> list[str]:
@@ -377,12 +634,105 @@ def build_stub_command(snapshot: dict[str, Any], run_id: str, result_path: Path)
     ]
 
 
+class WorkerBackend(abc.ABC):
+    """Protocol for backend-specific worker spawn preparation."""
+
+    @abc.abstractmethod
+    def prepare(
+        self,
+        snapshot: dict[str, Any],
+        worker_task: dict[str, Any],
+        run_id: str,
+        result_path: Path,
+    ) -> tuple[str, list[str], Any]:
+        """Return (prompt_text, command, stdin_mode) for subprocess.Popen."""
+
+
+class CodexBackend(WorkerBackend):
+    def prepare(
+        self,
+        snapshot: dict[str, Any],
+        worker_task: dict[str, Any],
+        run_id: str,
+        result_path: Path,
+    ) -> tuple[str, list[str], Any]:
+        worker_task["run_id"] = run_id
+        autonomy_runner = load_autonomy_runner()
+        prompt_text = autonomy_runner.build_prompt(
+            worker_task,
+            autonomy_runner.normalize_dependency_context(
+                [
+                    {
+                        "task_id": dep.get("depends_on_task_id"),
+                        "title": dep.get("depends_on_title"),
+                        "summary": dep.get("depends_on_status"),
+                        "decisions": "",
+                        "blockers": "",
+                        "validation": "",
+                    }
+                    for dep in snapshot.get("dependencies") or []
+                ]
+            ),
+        )
+        command = autonomy_runner.build_codex_command(worker_task, result_path, AUTONOMY_SCHEMA_PATH)
+        return prompt_text, command, subprocess.PIPE
+
+
+class ClaudeBackend(WorkerBackend):
+    def prepare(
+        self,
+        snapshot: dict[str, Any],
+        worker_task: dict[str, Any],
+        run_id: str,
+        result_path: Path,
+    ) -> tuple[str, list[str], Any]:
+        prompt_text = worker_task["prompt_body"]
+        command = build_claude_command(worker_task, result_path, worker_task["worker_model"])
+        return prompt_text, command, subprocess.PIPE
+
+
+class StubBackend(WorkerBackend):
+    def prepare(
+        self,
+        snapshot: dict[str, Any],
+        worker_task: dict[str, Any],
+        run_id: str,
+        result_path: Path,
+    ) -> tuple[str, list[str], Any]:
+        prompt_text = worker_task["prompt_body"]
+        command = build_stub_command(snapshot, run_id, result_path)
+        return prompt_text, command, subprocess.DEVNULL
+
+
+_WORKER_BACKENDS: dict[str, WorkerBackend] = {
+    "codex": CodexBackend(),
+    "claude": ClaudeBackend(),
+    "stub": StubBackend(),
+}
+
+
+def get_worker_backend(name: str) -> WorkerBackend:
+    """Return the WorkerBackend for the given backend name, defaulting to StubBackend."""
+    return _WORKER_BACKENDS.get(name, _WORKER_BACKENDS["stub"])
+
+
 def success_runtime_status(snapshot: dict[str, Any]) -> str:
     if snapshot.get("approval_required"):
         return "pending_review"
     if snapshot.get("task_type") == "truth":
         return "pending_review"
     return "done"
+
+
+def summarize_validation_results(entries: list[dict[str, Any]]) -> str | None:
+    summaries: list[str] = []
+    for entry in entries:
+        name = str(entry.get("name") or "validation").strip()
+        passed = bool(entry.get("passed"))
+        notes = str(entry.get("notes") or "").strip()
+        status = "passed" if passed else "failed"
+        summaries.append(f"{name}: {status}{f' ({notes})' if notes else ''}")
+    return "; ".join(summaries) if summaries else None
 
 
 def add_artifacts(task_id: str, artifacts: list[tuple[str, str, dict[str, Any]]], db_path: Path) -> None:
@@ -568,13 +918,11 @@ def worker_run_paths(paths: RuntimePaths, task_id: str, run_id: str | None, arti
             "prompt": paths.worker_prompts_dir / task_id / f"{run_id}.md",
             "log": paths.worker_logs_dir / task_id / f"{run_id}.log",
             "result": paths.worker_results_dir / task_id / f"{run_id}.json",
-            "report": paths.worker_reports_dir / task_id / f"{run_id}.md",
         }
     return {
         "prompt": select_latest_artifact_path(artifacts, ".md"),
         "log": select_latest_artifact_path(artifacts, ".log"),
         "result": select_latest_artifact_path(artifacts, ".json"),
-        "report": select_latest_artifact_path(artifacts, ".report"),
     }
 
 
@@ -639,6 +987,7 @@ def worker_status_text(payload: dict[str, Any]) -> str:
     lines = [
         f"Worker status: {summary['overall_status']}",
         summary["headline"],
+        f"Structured results: {payload['runtime_paths']['worker_results_dir']}",
         (
             "Active workers: "
             f"{summary['active_count']} | healthy={summary['healthy_count']} "
@@ -651,7 +1000,8 @@ def worker_status_text(payload: dict[str, Any]) -> str:
                 (
                     f"- {worker['observed_state']}: {worker['task_id']} run={worker['run_id'] or '-'} "
                     f"runtime={worker['runtime_status']} heartbeat_age={_fmt_seconds(worker['heartbeat']['age_seconds'])}s "
-                    f"log_age={_fmt_seconds(worker['log']['age_seconds'])}s reason={worker['reason']}"
+                    f"log_age={_fmt_seconds(worker['log']['age_seconds'])}s "
+                    f"model={((worker.get('worker') or {}).get('model') or '-')} reason={worker['reason']}"
                 )
             )
     else:
@@ -663,7 +1013,7 @@ def worker_status_text(payload: dict[str, Any]) -> str:
                 (
                     f"- {worker['observed_state']}: {worker['task_id']} run={worker['run_id'] or '-'} "
                     f"runtime={worker['runtime_status']} finished_at={worker['runtime']['finished_at'] or worker['runtime']['last_transition_at']} "
-                    f"reason={worker['reason']}"
+                    f"model={((worker.get('worker') or {}).get('model') or '-')} reason={worker['reason']}"
                 )
             )
     return "\n".join(lines)
@@ -721,7 +1071,7 @@ class CentralDispatcher:
             state.log_handle = None
 
     def _supervision_payload(self, state: ActiveWorker) -> dict[str, Any]:
-        return {
+        payload = {
             "run_id": state.run_id,
             "worker_pid": state.pid,
             "worker_process_start_token": state.process_start_token,
@@ -737,6 +1087,18 @@ class CentralDispatcher:
             "updated_at": utc_now(),
             "adopted": state.adopted,
         }
+        if state.selected_worker_model is not None:
+            payload["worker_model"] = state.selected_worker_model
+            # Backward compat: also write codex_model for codex backend
+            if state.selected_worker_backend == "codex":
+                payload["codex_model"] = state.selected_worker_model
+        if state.selected_worker_model_source is not None:
+            payload["worker_model_source"] = state.selected_worker_model_source
+            if state.selected_worker_backend == "codex":
+                payload["codex_model_source"] = state.selected_worker_model_source
+        if state.selected_worker_backend is not None:
+            payload["worker_backend"] = state.selected_worker_backend
+        return payload
 
     def _sync_worker_lease(
         self,
@@ -841,6 +1203,7 @@ class CentralDispatcher:
             ).fetchall()
             active_leases = int(conn.execute("SELECT COUNT(*) AS c FROM task_active_leases").fetchone()["c"])
             counts = {str(row["runtime_status"]): int(row["c"]) for row in runtime_summary}
+            mismatch_count = sum(1 for snapshot in snapshots if snapshot.get("status_mismatch"))
         finally:
             conn.close()
         return {
@@ -848,6 +1211,7 @@ class CentralDispatcher:
             "next_eligible_task_id": eligible[0]["task_id"] if eligible else None,
             "runtime_counts": counts,
             "active_leases": active_leases,
+            "mismatch_count": mismatch_count,
         }
 
     @staticmethod
@@ -866,6 +1230,7 @@ class CentralDispatcher:
             return
         snapshot = self._dispatcher_snapshot()
         active_ids = sorted(self._active)
+        idle_slots = max(0, self.config.max_workers - len(active_ids))
         self.logger.emit(
             "INF",
             "central.dispatcher",
@@ -873,12 +1238,14 @@ class CentralDispatcher:
                 "heartbeat "
                 f"state={'stopping' if self._stop_requested else 'running'} "
                 f"workers={len(active_ids)}/{self.config.max_workers} "
+                f"idle_slots={idle_slots} "
                 f"running_tasks={self._format_task_ids(active_ids)} "
                 f"eligible={snapshot['eligible_count']} "
                 f"next={snapshot['next_eligible_task_id'] or '-'} "
                 f"leases={snapshot['active_leases']} "
                 f"review={snapshot['runtime_counts'].get('pending_review', 0)} "
-                f"failed={snapshot['runtime_counts'].get('failed', 0)}"
+                f"failed={snapshot['runtime_counts'].get('failed', 0)} "
+                f"mismatch={snapshot['mismatch_count']}"
             ),
         )
         self._last_status_heartbeat_monotonic = now
@@ -886,24 +1253,26 @@ class CentralDispatcher:
     def _claim_next(self) -> dict[str, Any] | None:
         conn = self._connect()
         try:
-            try:
-                return task_db.runtime_claim(
-                    conn,
-                    worker_id=derive_worker_id("slot"),
-                    queue_name="default",
-                    lease_seconds=max(5, int(self.config.heartbeat_seconds * 3)),
-                    task_id=None,
-                    actor_id="central.dispatcher",
-                )
-            except SystemExit as exc:
-                if exc.code == 1:
-                    return None
-                raise
+            return task_db.runtime_claim(
+                conn,
+                worker_id=derive_worker_id("slot"),
+                queue_name="default",
+                lease_seconds=max(5, int(self.config.heartbeat_seconds * 3)),
+                task_id=None,
+                actor_id="central.dispatcher",
+                raise_on_empty=False,
+            )
         finally:
             conn.close()
 
     def _spawn_worker(self, snapshot: dict[str, Any]) -> None:
-        worker_task = build_worker_task(snapshot)
+        effective_backend = resolve_task_worker_backend(snapshot, self.config.worker_mode)
+        worker_task = build_worker_task(
+            snapshot,
+            self.config.default_codex_model,
+            worker_mode=effective_backend,
+            dispatcher_default_worker_model=self.config.default_worker_model,
+        )
         run_id = (snapshot.get("lease") or {}).get("execution_run_id") or f"{snapshot['task_id']}-{int(time.time())}"
         prompts_dir = self.paths.worker_prompts_dir / snapshot["task_id"]
         results_dir = self.paths.worker_results_dir / snapshot["task_id"]
@@ -915,31 +1284,8 @@ class CentralDispatcher:
         result_path = results_dir / f"{run_id}.json"
         log_path = logs_dir / f"{run_id}.log"
 
-        dependency_context = [
-            {
-                "task_id": dep.get("depends_on_task_id"),
-                "title": dep.get("depends_on_title"),
-                "summary": dep.get("depends_on_status"),
-                "decisions": "",
-                "blockers": "",
-                "validation": "",
-            }
-            for dep in snapshot.get("dependencies") or []
-        ]
-
-        if self.config.worker_mode == "codex":
-            worker_task["run_id"] = run_id
-            autonomy_runner = load_autonomy_runner()
-            prompt_text = autonomy_runner.build_prompt(
-                worker_task,
-                autonomy_runner.normalize_dependency_context(dependency_context),
-            )
-            command = autonomy_runner.build_codex_command(worker_task, result_path, AUTONOMY_SCHEMA_PATH)
-            stdin_mode: Any = subprocess.PIPE
-        else:
-            prompt_text = worker_task["prompt_body"]
-            command = build_stub_command(snapshot, run_id, result_path)
-            stdin_mode = subprocess.DEVNULL
+        backend = get_worker_backend(effective_backend)
+        prompt_text, command, stdin_mode = backend.prepare(snapshot, worker_task, run_id, result_path)
 
         prompt_path.write_text(prompt_text, encoding="utf-8")
         log_handle = log_path.open("a", encoding="utf-8")
@@ -947,13 +1293,17 @@ class CentralDispatcher:
         conn = self._connect()
         try:
             with conn:
+                runtime_notes = [f"worker_mode={effective_backend}"]
+                if worker_task.get("worker_model"):
+                    runtime_notes.append(f"model={worker_task['worker_model']}")
+                    runtime_notes.append(f"model_source={worker_task.get('worker_model_source', '-')}")
                 task_db.runtime_transition(
                     conn,
                     task_id=snapshot["task_id"],
                     status="running",
                     worker_id=(snapshot.get("lease") or {}).get("lease_owner_id"),
                     error_text=None,
-                    notes=f"worker_mode={self.config.worker_mode}",
+                    notes=" ".join(runtime_notes),
                     artifacts=[],
                     actor_id="central.dispatcher",
                 )
@@ -988,6 +1338,9 @@ class CentralDispatcher:
             start_monotonic=time.monotonic(),
             last_heartbeat_monotonic=time.monotonic(),
             timeout_seconds=int((snapshot.get("execution") or {}).get("timeout_seconds") or 1800),
+            selected_worker_model=str(worker_task["worker_model"]) if worker_task.get("worker_model") else None,
+            selected_worker_model_source=str(worker_task["worker_model_source"]) if worker_task.get("worker_model_source") else None,
+            selected_worker_backend=effective_backend,
         )
         try:
             self._persist_worker_supervision(state, handoff={})
@@ -999,7 +1352,15 @@ class CentralDispatcher:
         self.logger.emit(
             "INF",
             "central.dispatcher",
-            f"worker_spawned task={snapshot['task_id']} run={run_id} pid={proc.pid} mode={self.config.worker_mode}",
+            " ".join(
+                item
+                for item in [
+                    f"worker_spawned task={snapshot['task_id']} run={run_id} pid={proc.pid} mode={effective_backend}",
+                    f"model={worker_task.get('worker_model', '-')}",
+                    f"model_source={worker_task.get('worker_model_source', '-')}",
+                ]
+                if item
+            ),
         )
         self._active[snapshot["task_id"]] = state
         self._emit_status_heartbeat(force=True)
@@ -1053,6 +1414,9 @@ class CentralDispatcher:
                 last_heartbeat_monotonic=0.0,
                 timeout_seconds=timeout_seconds,
                 adopted=True,
+                selected_worker_model=normalize_optional_string(supervision.get("worker_model") or supervision.get("codex_model")),
+                selected_worker_model_source=normalize_optional_string(supervision.get("worker_model_source") or supervision.get("codex_model_source")),
+                selected_worker_backend=normalize_optional_string(supervision.get("worker_backend") or supervision.get("worker_mode")),
             )
             if not process_matches(state.pid, state.process_start_token):
                 if state.result_path.exists() or state.log_path.exists() or state.prompt_path.exists():
@@ -1148,6 +1512,7 @@ class CentralDispatcher:
             runtime_status = "failed"
             error_text = None
             notes = None
+            tests = None
             extra_artifacts: list[tuple[str, str, dict[str, Any]]] = []
             result_artifacts = terminal_artifacts.copy()
             if state.result_path.exists():
@@ -1157,6 +1522,7 @@ class CentralDispatcher:
                     result = autonomy_runner.load_result_file(state.result_path, task_id=task_id, run_id=state.run_id)
                     runtime_status = success_runtime_status(state.task) if result.status == "COMPLETED" else "failed"
                     notes = result.summary
+                    tests = summarize_validation_results(result.validation)
                     error_text = None if runtime_status in {"done", "pending_review"} else result.summary
                     for artifact in result.artifacts:
                         artifact_path = str(artifact.get("path") or "").strip()
@@ -1186,6 +1552,41 @@ class CentralDispatcher:
                     artifacts=result_artifacts,
                     actor_id="central.dispatcher",
                 )
+            if runtime_status == "done":
+                reconcile_conn = self._connect()
+                try:
+                    reconciled = task_db.auto_reconcile_runtime_success(
+                        reconcile_conn,
+                        task_id=task_id,
+                        summary=notes or "runtime completed successfully",
+                        notes=notes,
+                        tests=tests,
+                        artifacts=result_artifacts,
+                        actor_id="central.dispatcher",
+                        run_id=state.run_id,
+                    )
+                    self.logger.emit(
+                        "INF",
+                        "central.dispatcher",
+                        f"worker_auto_reconciled task={task_id} run={state.run_id} planner_status={reconciled['planner_status']} version={reconciled['version']}",
+                    )
+                except Exception as exc:
+                    with reconcile_conn:
+                        task_db.insert_event(
+                            reconcile_conn,
+                            task_id=task_id,
+                            event_type="planner.task_auto_reconcile_failed",
+                            actor_kind="runtime",
+                            actor_id="central.dispatcher",
+                            payload={"run_id": state.run_id, "error": str(exc)},
+                        )
+                    self.logger.emit(
+                        "ERR",
+                        "central.dispatcher",
+                        f"worker_auto_reconcile_failed task={task_id} run={state.run_id} error={exc}",
+                    )
+                finally:
+                    reconcile_conn.close()
             if extra_artifacts:
                 add_artifacts(task_id, extra_artifacts, self.config.db_path)
             self.logger.emit(
@@ -1290,7 +1691,9 @@ class CentralDispatcher:
             "central.dispatcher",
             (
                 f"dispatcher_started max_workers={self.config.max_workers} "
-                f"worker_mode={self.config.worker_mode} adopted_workers={adopted}"
+                f"worker_mode={self.config.worker_mode} "
+                f"default_worker_model={self.config.default_worker_model or self.config.default_codex_model} "
+                f"adopted_workers={adopted}"
             ),
         )
         self._emit_status_heartbeat(force=True)
@@ -1322,6 +1725,7 @@ def status_payload(db_path: Path, paths: RuntimePaths) -> dict[str, Any]:
     pid = None
     configured_max_workers = None
     worker_mode = None
+    configured_default_codex_model = None
     if payload is not None:
         try:
             pid = int(payload.get("pid"))
@@ -1334,6 +1738,8 @@ def status_payload(db_path: Path, paths: RuntimePaths) -> dict[str, Any]:
         except (TypeError, ValueError):
             configured_max_workers = None
         worker_mode = str(payload.get("worker_mode")) if payload.get("worker_mode") else None
+        configured_default_codex_model = normalize_optional_string(payload.get("default_codex_model"))
+        configured_default_worker_model = normalize_optional_string(payload.get("default_worker_model")) or configured_default_codex_model
     conn = connect_initialized(db_path)
     try:
         runtime_counts = {
@@ -1354,8 +1760,11 @@ def status_payload(db_path: Path, paths: RuntimePaths) -> dict[str, Any]:
         "lock_path": str(paths.lock_path),
         "log_path": str(paths.log_path),
         "db_path": str(db_path),
+        "runtime_paths": runtime_paths_payload(paths),
         "configured_max_workers": configured_max_workers,
         "worker_mode": worker_mode,
+        "configured_default_codex_model": configured_default_codex_model,
+        "configured_default_worker_model": configured_default_worker_model if running else None,
         "active_leases": active_leases,
         "eligible_count": eligible,
         "runtime_counts": runtime_counts,
@@ -1416,6 +1825,8 @@ def worker_status_payload(
             conn.close()
         runtime = snapshot.get("runtime") or {}
         lease = snapshot.get("lease") or {}
+        lease_metadata = lease.get("metadata") if isinstance(lease, dict) else {}
+        supervision = lease_metadata.get("supervision") if isinstance(lease_metadata, dict) else {}
         run_id = lease.get("execution_run_id") or infer_recent_run_id(snapshot["task_id"], artifacts, paths)
         run_paths = worker_run_paths(paths, snapshot["task_id"], run_id, artifacts)
         latest_runtime = latest_runtime_event(events)
@@ -1450,6 +1861,11 @@ def worker_status_payload(
             "title": snapshot["title"],
             "worker_id": lease.get("lease_owner_id") or runtime.get("claimed_by"),
             "run_id": run_id,
+            "worker": {
+                "backend": supervision.get("worker_backend") if isinstance(supervision, dict) else None,
+                "model": (supervision.get("worker_model") or supervision.get("codex_model")) if isinstance(supervision, dict) else None,
+                "model_source": (supervision.get("worker_model_source") or supervision.get("codex_model_source")) if isinstance(supervision, dict) else None,
+            },
             "runtime_status": runtime.get("runtime_status"),
             "observed_state": observed_state,
             "reason": reason,
@@ -1509,6 +1925,7 @@ def worker_status_payload(
         "generated_at": observed_at,
         "db_path": str(db_path),
         "state_dir": str(paths.state_dir),
+        "runtime_paths": runtime_paths_payload(paths),
         "dispatcher": dispatcher,
         "summary": {
             "overall_status": overall_status,
@@ -1593,6 +2010,10 @@ def build_dispatcher_config(args: argparse.Namespace) -> DispatcherConfig:
         status_heartbeat_seconds=args.status_heartbeat_seconds,
         stale_recovery_seconds=args.stale_recovery_seconds,
         worker_mode=args.worker_mode,
+        default_worker_model=resolve_default_worker_model(
+            args.worker_mode,
+            getattr(args, "default_worker_model", None) or getattr(args, "default_codex_model", None),
+        ),
     )
 
 
@@ -1650,6 +2071,12 @@ def command_self_check(args: argparse.Namespace) -> int:
         try:
             task_db.apply_migrations(conn, task_db.load_migrations(task_db.resolve_migrations_dir(None)))
             with conn:
+                task_db.ensure_repo(
+                    conn,
+                    repo_id="CENTRAL",
+                    repo_root=str(REPO_ROOT),
+                    display_name="CENTRAL",
+                )
                 task_db.create_task(conn, smoke_task_payload(), actor_kind="self_check", actor_id="central.runtime")
         finally:
             conn.close()
@@ -1662,18 +2089,25 @@ def command_self_check(args: argparse.Namespace) -> int:
             status_heartbeat_seconds=0.5,
             stale_recovery_seconds=0.5,
             worker_mode="stub",
+            default_codex_model=DEFAULT_CODEX_MODEL,
         )
         dispatcher = CentralDispatcher(cfg)
         dispatcher.run_once(emit_result=False)
         conn = connect_initialized(db_path)
         try:
             task_row = conn.execute(
-                "SELECT runtime_status, last_runtime_error FROM task_runtime_state WHERE task_id = ?",
+                """
+                SELECT t.planner_status, rs.runtime_status, rs.last_runtime_error
+                FROM tasks t
+                LEFT JOIN task_runtime_state rs ON rs.task_id = t.task_id
+                WHERE t.task_id = ?
+                """,
                 ("CENTRAL-RUNTIME-SMOKE",),
             ).fetchone()
             payload = {
                 "db_path": str(db_path),
                 "state_dir": str(state_dir),
+                "planner_status": task_row["planner_status"] if task_row else None,
                 "runtime_status": task_row["runtime_status"] if task_row else None,
                 "last_runtime_error": task_row["last_runtime_error"] if task_row else None,
             }
@@ -1726,7 +2160,9 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--heartbeat-seconds", type=float, default=5.0)
         sub.add_argument("--status-heartbeat-seconds", type=float, default=30.0)
         sub.add_argument("--stale-recovery-seconds", type=float, default=10.0)
-        sub.add_argument("--worker-mode", choices=["codex", "stub"], default=os.environ.get("CENTRAL_WORKER_MODE", "codex"))
+        sub.add_argument("--worker-mode", choices=["codex", "claude", "stub"], default=os.environ.get("CENTRAL_WORKER_MODE", "codex"))
+        sub.add_argument("--default-codex-model")
+        sub.add_argument("--default-worker-model", "--worker-model")
         sub.set_defaults(func=func)
 
     self_check_parser = subparsers.add_parser("self-check", help="Run a stub-mode CENTRAL runtime smoke check")
