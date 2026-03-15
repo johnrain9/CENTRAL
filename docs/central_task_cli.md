@@ -22,11 +22,64 @@ DB path resolution order:
 2. `CENTRAL_TASK_DB_PATH`
 3. `/home/cobra/CENTRAL/state/central_tasks.db`
 
+Durability directory resolution:
+
+1. `--durability-dir`
+2. `/home/cobra/CENTRAL/durability/central_db`
+
 Initialize first if needed:
 
 ```bash
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py init
 ```
+
+## Durability Commands
+
+These commands make the canonical DB portable and recoverable without changing the DB-first architecture.
+
+### Publish a durable snapshot
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py snapshot-create \
+  --note "planner handoff after CENTRAL-OPS-26"
+```
+
+Behavior:
+
+- captures a point-in-time SQLite backup from the live DB
+- writes an immutable snapshot under `durability/central_db/snapshots/<snapshot_id>/`
+- writes `manifest.json` with task/version inventory and planner/runtime digests
+- updates `durability/central_db/latest.json` to point at the newest published snapshot
+
+### List published snapshots
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py snapshot-list
+```
+
+This gives operators a quick audit view of published recovery points.
+
+### Restore a snapshot
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py snapshot-restore
+
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py snapshot-restore \
+  --snapshot-id 20260310T000000Z-abcdef12 \
+  --db-path /tmp/central_tasks_restored.db
+```
+
+Behavior:
+
+- restores the latest snapshot by default, or a named snapshot with `--snapshot-id`
+- writes a pre-restore backup of the target DB unless `--no-backup-existing` is passed
+- supports clean-checkout or alternate-path restores with `--db-path`
+
+Recommended operator flow:
+
+1. `snapshot-restore` after pulling the latest repo state
+2. make planner updates through the DB CLI
+3. `snapshot-create` before commit/push so the canonical DB state is durable and shareable
 
 ## Planner Commands
 
@@ -185,6 +238,55 @@ Every generated markdown artifact is marked as generated from the CENTRAL DB and
 ## Runtime Commands
 
 These commands implement the DB-native dispatcher/runtime control path.
+For normal operator use, prefer the wrapper commands:
+
+```bash
+dispatcher start --max-workers 3
+dispatcher config --max-workers 3
+dispatcher status
+dispatcher workers
+```
+
+Launcher rules:
+
+- `dispatcher start --max-workers <n>` applies an immediate worker limit
+- `dispatcher config --max-workers <n>` persists the default launcher limit
+- `dispatcher status` shows the active daemon limit plus the next-start default/source
+- `dispatcher workers --json` is the canonical worker inspection surface for operators and future skills
+- `dispatcher stop` and `dispatcher restart` perform a fast handoff: active workers keep running, lease metadata preserves adoption state, and the next dispatcher adopts them on startup
+- graceful handoff extends active leases for a short restart window; if no dispatcher returns before that grace expires, stale-lease recovery can reclaim the task
+- `CENTRAL_DISPATCHER_MAX_WORKERS=<n>` overrides launcher defaults for the current shell session
+
+### Inspect active and recent workers
+
+Use the CENTRAL runtime worker inspector instead of scraping log files in routine cases:
+
+```bash
+dispatcher workers
+dispatcher workers --json
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py worker-status --json
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py worker-status --task-id CENTRAL-OPS-20 --json
+```
+
+The structured payload includes:
+
+- active and recent task/run identity
+- current runtime status and lease owner
+- heartbeat freshness and lease expiry timing
+- log file path, recency, size, and growth since the previous inspection
+- concise heuristics for `healthy`, `low_activity`, `potentially_stuck`, `recently_finished`, or `recent_issue`
+
+Routine guidance:
+
+- start with `dispatcher workers`
+- switch to `--json` when a skill or automation needs structured state
+- tail raw logs only after the worker-status output identifies the task or run worth inspecting
+
+Restart handoff guidance:
+
+1. Prefer `dispatcher restart` over waiting for long-running workers to drain.
+2. After restart, verify the new daemon with `dispatcher status`.
+3. Use `dispatcher workers` to confirm the active run was adopted and heartbeats resumed.
 
 ### Discover eligible runtime work
 
@@ -259,6 +361,6 @@ Behavior:
 
 This CLI mutates the DB directly. Rollback is operational, not markdown-first:
 
-- restore the SQLite DB from backup if a broad mutation was incorrect
+- restore the SQLite DB from `snapshot-restore` if a broad mutation was incorrect
 - use `task-update`, `task-reconcile`, or runtime commands for targeted corrections
 - treat markdown bootstrap surfaces as import/export evidence, not the rollback source of truth

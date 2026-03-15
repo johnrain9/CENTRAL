@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVICE_NAME="voice-ptt.service"
+LOG_FILE="/tmp/voice-ptt.log"
+DAEMON="/home/cobra/CENTRAL/tools/voice_ptt/voice_ptt.py"
+CONFIG="/home/cobra/CENTRAL/tools/voice_ptt/config.toml"
+SYSTEMCTL_BIN="/usr/bin/systemctl"
+
+import_user_env() {
+  if [[ ! -x "$SYSTEMCTL_BIN" ]]; then
+    return 1
+  fi
+  "$SYSTEMCTL_BIN" --user import-environment \
+    DISPLAY \
+    WAYLAND_DISPLAY \
+    XAUTHORITY \
+    XDG_RUNTIME_DIR \
+    DBUS_SESSION_BUS_ADDRESS \
+    OPENAI_API_KEY >/dev/null 2>&1
+}
+
+if [[ -x "$SYSTEMCTL_BIN" ]]; then
+  import_user_env || true
+  if "$SYSTEMCTL_BIN" --user start "$SERVICE_NAME" >/dev/null 2>&1; then
+    exit 0
+  fi
+fi
+
+nohup /usr/bin/python3 "$DAEMON" --config "$CONFIG" >>"$LOG_FILE" 2>&1 &

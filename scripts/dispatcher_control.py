@@ -1,26 +1,41 @@
 #!/usr/bin/env python3
-"""Operator wrapper for the autonomy dispatcher."""
+"""Operator wrapper for the CENTRAL-native dispatcher."""
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 
-REPO_DIR = Path("/home/cobra/photo_auto_tagging")
-VENV_PYTHON = REPO_DIR / ".venv" / "bin" / "python"
-AUTONOMY_BIN = REPO_DIR / ".venv" / "bin" / "autonomy"
-PROFILE = os.environ.get("AUTONOMY_PROFILE", "default")
-PROFILE_DIR = Path.home() / ".autonomy" / "profiles" / PROFILE
-STATE_DIR = PROFILE_DIR / ".worker-state"
+REPO_DIR = Path("/home/cobra/CENTRAL")
+RUNTIME_SCRIPT = REPO_DIR / "scripts" / "central_runtime.py"
+DB_SCRIPT = REPO_DIR / "scripts" / "central_task_db.py"
+PYTHON_BIN = sys.executable or "/usr/bin/python3"
+DB_PATH = os.environ.get("CENTRAL_TASK_DB_PATH")
+STATE_DIR = Path(os.environ.get("CENTRAL_RUNTIME_STATE_DIR", str(REPO_DIR / "state" / "central_runtime"))).expanduser()
 LOCK_PATH = STATE_DIR / "dispatcher.lock"
 LOG_PATH = STATE_DIR / "dispatcher.log"
 LAUNCH_LOG_PATH = STATE_DIR / "dispatcher-launcher.log"
+CONFIG_PATH = STATE_DIR / "dispatcher-config.json"
+DEFAULT_MAX_WORKERS = 1
+MAX_WORKERS_ENV = "CENTRAL_DISPATCHER_MAX_WORKERS"
+
+
+@dataclass(frozen=True)
+class ResolvedMaxWorkers:
+    value: int
+    source: str
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def die(message: str, code: int = 1) -> "None":
@@ -29,133 +44,244 @@ def die(message: str, code: int = 1) -> "None":
 
 
 def ensure_runtime() -> None:
-    if not REPO_DIR.is_dir():
-        die(f"photo_auto_tagging repo missing: {REPO_DIR}")
-    if not VENV_PYTHON.exists():
-        die(f"dispatcher runtime missing: {VENV_PYTHON}")
+    if not RUNTIME_SCRIPT.exists():
+        die(f"CENTRAL runtime script missing: {RUNTIME_SCRIPT}")
+    if not DB_SCRIPT.exists():
+        die(f"CENTRAL DB script missing: {DB_SCRIPT}")
 
 
-def autonomy_cmd(*args: str) -> list[str]:
-    if AUTONOMY_BIN.exists():
-        return [str(AUTONOMY_BIN), *args]
-    return [str(VENV_PYTHON), "-m", "autonomy.cli", *args]
+def parse_positive_int(raw: str, *, label: str) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        die(f"{label} must be an integer: {raw!r}")
+        raise exc
+    if value < 1:
+        die(f"{label} must be >= 1: {value}")
+    return value
 
 
-def autonomy_exec() -> str:
-    return str(AUTONOMY_BIN if AUTONOMY_BIN.exists() else VENV_PYTHON)
+def argparse_positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected integer, got {raw!r}") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError("value must be >= 1")
+    return value
 
 
-def run_capture(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        autonomy_cmd(*args),
-        cwd=str(REPO_DIR),
-        capture_output=True,
-        text=True,
-        check=check,
-    )
+def runtime_cmd(*args: str) -> list[str]:
+    command = [PYTHON_BIN, str(RUNTIME_SCRIPT), *args]
+    if DB_PATH:
+        command.extend(["--db-path", DB_PATH])
+    command.extend(["--state-dir", str(STATE_DIR)])
+    return command
 
 
-def init_profile() -> None:
-    result = run_capture("init", "--profile", PROFILE)
+def db_init_cmd() -> list[str]:
+    command = [PYTHON_BIN, str(DB_SCRIPT), "init"]
+    if DB_PATH:
+        command.extend(["--db-path", DB_PATH])
+    command.extend(["--json"])
+    return command
+
+
+def init_db() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    if result.stdout.strip():
-        # Keep init quiet unless there is a real failure path later.
-        pass
+    result = subprocess.run(db_init_cmd(), cwd=str(REPO_DIR), capture_output=True, text=True)
+    if result.returncode != 0:
+        die((result.stderr or result.stdout or "CENTRAL DB init failed").strip())
 
 
-def lock_payload() -> dict[str, object] | None:
-    if not LOCK_PATH.exists():
+def read_json_file(path: Path) -> dict[str, object] | None:
+    if not path.exists():
         return None
     try:
-        payload = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
-    if not isinstance(payload, dict):
-        return None
-    return payload
+    return payload if isinstance(payload, dict) else None
 
 
-def pid_alive(pid: int | None) -> bool:
-    if not pid or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+def read_lock_payload() -> dict[str, object] | None:
+    return read_json_file(LOCK_PATH)
 
 
 def running_pid() -> int | None:
-    payload = lock_payload()
-    if not payload:
+    payload = read_lock_payload()
+    if payload is None:
         return None
     try:
         pid = int(payload.get("pid"))
-    except (TypeError, ValueError):
+    except Exception:
         return None
-    return pid if pid_alive(pid) else None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
 
 
-def print_status() -> int:
-    init_profile()
-    result = run_capture("dispatch", "status", "--profile", PROFILE, check=False)
-    if result.returncode == 0:
-        stdout = result.stdout.strip()
-        if stdout:
-            print(stdout)
-        else:
-            print("{}")
-        return 0
-    stderr = (result.stderr or "").strip()
-    stdout = (result.stdout or "").strip()
-    die(stderr or stdout or "dispatcher status failed")
-    return 1
+def running_lock_payload() -> dict[str, object] | None:
+    return read_lock_payload() if running_pid() else None
 
 
-def start_dispatcher(*, restart: bool = False) -> int:
+def load_saved_config() -> dict[str, object]:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        die(f"invalid dispatcher config {CONFIG_PATH}: {exc}")
+    if not isinstance(payload, dict):
+        die(f"invalid dispatcher config {CONFIG_PATH}: expected JSON object")
+    max_workers = payload.get("max_workers")
+    if max_workers is not None:
+        payload["max_workers"] = parse_positive_int(str(max_workers), label=f"{CONFIG_PATH} max_workers")
+    return payload
+
+
+def saved_max_workers() -> int | None:
+    payload = load_saved_config()
+    value = payload.get("max_workers")
+    return int(value) if value is not None else None
+
+
+def env_max_workers() -> int | None:
+    raw = os.environ.get(MAX_WORKERS_ENV)
+    if raw is None or not raw.strip():
+        return None
+    return parse_positive_int(raw, label=MAX_WORKERS_ENV)
+
+
+def save_config(*, max_workers: int) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {"max_workers": max_workers, "updated_at": utc_now()}
+    CONFIG_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def describe_source(source: str) -> str:
+    labels = {
+        "cli": "cli flag",
+        "env": MAX_WORKERS_ENV,
+        "running_daemon": "running daemon",
+        "saved_config": str(CONFIG_PATH),
+        "default": "default",
+    }
+    return labels.get(source, source)
+
+
+def resolve_max_workers(cli_value: int | None, *, restart: bool) -> ResolvedMaxWorkers:
+    if cli_value is not None:
+        return ResolvedMaxWorkers(value=cli_value, source="cli")
+    env_value = env_max_workers()
+    if env_value is not None:
+        return ResolvedMaxWorkers(value=env_value, source="env")
+    if restart:
+        payload = running_lock_payload() or {}
+        running_value = payload.get("max_workers")
+        if running_value is not None:
+            return ResolvedMaxWorkers(
+                value=parse_positive_int(str(running_value), label="running dispatcher max_workers"),
+                source="running_daemon",
+            )
+    persisted = saved_max_workers()
+    if persisted is not None:
+        return ResolvedMaxWorkers(value=persisted, source="saved_config")
+    return ResolvedMaxWorkers(value=DEFAULT_MAX_WORKERS, source="default")
+
+
+def runtime_status_payload() -> dict[str, object]:
+    result = subprocess.run(runtime_cmd("status", "--json"), cwd=str(REPO_DIR), capture_output=True, text=True)
+    if result.returncode != 0:
+        die((result.stderr or result.stdout or "dispatcher status failed").strip())
+    raw = (result.stdout or "{}").strip() or "{}"
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        die(f"dispatcher status returned invalid JSON: {exc}")
+        raise exc
+    if not isinstance(payload, dict):
+        die("dispatcher status returned a non-object payload")
+    return payload
+
+
+def launcher_status_payload() -> dict[str, object]:
+    payload = runtime_status_payload()
+    next_start = resolve_max_workers(None, restart=False)
+    next_restart = resolve_max_workers(None, restart=True)
+    payload.update(
+        {
+            "launcher_config_path": str(CONFIG_PATH),
+            "saved_max_workers": saved_max_workers(),
+            "env_max_workers": env_max_workers(),
+            "next_start_max_workers": next_start.value,
+            "next_start_source": next_start.source,
+            "next_restart_max_workers": next_restart.value,
+            "next_restart_source": next_restart.source,
+        }
+    )
+    return payload
+
+
+def start_dispatcher(*, restart: bool = False, max_workers: int | None = None) -> int:
     ensure_runtime()
-    init_profile()
-    current_pid = running_pid()
-    if current_pid and not restart:
-        print(f"Dispatcher already running (pid {current_pid})")
+    init_db()
+    current = running_pid()
+    resolved = resolve_max_workers(max_workers, restart=restart)
+    if current and not restart:
+        if max_workers is not None:
+            print("Dispatcher already running; restart is required to apply a new max worker limit.")
+        print(f"Dispatcher already running (pid {current})")
         return print_status()
-    if current_pid and restart:
+    if current and restart:
         stop_dispatcher(quiet=True)
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with LAUNCH_LOG_PATH.open("ab") as log_handle:
+    with LAUNCH_LOG_PATH.open("ab") as handle:
         proc = subprocess.Popen(
-            autonomy_cmd("dispatch", "daemon", "--profile", PROFILE),
+            runtime_cmd("daemon", "--max-workers", str(resolved.value)),
             cwd=str(REPO_DIR),
-            stdout=log_handle,
+            stdout=handle,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
         )
-
     deadline = time.time() + 10
     while time.time() < deadline:
         pid = running_pid()
         if pid:
+            status = runtime_status_payload()
             print(f"Dispatcher started (pid {pid})")
-            print(f"Profile: {PROFILE}")
-            print(f"Log:     {LOG_PATH}")
+            print(f"DB:  {DB_PATH or str(REPO_DIR / 'state' / 'central_tasks.db')}")
+            print(f"Log: {LOG_PATH}")
+            print(
+                "Max workers: "
+                f"{status.get('configured_max_workers') or resolved.value} "
+                f"(source: {describe_source(resolved.source)})"
+            )
+            if saved_max_workers() is not None:
+                print(f"Saved default: {saved_max_workers()} ({CONFIG_PATH})")
             return 0
         if proc.poll() is not None:
-            launch_log = tail_file(LAUNCH_LOG_PATH, 80)
-            die(f"dispatcher failed to start\n{launch_log}".rstrip())
+            die(tail_file(LAUNCH_LOG_PATH, 80) or "dispatcher failed to start")
         time.sleep(0.2)
-
-    launch_log = tail_file(LAUNCH_LOG_PATH, 80)
-    die(f"dispatcher did not acquire lock in time\n{launch_log}".rstrip())
+    die(tail_file(LAUNCH_LOG_PATH, 80) or "dispatcher did not acquire lock in time")
     return 1
+
+
+def print_status() -> int:
+    ensure_runtime()
+    init_db()
+    print(json.dumps(launcher_status_payload(), indent=2, sort_keys=True))
+    return 0
 
 
 def stop_dispatcher(*, quiet: bool = False) -> int:
     ensure_runtime()
-    init_profile()
-    result = run_capture("dispatch", "stop", "--profile", PROFILE, check=False)
-    message = (result.stdout or result.stderr or "").strip() or "stop issued"
+    result = subprocess.run(runtime_cmd("stop"), cwd=str(REPO_DIR), capture_output=True, text=True)
+    if result.returncode != 0:
+        die((result.stderr or result.stdout or "dispatcher stop failed").strip())
     deadline = time.time() + 10
     while time.time() < deadline:
         if running_pid() is None:
@@ -163,7 +289,7 @@ def stop_dispatcher(*, quiet: bool = False) -> int:
                 print("Dispatcher stopped")
             return 0
         time.sleep(0.2)
-    die(f"{message}\ndispatcher still appears to be running")
+    die("dispatcher still appears to be running")
     return 1
 
 
@@ -176,46 +302,124 @@ def tail_file(path: Path, lines: int = 120) -> str:
 
 def show_logs(follow: bool = False) -> int:
     ensure_runtime()
-    init_profile()
     if follow:
-        os.execv(autonomy_exec(), autonomy_cmd("dispatch", "tail", "--profile", PROFILE, "--follow"))
+        os.execv(PYTHON_BIN, runtime_cmd("tail", "--follow"))
     print(tail_file(LOG_PATH))
     return 0
 
 
 def run_once() -> int:
     ensure_runtime()
-    init_profile()
-    result = run_capture("dispatch", "run-once", "--profile", PROFILE, check=False)
+    init_db()
+    result = subprocess.run(runtime_cmd("run-once"), cwd=str(REPO_DIR), capture_output=True, text=True)
     if result.stdout.strip():
         print(result.stdout.strip())
     if result.returncode != 0:
-        die((result.stderr or "").strip() or "dispatch run-once failed")
+        die((result.stderr or "dispatcher run-once failed").strip())
     return 0
 
 
-def usage() -> int:
-    print("Usage: dispatcher [start|restart|stop|status|logs|follow|once]")
-    return 1
+def show_workers(*, as_json: bool, task_id: str | None, limit: int, recent_hours: float) -> int:
+    ensure_runtime()
+    init_db()
+    command = ["worker-status", "--limit", str(limit), "--recent-hours", str(recent_hours)]
+    if task_id:
+        command.extend(["--task-id", task_id])
+    if as_json:
+        command.append("--json")
+    result = subprocess.run(runtime_cmd(*command), cwd=str(REPO_DIR), capture_output=True, text=True)
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        die((result.stderr or result.stdout or "dispatcher worker-status failed").strip())
+    return 0
+
+
+def show_config(*, max_workers: int | None = None) -> int:
+    ensure_runtime()
+    if max_workers is not None:
+        save_config(max_workers=max_workers)
+    payload = load_saved_config()
+    print(
+        json.dumps(
+            {
+                "config_path": str(CONFIG_PATH),
+                "saved_max_workers": payload.get("max_workers"),
+                "updated_at": payload.get("updated_at"),
+                "env_max_workers": env_max_workers(),
+                "effective_start_max_workers": resolve_max_workers(None, restart=False).value,
+                "effective_start_source": resolve_max_workers(None, restart=False).source,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="CENTRAL dispatcher operator wrapper")
+    subparsers = parser.add_subparsers(dest="command")
+
+    start_parser = subparsers.add_parser("start", help="Start the dispatcher daemon")
+    start_parser.add_argument("--max-workers", type=argparse_positive_int)
+
+    restart_parser = subparsers.add_parser("restart", help="Restart the dispatcher daemon")
+    restart_parser.add_argument("--max-workers", type=argparse_positive_int)
+
+    subparsers.add_parser("stop", help="Stop the dispatcher daemon")
+    subparsers.add_parser("status", help="Show dispatcher status")
+    workers_parser = subparsers.add_parser("workers", help="Inspect active and recent workers")
+    workers_parser.add_argument("--json", action="store_true")
+    workers_parser.add_argument("--task-id")
+    workers_parser.add_argument("--limit", type=argparse_positive_int, default=5)
+    workers_parser.add_argument("--recent-hours", type=float, default=24.0)
+    worker_status_parser = subparsers.add_parser("worker-status", help="Inspect active and recent workers")
+    worker_status_parser.add_argument("--json", action="store_true")
+    worker_status_parser.add_argument("--task-id")
+    worker_status_parser.add_argument("--limit", type=argparse_positive_int, default=5)
+    worker_status_parser.add_argument("--recent-hours", type=float, default=24.0)
+    subparsers.add_parser("logs", help="Show recent dispatcher logs")
+    subparsers.add_parser("follow", help="Follow dispatcher logs")
+    subparsers.add_parser("once", help="Run one dispatcher cycle")
+    subparsers.add_parser("run-once", help="Run one dispatcher cycle")
+    subparsers.add_parser("run_once", help="Run one dispatcher cycle")
+
+    config_parser = subparsers.add_parser("config", help="Show or update persisted launcher defaults")
+    config_parser.add_argument("--max-workers", type=argparse_positive_int)
+
+    return parser
 
 
 def main(argv: list[str]) -> int:
-    cmd = argv[1] if len(argv) > 1 else "start"
+    parser = build_parser()
+    args = parser.parse_args(argv[1:])
+    cmd = args.command or "start"
     if cmd == "start":
-        return start_dispatcher(restart=False)
+        return start_dispatcher(restart=False, max_workers=getattr(args, "max_workers", None))
     if cmd == "restart":
-        return start_dispatcher(restart=True)
+        return start_dispatcher(restart=True, max_workers=getattr(args, "max_workers", None))
     if cmd == "stop":
         return stop_dispatcher()
     if cmd == "status":
         return print_status()
+    if cmd in {"workers", "worker-status"}:
+        return show_workers(
+            as_json=getattr(args, "json", False),
+            task_id=getattr(args, "task_id", None),
+            limit=getattr(args, "limit", 5),
+            recent_hours=getattr(args, "recent_hours", 24.0),
+        )
     if cmd == "logs":
         return show_logs(follow=False)
     if cmd == "follow":
         return show_logs(follow=True)
     if cmd in {"once", "run-once", "run_once"}:
         return run_once()
-    return usage()
+    if cmd == "config":
+        return show_config(max_workers=getattr(args, "max_workers", None))
+    parser.print_help()
+    return 1
 
 
 if __name__ == "__main__":

@@ -1,0 +1,42 @@
+# Resident push-to-talk transcription defaults for this workstation.
+
+[recording]
+input = "default"
+sample_rate = 16000
+channels = 1
+temp_dir = "/tmp/voice-ptt"
+ffmpeg_path = "ffmpeg"
+
+[beep]
+paplay_path = "paplay"
+start_hz = 880
+stop_hz = 660
+duration_ms = 140
+
+[backend]
+type = "openai"
+timeout_seconds = 180
+
+[backend.openai]
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-transcribe"
+api_key_env = "OPENAI_API_KEY"
+api_key_file = ""
+prompt = ""
+curl_path = "curl"
+
+[backend.command]
+shell_command = ""
+trim_stdout = true
+
+[paste]
+mode = "ctrl_shift_v"
+delay_ms = 120
+
+[notify]
+enabled = true
+notify_send_path = "notify-send"
+
+[hotkey]
+modifiers = ["Control", "Shift"]
+key = "R"

@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import sys
+import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ DEFAULT_MIGRATIONS_DIR = REPO_ROOT / "db" / "migrations"
 DEFAULT_GENERATED_DIR = REPO_ROOT / "generated"
 DEFAULT_TASKS_DIR = REPO_ROOT / "tasks"
 DEFAULT_PACKET_PATH = REPO_ROOT / "central_task_system_tasks.md"
+DEFAULT_DURABILITY_DIR = REPO_ROOT / "durability" / "central_db"
 PLANNER_STATUSES = {"todo", "in_progress", "blocked", "done"}
 RUNTIME_STATUSES = {"queued", "claimed", "running", "pending_review", "failed", "timeout", "canceled", "done"}
 ACTIVE_RUNTIME_STATUSES = {"claimed", "running", "pending_review"}
@@ -32,6 +34,9 @@ TASK_FILE_NAME_RE = re.compile(r"^CENTRAL-OPS-[0-9]+\\.md$")
 SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
 KEY_VALUE_RE = re.compile(r"^- `([^`]+)`: (.+)$", re.MULTILINE)
 TASK_PACKET_RE = re.compile(r"^## Task (CENTRAL-OPS-[0-9]+): (.+)$", re.MULTILINE)
+SNAPSHOT_DB_FILENAME = "central_tasks.db"
+SNAPSHOT_MANIFEST_FILENAME = "manifest.json"
+SNAPSHOT_POINTER_FILENAME = "latest.json"
 
 
 @dataclass(frozen=True)
@@ -70,9 +75,24 @@ def resolve_migrations_dir(explicit: str | None) -> Path:
     return DEFAULT_MIGRATIONS_DIR
 
 
+def resolve_durability_dir(explicit: str | None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return DEFAULT_DURABILITY_DIR
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def connect_read_only(db_path: Path) -> sqlite3.Connection:
+    if not db_path.exists():
+        die(f"database not found: {db_path}")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -311,8 +331,190 @@ def write_output(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def write_json_document(path: Path, payload: Any) -> None:
+    write_output(path, json_dumps(payload) + "\n")
+
+
 def generated_banner(generated_at: str) -> str:
     return f"Generated from CENTRAL DB at {generated_at}. Do not edit manually."
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def stable_sha256(payload: Any) -> str:
+    return hashlib.sha256(compact_json(payload).encode("utf-8")).hexdigest()
+
+
+def snapshots_root(durability_dir: Path) -> Path:
+    return durability_dir / "snapshots"
+
+
+def latest_snapshot_pointer_path(durability_dir: Path) -> Path:
+    return durability_dir / SNAPSHOT_POINTER_FILENAME
+
+
+def generate_snapshot_id() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{timestamp}-{uuid.uuid4().hex[:8]}"
+
+
+def backup_connection_to_path(source_conn: sqlite3.Connection, target_db_path: Path) -> None:
+    target_db_path.parent.mkdir(parents=True, exist_ok=True)
+    if target_db_path.exists():
+        target_db_path.unlink()
+    target_conn = sqlite3.connect(str(target_db_path))
+    try:
+        source_conn.backup(target_conn)
+    finally:
+        target_conn.close()
+
+
+def copy_sqlite_database(source_db_path: Path, target_db_path: Path) -> None:
+    source_conn = connect_read_only(source_db_path)
+    try:
+        backup_connection_to_path(source_conn, target_db_path)
+    finally:
+        source_conn.close()
+
+
+def render_snapshot_rows(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for manifest in manifests:
+        rows.append(
+            {
+                "snapshot_id": manifest["snapshot_id"],
+                "created_at": manifest["created_at"],
+                "task_count": manifest["task_count"],
+                "event_count": manifest["event_count"],
+                "planner_digest": manifest["planner_state_digest"][:12],
+                "runtime_digest": manifest["runtime_state_digest"][:12],
+                "db_mb": f"{manifest['db_bytes'] / (1024 * 1024):.2f}",
+                "note": manifest.get("note") or "",
+            }
+        )
+    return rows
+
+
+def build_snapshot_manifest(
+    conn: sqlite3.Connection,
+    *,
+    snapshot_id: str,
+    source_db_path: Path,
+    snapshot_db_path: Path,
+    actor_id: str,
+    note: str | None,
+) -> dict[str, Any]:
+    require_initialized_db(conn, snapshot_db_path)
+    applied = applied_migrations(conn)
+    tasks = conn.execute(
+        """
+        SELECT task_id, version, planner_status, priority, updated_at, target_repo_id
+        FROM tasks
+        WHERE archived_at IS NULL
+        ORDER BY task_id ASC
+        """
+    ).fetchall()
+    runtime_rows = conn.execute(
+        """
+        SELECT task_id, runtime_status, queue_name, claimed_by, last_transition_at, retry_count
+        FROM task_runtime_state
+        ORDER BY task_id ASC
+        """
+    ).fetchall()
+    repo_ids = [
+        str(row["repo_id"])
+        for row in conn.execute("SELECT repo_id FROM repos ORDER BY repo_id ASC").fetchall()
+    ]
+    task_rows = [
+        {
+            "task_id": str(row["task_id"]),
+            "version": int(row["version"]),
+            "planner_status": str(row["planner_status"]),
+            "priority": int(row["priority"]),
+            "updated_at": str(row["updated_at"]),
+            "target_repo_id": str(row["target_repo_id"]),
+        }
+        for row in tasks
+    ]
+    runtime_payload = [
+        {
+            "task_id": str(row["task_id"]),
+            "runtime_status": str(row["runtime_status"]),
+            "queue_name": row["queue_name"],
+            "claimed_by": row["claimed_by"],
+            "last_transition_at": str(row["last_transition_at"]),
+            "retry_count": int(row["retry_count"]),
+        }
+        for row in runtime_rows
+    ]
+    planner_status_counts: dict[str, int] = defaultdict(int)
+    for row in task_rows:
+        planner_status_counts[row["planner_status"]] += 1
+    db_sha256 = file_sha256(snapshot_db_path)
+    return {
+        "schema_version": 1,
+        "snapshot_id": snapshot_id,
+        "created_at": now_iso(),
+        "actor_id": actor_id,
+        "note": note,
+        "source_db_path": str(source_db_path),
+        "db_filename": SNAPSHOT_DB_FILENAME,
+        "db_bytes": snapshot_db_path.stat().st_size,
+        "db_sha256": db_sha256,
+        "task_count": len(task_rows),
+        "event_count": int(conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]),
+        "artifact_count": int(conn.execute("SELECT COUNT(*) FROM task_artifacts").fetchone()[0]),
+        "repo_ids": repo_ids,
+        "planner_status_counts": dict(sorted(planner_status_counts.items())),
+        "applied_migrations": [row["name"] for row in applied.values()],
+        "planner_state_digest": stable_sha256(task_rows),
+        "runtime_state_digest": stable_sha256(runtime_payload),
+        "tasks": task_rows,
+    }
+
+
+def load_latest_snapshot_pointer(durability_dir: Path) -> dict[str, Any]:
+    pointer_path = latest_snapshot_pointer_path(durability_dir)
+    if not pointer_path.exists():
+        die(f"latest snapshot pointer missing: {pointer_path}")
+    raw = json.loads(pointer_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or "snapshot_id" not in raw:
+        die(f"invalid latest snapshot pointer: {pointer_path}")
+    return raw
+
+
+def resolve_snapshot_manifest(durability_dir: Path, snapshot_id: str | None) -> tuple[dict[str, Any], Path]:
+    selected_id = snapshot_id
+    if selected_id is None:
+        selected_id = str(load_latest_snapshot_pointer(durability_dir)["snapshot_id"])
+    manifest_path = snapshots_root(durability_dir) / selected_id / SNAPSHOT_MANIFEST_FILENAME
+    if not manifest_path.exists():
+        die(f"snapshot manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        die(f"invalid snapshot manifest: {manifest_path}")
+    return manifest, manifest_path
+
+
+def list_snapshot_manifests(durability_dir: Path) -> list[dict[str, Any]]:
+    manifests: list[dict[str, Any]] = []
+    root = snapshots_root(durability_dir)
+    if not root.exists():
+        return manifests
+    for manifest_path in sorted(root.glob(f"*/{SNAPSHOT_MANIFEST_FILENAME}"), reverse=True):
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            manifests.append(raw)
+    return manifests
 
 
 def ensure_repo(
@@ -1354,6 +1556,7 @@ def render_task_card(snapshot: dict[str, Any]) -> dict[str, Any]:
         "task_id": snapshot["task_id"],
         "title": snapshot["title"],
         "summary": snapshot["summary"],
+        "version": snapshot["version"],
         "priority": snapshot["priority"],
         "planner_status": snapshot["planner_status"],
         "runtime_status": snapshot["runtime"]["runtime_status"] if snapshot["runtime"] else None,
@@ -2157,6 +2360,145 @@ def command_status(args: argparse.Namespace) -> int:
     ]))
 
 
+def command_snapshot_create(args: argparse.Namespace) -> int:
+    conn, db_path = open_initialized_connection(args.db_path)
+    durability_dir = resolve_durability_dir(args.durability_dir)
+    snapshot_id = args.snapshot_id or generate_snapshot_id()
+    snapshot_dir = snapshots_root(durability_dir) / snapshot_id
+    if snapshot_dir.exists():
+        die(f"snapshot already exists: {snapshot_dir}")
+    snapshot_db_path = snapshot_dir / SNAPSHOT_DB_FILENAME
+    manifest_path = snapshot_dir / SNAPSHOT_MANIFEST_FILENAME
+    try:
+        backup_connection_to_path(conn, snapshot_db_path)
+    finally:
+        conn.close()
+    snapshot_conn = connect_read_only(snapshot_db_path)
+    try:
+        manifest = build_snapshot_manifest(
+            snapshot_conn,
+            snapshot_id=snapshot_id,
+            source_db_path=db_path,
+            snapshot_db_path=snapshot_db_path,
+            actor_id=args.actor_id,
+            note=args.note,
+        )
+    finally:
+        snapshot_conn.close()
+    write_json_document(manifest_path, manifest)
+    pointer_payload = {
+        "snapshot_id": snapshot_id,
+        "created_at": manifest["created_at"],
+        "manifest_path": str(manifest_path.relative_to(durability_dir)),
+    }
+    write_json_document(latest_snapshot_pointer_path(durability_dir), pointer_payload)
+    payload = {
+        "snapshot_id": snapshot_id,
+        "created_at": manifest["created_at"],
+        "source_db_path": str(db_path),
+        "durability_dir": str(durability_dir),
+        "snapshot_dir": str(snapshot_dir),
+        "snapshot_db_path": str(snapshot_db_path),
+        "manifest_path": str(manifest_path),
+        "latest_pointer_path": str(latest_snapshot_pointer_path(durability_dir)),
+        "db_sha256": manifest["db_sha256"],
+        "db_bytes": manifest["db_bytes"],
+        "task_count": manifest["task_count"],
+        "event_count": manifest["event_count"],
+        "planner_state_digest": manifest["planner_state_digest"],
+        "runtime_state_digest": manifest["runtime_state_digest"],
+        "note": args.note,
+    }
+    return print_or_json(payload, as_json=args.json, formatter=lambda data: "\n".join([
+        f"Snapshot ID:      {data['snapshot_id']}",
+        f"Created at:       {data['created_at']}",
+        f"Source DB:        {data['source_db_path']}",
+        f"Snapshot DB:      {data['snapshot_db_path']}",
+        f"Manifest:         {data['manifest_path']}",
+        f"Latest pointer:   {data['latest_pointer_path']}",
+        f"Task count:       {data['task_count']}",
+        f"DB bytes:         {data['db_bytes']}",
+        f"Planner digest:   {data['planner_state_digest']}",
+    ]))
+
+
+def command_snapshot_list(args: argparse.Namespace) -> int:
+    durability_dir = resolve_durability_dir(args.durability_dir)
+    manifests = list_snapshot_manifests(durability_dir)
+    if args.limit is not None:
+        manifests = manifests[: args.limit]
+    latest_snapshot_id: str | None = None
+    pointer_path = latest_snapshot_pointer_path(durability_dir)
+    if pointer_path.exists():
+        latest_snapshot_id = str(load_latest_snapshot_pointer(durability_dir)["snapshot_id"])
+    rows = render_snapshot_rows(manifests)
+    if latest_snapshot_id is not None:
+        for row in rows:
+            if row["snapshot_id"] == latest_snapshot_id:
+                row["note"] = (row["note"] + " [latest]").strip()
+                break
+    payload = {
+        "durability_dir": str(durability_dir),
+        "latest_snapshot_id": latest_snapshot_id,
+        "count": len(manifests),
+        "snapshots": manifests,
+    }
+    return print_or_json(payload, as_json=args.json, formatter=lambda data: "\n".join([
+        f"Durability dir: {data['durability_dir']}",
+        f"Snapshots:      {data['count']}",
+        f"Latest:         {data['latest_snapshot_id'] or '(none)'}",
+        "",
+        render_table(rows, [("snapshot_id", "snapshot_id"), ("created_at", "created_at"), ("tasks", "task_count"), ("events", "event_count"), ("db_mb", "db_mb"), ("planner", "planner_digest"), ("note", "note")]),
+    ]))
+
+
+def command_snapshot_restore(args: argparse.Namespace) -> int:
+    durability_dir = resolve_durability_dir(args.durability_dir)
+    manifest, manifest_path = resolve_snapshot_manifest(durability_dir, args.snapshot_id)
+    snapshot_db_path = manifest_path.parent / str(manifest.get("db_filename", SNAPSHOT_DB_FILENAME))
+    if not snapshot_db_path.exists():
+        die(f"snapshot database not found: {snapshot_db_path}")
+    target_db_path = resolve_db_path(args.db_path)
+    backup_path: str | None = None
+    if target_db_path.exists() and not args.no_backup_existing:
+        backup_dir = (
+            Path(args.backup_dir).expanduser().resolve()
+            if args.backup_dir
+            else target_db_path.parent / "backups"
+        )
+        backup_name = f"{target_db_path.stem}.pre-restore-{manifest['snapshot_id']}.db"
+        backup_target = backup_dir / backup_name
+        copy_sqlite_database(target_db_path, backup_target)
+        backup_path = str(backup_target)
+    temp_target = target_db_path.parent / f".{target_db_path.name}.{manifest['snapshot_id']}.tmp"
+    copy_sqlite_database(snapshot_db_path, temp_target)
+    target_db_path.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(temp_target, target_db_path)
+    verify_conn = connect_read_only(target_db_path)
+    try:
+        require_initialized_db(verify_conn, target_db_path)
+    finally:
+        verify_conn.close()
+    payload = {
+        "snapshot_id": manifest["snapshot_id"],
+        "manifest_path": str(manifest_path),
+        "snapshot_db_path": str(snapshot_db_path),
+        "target_db_path": str(target_db_path),
+        "backup_path": backup_path,
+        "task_count": manifest["task_count"],
+        "planner_state_digest": manifest["planner_state_digest"],
+        "runtime_state_digest": manifest["runtime_state_digest"],
+    }
+    return print_or_json(payload, as_json=args.json, formatter=lambda data: "\n".join([
+        f"Restored snapshot: {data['snapshot_id']}",
+        f"Source DB:         {data['snapshot_db_path']}",
+        f"Target DB:         {data['target_db_path']}",
+        f"Backup DB:         {data['backup_path'] or '(skipped)'}",
+        f"Task count:        {data['task_count']}",
+        f"Planner digest:    {data['planner_state_digest']}",
+    ]))
+
+
 def open_initialized_connection(db_path_arg: str | None) -> tuple[sqlite3.Connection, Path]:
     db_path = resolve_db_path(db_path_arg)
     conn = connect(db_path)
@@ -2607,6 +2949,13 @@ def add_db_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db-path", help="SQLite DB path. Defaults to CENTRAL_TASK_DB_PATH or CENTRAL/state/central_tasks.db")
 
 
+def add_durability_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--durability-dir",
+        help="Snapshot publish directory. Defaults to CENTRAL/durability/central_db",
+    )
+
+
 def add_json_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="Print structured output.")
 
@@ -2626,6 +2975,39 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--migrations-dir", help="Directory containing SQL migration files.")
     add_json_argument(status_parser)
     status_parser.set_defaults(func=command_status)
+
+    snapshot_create_parser = subparsers.add_parser(
+        "snapshot-create",
+        help="Publish an immutable CENTRAL DB snapshot to the durability directory and update the latest pointer.",
+    )
+    add_db_argument(snapshot_create_parser)
+    add_durability_argument(snapshot_create_parser)
+    snapshot_create_parser.add_argument("--snapshot-id", help="Optional explicit snapshot ID.")
+    snapshot_create_parser.add_argument("--note", help="Optional operator note stored in the snapshot manifest.")
+    snapshot_create_parser.add_argument("--actor-id", default="planner/coordinator")
+    add_json_argument(snapshot_create_parser)
+    snapshot_create_parser.set_defaults(func=command_snapshot_create)
+
+    snapshot_list_parser = subparsers.add_parser(
+        "snapshot-list",
+        help="List published CENTRAL DB snapshots from the durability directory.",
+    )
+    add_durability_argument(snapshot_list_parser)
+    snapshot_list_parser.add_argument("--limit", type=int)
+    add_json_argument(snapshot_list_parser)
+    snapshot_list_parser.set_defaults(func=command_snapshot_list)
+
+    snapshot_restore_parser = subparsers.add_parser(
+        "snapshot-restore",
+        help="Restore a published CENTRAL DB snapshot into a target DB path.",
+    )
+    add_db_argument(snapshot_restore_parser)
+    add_durability_argument(snapshot_restore_parser)
+    snapshot_restore_parser.add_argument("--snapshot-id", help="Snapshot ID to restore. Defaults to the latest published snapshot.")
+    snapshot_restore_parser.add_argument("--backup-dir", help="Where to write a backup of the existing target DB before overwrite.")
+    snapshot_restore_parser.add_argument("--no-backup-existing", action="store_true")
+    add_json_argument(snapshot_restore_parser)
+    snapshot_restore_parser.set_defaults(func=command_snapshot_restore)
 
     repo_upsert_parser = subparsers.add_parser("repo-upsert", help="Create or update a repo row in the CENTRAL DB.")
     add_db_argument(repo_upsert_parser)

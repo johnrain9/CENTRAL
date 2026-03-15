@@ -2,80 +2,84 @@
 
 ## Purpose
 
-This is the legacy autonomy runtime runbook.
-Canonical CENTRAL planning, runtime state, generated views, and bootstrap import now live in the CENTRAL DB workflow documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md).
+This is the CENTRAL-native dispatcher runbook.
+Canonical CENTRAL planning, runtime state, generated views, and bootstrap import live in the CENTRAL DB workflow documented in [`docs/central_task_cli.md`](/home/cobra/CENTRAL/docs/central_task_cli.md).
 
 Current implementation lives in:
 
-- repo: `/home/cobra/photo_auto_tagging`
-- module: `/home/cobra/photo_auto_tagging/autonomy`
+- repo: `/home/cobra/CENTRAL`
+- runtime script: `/home/cobra/CENTRAL/scripts/central_runtime.py`
+- launcher wrapper: `/home/cobra/CENTRAL/scripts/dispatcher_control.py`
 
 ## Runtime Contract
 
 Preferred daily entrypoints:
 
 - `dispatcher ...` for start/stop/status/log control from any shell with `~/.zshrc` loaded
-- `autonomy ...` inside the activated `/home/cobra/photo_auto_tagging/.venv`
-- `python -m autonomy.cli ...` only as a fallback if the console script is missing
+- `python3 /home/cobra/CENTRAL/scripts/central_runtime.py ...` for direct CENTRAL-native runtime control
+- `autonomy ...` is now legacy compatibility tooling for older autonomy surfaces only
 
 Bootstrap the runtime with:
 
 ```bash
-cd /home/cobra/photo_auto_tagging
-source .venv/bin/activate
-if ! command -v autonomy >/dev/null 2>&1; then
-  ./.venv/bin/python -m pip install -e .
-fi
-autonomy init --profile default
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py init
 ```
 
 Notes:
 
-- `pyproject.toml` already defines the `autonomy` and `autonomy-cli` console scripts.
-- The supported fix for a missing `autonomy` binary is an editable install into the repo venv.
-- `dispatcher` prefers `.venv/bin/autonomy` and falls back to `python -m autonomy.cli` if the console script is not present yet.
-- First-run profile bootstrap remains required for each profile.
+- `dispatcher` now starts the CENTRAL-native runtime, not `autonomy dispatch daemon`.
+- CENTRAL runtime state lives under `/home/cobra/CENTRAL/state/central_runtime` by default.
+- Set `CENTRAL_WORKER_MODE=stub` for isolated smoke runs or `CENTRAL_WORKER_MODE=codex` for real worker execution.
+- `dispatcher start --max-workers <n>` or `python3 /home/cobra/CENTRAL/scripts/central_runtime.py daemon --max-workers <n>` sets dispatcher concurrency.
+- `dispatcher config --max-workers <n>` persists the launcher default worker limit for later starts and restarts.
 
 ## Manual CLI Flow
 
 Operator status and queue checks:
 
 ```bash
-autonomy dispatch status --profile default
-autonomy report summary --json --profile default
-autonomy task eligible --json --profile default
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py status --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-summary --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py runtime-eligible --json
 ```
 
 Dispatch execution:
 
 ```bash
-autonomy dispatch run-once --profile default
-autonomy dispatch daemon --profile default
-autonomy dispatch stop --profile default
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py run-once
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py daemon --max-workers 3
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py stop
 ```
 
 Worker and report inspection:
 
 ```bash
-autonomy worker list --json --profile default
-autonomy report review-aging --json --profile default
-autonomy report tail --profile default
+dispatcher workers
+dispatcher workers --json
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py worker-status --json
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py tail
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-review --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-assignments --json
 ```
 
-Planner flow:
+Preferred routine inspection path:
+
+- use `dispatcher workers` for the operator summary
+- use `dispatcher workers --json` or `python3 /home/cobra/CENTRAL/scripts/central_runtime.py worker-status --json` for tool/skill integrations
+- treat manual log tailing as a follow-up step only when the structured worker status points to a suspect run
+
+Runtime smoke and self-check:
 
 ```bash
-autonomy task list --json --status pending --profile default
-autonomy task eligible --json --profile default
-autonomy task blocked --json --profile default
-autonomy graph list --json --profile default
+CENTRAL_WORKER_MODE=stub python3 /home/cobra/CENTRAL/scripts/central_runtime.py self-check
 ```
 
-Fallback if the console script is not installed yet:
+Legacy autonomy dispatcher path is no longer primary. If older autonomy state still needs inspection:
 
 ```bash
-python -m autonomy.cli dispatch status --profile default
-python -m autonomy.cli task eligible --json --profile default
+cd /home/cobra/photo_auto_tagging
+source .venv/bin/activate
+autonomy dispatch status --profile default
 ```
 
 Deprecated CENTRAL bridge flow:
@@ -100,9 +104,14 @@ Supported commands:
 ```bash
 dispatcher
 dispatcher start
+dispatcher start --max-workers 3
 dispatcher restart
+dispatcher restart --max-workers 3
 dispatcher stop
 dispatcher status
+dispatcher workers
+dispatcher config
+dispatcher config --max-workers 3
 dispatcher logs
 dispatcher follow
 dispatcher once
@@ -111,22 +120,41 @@ dispatcher once
 Behavior:
 
 - `dispatcher` defaults to `start`
-- auto-runs `init --profile default` if needed
-- launches `dispatch daemon` in the background
-- prefers the `autonomy` console script when it exists in the repo venv
-- falls back to `python -m autonomy.cli` without changing `dispatcher` usage
-- writes launcher output to the profile state dir
-- uses the autonomy lock file as the source of truth for running state
+- auto-runs CENTRAL DB init if needed
+- launches CENTRAL-native `daemon` in the background
+- `dispatcher start --max-workers <n>` launches the daemon with `<n>` workers
+- `dispatcher workers` reports active and recent worker runs with heartbeat freshness, log recency, and stuck-suspect heuristics
+- `dispatcher config --max-workers <n>` saves the default worker limit to `/home/cobra/CENTRAL/state/central_runtime/dispatcher-config.json`
+- `dispatcher restart` preserves the currently running worker limit unless a new `--max-workers` value, environment override, or saved config replaces it
+- `dispatcher stop` and `dispatcher restart` are restart-safe handoff operations: the daemon exits promptly, active workers keep running, and the next dispatcher instance adopts them from persisted lease metadata
+- active worker supervision metadata is persisted in `task_active_leases.lease_metadata_json`, including run id, worker pid, process identity, and prompt/log/result paths needed for adoption
+- a graceful stop extends active leases for a short handoff window; if no dispatcher returns before that grace expires, normal stale-lease recovery rules still apply
+- `CENTRAL_DISPATCHER_MAX_WORKERS=<n>` overrides the saved/default worker limit for the current shell session
+- writes launcher output to CENTRAL runtime state
+- uses the CENTRAL runtime lock file as the source of truth for running state
+- `dispatcher status` shows both the active daemon worker limit and the next-start launcher default/source
+
+Restart-safe operator path:
+
+1. Run `dispatcher restart` for routine code/config restarts while long workers are active.
+2. Confirm the new daemon is up with `dispatcher status`.
+3. Confirm adoption with `dispatcher workers` or `dispatcher workers --json`.
+4. If the daemon was stopped intentionally, restart it before the handoff grace expires so active leases do not age into stale recovery.
 
 ## On-Disk State
 
-Default profile paths:
+Default CENTRAL runtime paths:
 
-- profile root: `~/.autonomy/profiles/default`
-- DB: `~/.autonomy/profiles/default/data/autonomy/autonomy.db`
-- dispatcher lock: `~/.autonomy/profiles/default/.worker-state/dispatcher.lock`
-- dispatcher log: `~/.autonomy/profiles/default/.worker-state/dispatcher.log`
-- launcher log: `~/.autonomy/profiles/default/.worker-state/dispatcher-launcher.log`
+- DB: `/home/cobra/CENTRAL/state/central_tasks.db`
+- runtime state root: `/home/cobra/CENTRAL/state/central_runtime`
+- dispatcher lock: `/home/cobra/CENTRAL/state/central_runtime/dispatcher.lock`
+- dispatcher log: `/home/cobra/CENTRAL/state/central_runtime/dispatcher.log`
+- launcher log: `/home/cobra/CENTRAL/state/central_runtime/dispatcher-launcher.log`
+- launcher config: `/home/cobra/CENTRAL/state/central_runtime/dispatcher-config.json`
+- worker prompts: `/home/cobra/CENTRAL/state/central_runtime/.worker-prompts`
+- worker results: `/home/cobra/CENTRAL/state/central_runtime/.worker-results`
+- worker logs: `/home/cobra/CENTRAL/state/central_runtime/.worker-logs`
+- worker supervision metadata: persisted in CENTRAL DB lease rows, not only in daemon memory
 
 ## Codex Skills In Use
 
@@ -209,25 +237,25 @@ User responsibility:
 Check these surfaces each dispatch cycle or at least daily:
 
 ```bash
-autonomy report review-aging --json --profile default
-autonomy report failures --json --profile default
-autonomy worker list --json --profile default
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py status --json
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py worker-status --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-review --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-assignments --json
 ```
 
 Per-task inspection:
 
 ```bash
-autonomy task show T000123 --json --profile default
-autonomy worker inspect T000123 --json --profile default
-autonomy worker tail T000123 --profile default
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py worker-status --task-id CENTRAL-OPS-20 --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-show --task-id CENTRAL-OPS-20 --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-task-card --task-id CENTRAL-OPS-20 --json
+python3 /home/cobra/CENTRAL/scripts/central_runtime.py tail
 ```
 
 Decision rules:
 
-- Approve with `autonomy task approve ...` when acceptance is met and the closeout includes concrete evidence.
-- Reject with `autonomy task reject ... --notes "..."` when scope, correctness, or evidence is insufficient and a human-readable reason is needed for replanning.
-- Reset with `autonomy task reset ...` for transient infra/runtime failures before a fresh dispatch attempt.
-- Retry with `autonomy worker retry ...` only when the prior run produced enough evidence to justify another execution without rewriting the task.
+- Reconcile `done` or `blocked` with `python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-reconcile ...` when planner review is complete.
+- Retry by returning runtime state to a claimable path through CENTRAL-native runtime and planner judgment.
 - Leave blocked when upstream dependencies or missing external inputs still prevent useful progress.
 
 Required closeout evidence:

@@ -211,14 +211,17 @@ Last sync: 2026-03-09T00:00:00-07:00
   - bootstrap file: [tasks/CENTRAL-OPS-19.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-19.md)
   - implementation: [docs/central_task_cli.md](/home/cobra/CENTRAL/docs/central_task_cli.md), [dispatch_system_readme.md](/home/cobra/CENTRAL/dispatch_system_readme.md), [/home/cobra/.codex/skills/autonomy-planner/SKILL.md](/home/cobra/.codex/skills/autonomy-planner/SKILL.md), [/home/cobra/photo_auto_tagging/autonomy/cli.py](/home/cobra/photo_auto_tagging/autonomy/cli.py)
   - why: the end state must be DB-native planning plus optional generated exports only.
-- [todo] CENTRAL-OPS-20 - Implement CENTRAL-native dispatcher daemon loop.
+- [done] CENTRAL-OPS-20 - Implement CENTRAL-native dispatcher daemon loop.
   - bootstrap file: [tasks/CENTRAL-OPS-20.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-20.md)
+  - implementation: [scripts/central_runtime.py](/home/cobra/CENTRAL/scripts/central_runtime.py), [dispatch_system_readme.md](/home/cobra/CENTRAL/dispatch_system_readme.md)
   - why: DB-native runtime primitives exist, but there is still no long-running CENTRAL dispatcher daemon.
-- [todo] CENTRAL-OPS-21 - Implement CENTRAL-native worker execution bridge.
+- [done] CENTRAL-OPS-21 - Implement CENTRAL-native worker execution bridge.
   - bootstrap file: [tasks/CENTRAL-OPS-21.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-21.md)
+  - implementation: [scripts/central_runtime.py](/home/cobra/CENTRAL/scripts/central_runtime.py), [dispatch_system_readme.md](/home/cobra/CENTRAL/dispatch_system_readme.md)
   - why: claimed CENTRAL tasks still need a real worker execution path.
-- [todo] CENTRAL-OPS-22 - Cut over dispatcher launcher and operator workflow to CENTRAL-native runtime.
+- [done] CENTRAL-OPS-22 - Cut over dispatcher launcher and operator workflow to CENTRAL-native runtime.
   - bootstrap file: [tasks/CENTRAL-OPS-22.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-22.md)
+  - implementation: [scripts/central_runtime.py](/home/cobra/CENTRAL/scripts/central_runtime.py), [scripts/dispatcher_control.py](/home/cobra/CENTRAL/scripts/dispatcher_control.py), [dispatch_system_readme.md](/home/cobra/CENTRAL/dispatch_system_readme.md)
   - why: the `dispatcher` command still needs to point at the CENTRAL-native runtime once it exists.
 - [done] CENTRAL-OPS-23 - Generate DB-native task-board landing page export.
   - bootstrap file: [tasks/CENTRAL-OPS-23.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-23.md)
@@ -232,6 +235,10 @@ Last sync: 2026-03-09T00:00:00-07:00
   - bootstrap file: [tasks/CENTRAL-OPS-25.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-25.md)
   - implementation: [scripts/central_task_db.py](/home/cobra/CENTRAL/scripts/central_task_db.py), [docs/central_task_cli.md](/home/cobra/CENTRAL/docs/central_task_cli.md)
   - why: operators still need repo-specific generated queue views without falling back to manual markdown maintenance.
+- [done] CENTRAL-OPS-26 - Add CENTRAL-native runtime self-check command.
+  - bootstrap file: [tasks/CENTRAL-OPS-26.md](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-26.md)
+  - implementation: [scripts/central_runtime.py](/home/cobra/CENTRAL/scripts/central_runtime.py), [dispatch_system_readme.md](/home/cobra/CENTRAL/dispatch_system_readme.md)
+  - why: operators need one deterministic smoke path that validates the new runtime stack without touching live state.
 - Canonical task packet: [central_task_system_tasks.md](/home/cobra/CENTRAL/central_task_system_tasks.md)
 
 ### Intake 2026-02-28: `video_queue_auto_prompt_design.md`

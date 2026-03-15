@@ -1,0 +1,17 @@
+[Unit]
+Description=Always-on push-to-talk voice transcription daemon
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/cobra/CENTRAL
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-%h/.config/voice-ptt.env
+ExecStart=/usr/bin/python3 /home/cobra/CENTRAL/tools/voice_ptt/voice_ptt.py --config /home/cobra/CENTRAL/tools/voice_ptt/config.toml
+Restart=always
+RestartSec=3
+StandardOutput=append:/tmp/voice-ptt.log
+StandardError=append:/tmp/voice-ptt.log
+
+[Install]
+WantedBy=default.target

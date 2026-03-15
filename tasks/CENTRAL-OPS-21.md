@@ -3,11 +3,11 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-21`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `implementation`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
+- `Worker Owner`: `planner/coordinator`
 - `Source Of Truth`: CENTRAL DB canonical record; this file is a bootstrap snapshot only
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
@@ -56,6 +56,14 @@ Connect the CENTRAL-native dispatcher to actual worker execution.
 - Verify heartbeat updates while the worker is active.
 - Verify success and failure paths record the expected runtime transitions.
 - Verify artifacts or closeout evidence are captured in DB-linked form.
+- Minimal smoke verification complete on 2026-03-10:
+  - stub worker bridge launched from the CENTRAL-native runtime
+  - heartbeat/update path remained coherent during execution
+  - worker completion recorded terminal runtime state plus prompt/log/result artifacts
+
+Review result:
+- accepted the CENTRAL-native worker execution bridge with pluggable `codex` and `stub` worker modes
+- accepted DB-linked artifact capture and runtime transition handling as sufficient first execution path
 
 ## Dependencies
 
@@ -78,6 +86,9 @@ CENTRAL-OPS-21 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 - CENTRAL DB is the canonical planner/runtime store for this task.
 - Reconcile worker outcomes in CENTRAL first.
+- Implementation now lives in:
+  - [`scripts/central_runtime.py`](/home/cobra/CENTRAL/scripts/central_runtime.py)
+  - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md)
 
 ## Validation Rules
 

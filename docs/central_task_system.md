@@ -18,6 +18,7 @@ Target model:
 - DB schema: [`central_task_db_schema.md`](/home/cobra/CENTRAL/docs/central_task_db_schema.md)
 - runtime integration model: [`central_autonomy_integration.md`](/home/cobra/CENTRAL/docs/central_autonomy_integration.md)
 - DB bootstrap and location contract: [`central_task_db_bootstrap.md`](/home/cobra/CENTRAL/docs/central_task_db_bootstrap.md)
+- DB durability and sync contract: [`central_db_durability.md`](/home/cobra/CENTRAL/docs/central_db_durability.md)
 
 ## Non-Canonical Surfaces
 
@@ -38,6 +39,7 @@ The canonical task system must support:
 - dependency traversal without file parsing
 - concurrent planner and worker activity
 - durable assignment and event history
+- explicit recovery and multi-operator handoff for canonical DB state
 - generated summaries and exports
 - clean integration with dispatcher/runtime state
 

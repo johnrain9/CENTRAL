@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Voice PTT
+Comment=Start the resident push-to-talk transcription daemon
+Exec=/home/cobra/.local/bin/voice-ptt-launch
+Terminal=false
+X-GNOME-Autostart-enabled=true

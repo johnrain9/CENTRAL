@@ -1091,3 +1091,40 @@ python -m autonomy.cli task list --json --status pending
 
 ## Notes
 - Completed in [`tasks/CENTRAL-OPS-25.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-25.md).
+
+---
+
+## Packet Correction For CENTRAL-OPS-20 Through CENTRAL-OPS-25
+
+- The inline packet numbering for `CENTRAL-OPS-20` through `CENTRAL-OPS-25` drifted during the export-task tranche.
+- Canonical bootstrap task files and [`tasks.md`](/home/cobra/CENTRAL/tasks.md) are the authoritative references for current numbering and status.
+- Current canonical mapping is:
+  - `CENTRAL-OPS-20`: [`tasks/CENTRAL-OPS-20.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-20.md)
+  - `CENTRAL-OPS-21`: [`tasks/CENTRAL-OPS-21.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-21.md)
+  - `CENTRAL-OPS-22`: [`tasks/CENTRAL-OPS-22.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-22.md)
+  - `CENTRAL-OPS-23`: [`tasks/CENTRAL-OPS-23.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-23.md)
+  - `CENTRAL-OPS-24`: [`tasks/CENTRAL-OPS-24.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-24.md)
+  - `CENTRAL-OPS-25`: [`tasks/CENTRAL-OPS-25.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-25.md)
+
+---
+
+## Task CENTRAL-OPS-26: Add CENTRAL-native runtime self-check command
+
+## Repo
+- Primary repo: `/home/cobra/CENTRAL`
+
+## Status
+- `done`
+
+## Objective
+- Add a deterministic CENTRAL-native self-check that validates the daemon and worker bridge against temporary isolated state.
+
+## Testing
+- Minimal smoke verification complete on 2026-03-10:
+  - `python3 /home/cobra/CENTRAL/scripts/central_runtime.py self-check`
+
+## Notes
+- Completed in:
+  - [`tasks/CENTRAL-OPS-26.md`](/home/cobra/CENTRAL/tasks/CENTRAL-OPS-26.md)
+  - [`scripts/central_runtime.py`](/home/cobra/CENTRAL/scripts/central_runtime.py)
+  - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md)

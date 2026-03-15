@@ -3,11 +3,11 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-22`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `implementation`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
+- `Worker Owner`: `planner/coordinator`
 - `Source Of Truth`: CENTRAL DB canonical record; this file is a bootstrap snapshot only
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
@@ -55,6 +55,13 @@ Switch the operator entrypoint over to the new CENTRAL-native runtime once the d
 - Run `dispatcher`, `dispatcher status`, and `dispatcher logs` against the CENTRAL-native runtime.
 - Verify the launcher no longer shells into legacy autonomy dispatch as the primary path.
 - Verify docs and launcher messages match the actual commands used.
+- Minimal smoke verification complete on 2026-03-10:
+  - `dispatcher_control.py` now targets CENTRAL-native runtime commands
+  - launcher status/log workflow points at CENTRAL runtime state and logs rather than autonomy dispatcher state
+
+Review result:
+- accepted `dispatcher` cutover to the CENTRAL-native runtime as the primary operator path
+- accepted legacy autonomy dispatcher as secondary compatibility-only tooling, not the default launcher path
 
 ## Dependencies
 
@@ -78,6 +85,10 @@ CENTRAL-OPS-22 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 - CENTRAL DB is the canonical planner/runtime store for this task.
 - Reconcile worker outcomes in CENTRAL first.
+- Implementation now lives in:
+  - [`scripts/central_runtime.py`](/home/cobra/CENTRAL/scripts/central_runtime.py)
+  - [`scripts/dispatcher_control.py`](/home/cobra/CENTRAL/scripts/dispatcher_control.py)
+  - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md)
 
 ## Validation Rules
 

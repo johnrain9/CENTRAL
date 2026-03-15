@@ -12,6 +12,10 @@ Default migration directory:
 
 - [`db/migrations`](/home/cobra/CENTRAL/db/migrations)
 
+Default durability directory:
+
+- [`durability/central_db`](/home/cobra/CENTRAL/durability/central_db)
+
 Resolution order for DB path:
 
 1. `--db-path`
@@ -42,6 +46,28 @@ python3 /home/cobra/CENTRAL/scripts/central_task_db.py status
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py status --json
 ```
 
+## Durability Commands
+
+Publish the current DB into the tracked durability directory:
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py snapshot-create
+```
+
+Restore the latest published snapshot back into the working DB:
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py snapshot-restore
+```
+
+List available snapshots:
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py snapshot-list
+```
+
+The detailed durability workflow is documented in [`central_db_durability.md`](/home/cobra/CENTRAL/docs/central_db_durability.md).
+
 ## Temporary Or Test Databases
 
 Use a temporary DB path for testing:
@@ -59,18 +85,9 @@ This leaves the default repo DB untouched.
 - A previously applied migration cannot change contents silently; checksum mismatch is treated as an error
 - Schema upgrades happen through new migration files, not by replacing the DB file
 
-## Current Scope
+## Operational Contract
 
-This bootstrap provides:
-
-- canonical schema creation
-- migration tracking
-- repeatable DB initialization
-
-This bootstrap does not yet provide:
-
-- planner CRUD commands
-- generated view commands
-- dispatcher runtime mutations
-
-Those arrive in later CENTRAL tasks.
+- initialize or migrate the local working DB with `init`
+- publish durable point-in-time snapshots with `snapshot-create`
+- restore the latest or a named snapshot with `snapshot-restore`
+- treat `state/central_tasks.db` as the live writable DB and `durability/central_db` as the backup/sync transport

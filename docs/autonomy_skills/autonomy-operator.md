@@ -10,6 +10,7 @@ Purpose:
 Bootstrap contract:
 
 - Primary shell entrypoint: `dispatcher ...`
+- Concurrency control: `dispatcher start --max-workers <n>` for an immediate override, or `dispatcher config --max-workers <n>` to persist the launcher default
 - Primary CLI surface inside `/home/cobra/photo_auto_tagging/.venv`: `autonomy ...`
 - If `autonomy` is missing after activation, run `./.venv/bin/python -m pip install -e .`
 - Use `python -m autonomy.cli ...` only as a fallback
@@ -18,7 +19,7 @@ Bootstrap contract:
 Deterministic responsibilities:
 
 - Start, stop, or pulse the dispatcher.
-- Inspect active runs and tail logs.
+- Inspect active runs with the canonical worker-status tool before tailing logs.
 - Surface completion, failure, and review-aging pressure.
 - Hand off approval and rejection decisions to explicit task commands.
 - When task context is needed for planner-owned work, inspect CENTRAL DB-backed task state first and treat markdown task cards as non-canonical exports only.
@@ -42,10 +43,12 @@ Command dependencies:
 Daily rhythm:
 
 1. Check dispatcher state with `dispatcher status`.
-2. Review queue pressure with `autonomy report summary --json --profile default`.
-3. Run one cycle or start the daemon.
-4. Monitor workers and logs.
-5. Review `pending_review` aging before ending the session.
+2. Inspect active runs with `dispatcher workers --json` to confirm heartbeat freshness, log recency, and stuck-suspect heuristics.
+3. Confirm worker concurrency from `configured_max_workers` / `next_start_max_workers` in the status payload when changing throughput.
+4. Review queue pressure with `autonomy report summary --json --profile default`.
+5. Run one cycle or start the daemon.
+6. Tail logs only when `dispatcher workers` points to a suspect task/run.
+7. Review `pending_review` aging before ending the session.
 
 Task reference rule:
 

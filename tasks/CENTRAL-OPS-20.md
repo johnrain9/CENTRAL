@@ -3,11 +3,11 @@
 ## Task Metadata
 
 - `Task ID`: `CENTRAL-OPS-20`
-- `Status`: `todo`
+- `Status`: `done`
 - `Target Repo`: `/home/cobra/CENTRAL`
 - `Task Type`: `implementation`
 - `Planner Owner`: `planner/coordinator`
-- `Worker Owner`: `unassigned`
+- `Worker Owner`: `planner/coordinator`
 - `Source Of Truth`: CENTRAL DB canonical record; this file is a bootstrap snapshot only
 - `Summary Record`: [`tasks.md`](/home/cobra/CENTRAL/tasks.md)
 
@@ -56,6 +56,14 @@ Create the first real CENTRAL-native dispatcher loop so DB-native task/runtime s
 - Verify it logs startup, cycle activity, and shutdown cleanly.
 - Verify stale-recovery logic can run on schedule without breaking the loop.
 - Verify it does not require the legacy autonomy dispatcher to function.
+- Minimal smoke verification complete on 2026-03-10:
+  - CENTRAL-native daemon started against a temp DB in stub worker mode
+  - `status` reported live dispatcher state against the temp DB
+  - clean shutdown completed without using legacy autonomy dispatcher
+
+Review result:
+- accepted CENTRAL-native daemon loop, lock handling, cycle logging, and stale-recovery scheduling
+- accepted daemon structure as a clean host for the worker execution bridge
 
 ## Dependencies
 
@@ -78,6 +86,9 @@ CENTRAL-OPS-20 | done|blocked | tests: <cmd/result> | ref: <branch/commit/notes>
 
 - CENTRAL DB is the canonical planner/runtime store for this task.
 - Reconcile worker outcomes in CENTRAL first.
+- Implementation now lives in:
+  - [`scripts/central_runtime.py`](/home/cobra/CENTRAL/scripts/central_runtime.py)
+  - [`dispatch_system_readme.md`](/home/cobra/CENTRAL/dispatch_system_readme.md)
 
 ## Validation Rules
 
