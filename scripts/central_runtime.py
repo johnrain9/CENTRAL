@@ -1666,6 +1666,14 @@ class CentralDispatcher:
             tests = None
             extra_artifacts: list[tuple[str, str, dict[str, Any]]] = []
             result_artifacts = terminal_artifacts.copy()
+            # For Claude workers, claude -p JSON output goes to the log file (stdout=log_handle).
+            # result_path is never written by the subprocess itself, so normalize it here before
+            # the result_path.exists() check below.
+            if not state.result_path.exists() and getattr(state, "selected_worker_backend", None) == "claude":
+                if normalize_claude_result(state.log_path, state.result_path, task_id, state.run_id):
+                    self.logger.emit("INF", "central.dispatcher", f"claude_result_normalized task={task_id} run={state.run_id}")
+                else:
+                    self.logger.emit("INF", "central.dispatcher", f"claude_result_normalize_failed task={task_id} run={state.run_id}")
             if state.result_path.exists():
                 result_artifacts.append(str(state.result_path))
                 try:
