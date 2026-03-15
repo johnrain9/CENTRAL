@@ -62,7 +62,9 @@ class RepoHealthTests(unittest.TestCase):
             ],
         }
         report = repo_health.render_report(bundle)
-        self.assertIn("working=fail evidence=warn overall=fail", report)
+        self.assertIn("working=fail", report)
+        self.assertIn("evidence=warn", report)
+        self.assertIn("FAILING", report)
         self.assertIn("coverage_unknown", report)
         self.assertIn("aimSoloAnalysis", report)
 
