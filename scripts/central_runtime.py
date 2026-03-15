@@ -325,11 +325,26 @@ class DaemonLog:
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
-    def tail(self, lines: int = 120) -> str:
+    # Pattern matches the plain-text log format written by emit():
+    #   HH:MM:SS LEV [subsystem] message
+    _LOG_LINE_RE = re.compile(r"^(\d{2}:\d{2}:\d{2}) (INF|WRN|ERR|DBG) \[([^\]]+)\] (.*)$")
+
+    def colorize_log_line(self, line: str) -> str:
+        """Re-parse a plain-text log line and apply color formatting for TTY output."""
+        m = self._LOG_LINE_RE.match(line)
+        if not m:
+            return line
+        timestamp, level, subsystem, message = m.group(1), m.group(2), m.group(3), m.group(4)
+        return self._format_console_line(timestamp, level, subsystem, message)
+
+    def tail(self, lines: int = 120, colorize: bool = False) -> str:
         if not self.path.exists():
             return ""
         data = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
-        return "\n".join(data[-lines:])
+        tail_lines = data[-lines:]
+        if colorize:
+            tail_lines = [self.colorize_log_line(ln) for ln in tail_lines]
+        return "\n".join(tail_lines)
 
     def _style(self, text: str, *codes: str) -> str:
         if not self.use_color:
@@ -658,6 +673,9 @@ def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: 
         "    'summary': summary,\n"
         "    'completed_items': [summary] if not is_error else [],\n"
         "    'remaining_items': [],\n"
+        "    'decisions': [],\n"
+        "    'discoveries': [],\n"
+        "    'blockers': [],\n"
         "    'validation': {},\n"
         "    'artifacts': [],\n"
         "    'claude_raw': claude_result,\n"
@@ -2183,10 +2201,30 @@ def command_stop(args: argparse.Namespace) -> int:
 def command_tail(args: argparse.Namespace) -> int:
     paths = build_runtime_paths(resolve_state_dir(args.state_dir))
     ensure_runtime_dirs(paths)
-    if args.follow:
-        os.execvp("tail", ["tail", "-n", str(args.lines), "-f", str(paths.log_path)])
     log = DaemonLog(paths)
-    print(log.tail(lines=args.lines))
+    is_tty = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+    if args.follow:
+        # Python-based follow so we can colorize each line as it arrives.
+        log_path = paths.log_path
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Emit the last N lines first, then stream new ones.
+        initial = log.tail(lines=args.lines, colorize=is_tty)
+        if initial:
+            print(initial, flush=True)
+        with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(0, 2)  # seek to end
+            try:
+                while True:
+                    line = fh.readline()
+                    if line:
+                        out = log.colorize_log_line(line.rstrip("\n")) if is_tty else line.rstrip("\n")
+                        print(out, flush=True)
+                    else:
+                        time.sleep(0.25)
+            except KeyboardInterrupt:
+                pass
+        return 0
+    print(log.tail(lines=args.lines, colorize=is_tty))
     return 0
 
 

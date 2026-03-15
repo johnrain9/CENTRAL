@@ -428,8 +428,9 @@ def show_logs(follow: bool = False) -> int:
     ensure_runtime()
     if follow:
         os.execv(PYTHON_BIN, runtime_cmd("tail", "--follow"))
-    print(tail_file(LOG_PATH))
-    return 0
+    # Delegate static tail to runtime so colorization logic is shared.
+    os.execv(PYTHON_BIN, runtime_cmd("tail"))
+    return 0  # unreachable
 
 
 def run_once() -> int:
