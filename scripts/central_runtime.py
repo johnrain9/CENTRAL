@@ -32,6 +32,17 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CLAUDE_MODEL_ENV = "CENTRAL_DISPATCHER_CLAUDE_MODEL"
 DEFAULT_WORKER_MODEL_ENV = "CENTRAL_DISPATCHER_WORKER_MODEL"
 
+# Model policy tiers.
+# High tier is used for design/architecture tasks; medium is the routine default.
+# These can be overridden via environment variables.
+HIGH_TIER_CLAUDE_MODEL = os.environ.get("CENTRAL_DISPATCHER_HIGH_TIER_CLAUDE_MODEL", "claude-opus-4-6")
+HIGH_TIER_CODEX_MODEL = os.environ.get("CENTRAL_DISPATCHER_HIGH_TIER_CODEX_MODEL", "o3")
+MEDIUM_TIER_CLAUDE_MODEL = os.environ.get("CENTRAL_DISPATCHER_MEDIUM_TIER_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
+MEDIUM_TIER_CODEX_MODEL = os.environ.get("CENTRAL_DISPATCHER_MEDIUM_TIER_CODEX_MODEL", DEFAULT_CODEX_MODEL)
+
+# Task classes that trigger high-tier model selection.
+HIGH_TIER_TAGS: frozenset[str] = frozenset({"design", "architecture", "planning", "spec"})
+
 if str(SCRIPT_PATH.parent) not in sys.path:
     sys.path.insert(0, str(SCRIPT_PATH.parent))
 
@@ -454,6 +465,12 @@ def resolve_worker_codex_model(snapshot: dict[str, Any], dispatcher_default_code
     task_override = normalize_optional_string(execution_metadata.get("codex_model"))
     if task_override is not None:
         return ModelSelection(value=task_override, source="task_override")
+    task_class = resolve_task_class(snapshot)
+    policy_model, policy_source = resolve_policy_model(task_class, "codex")
+    # Only apply policy if it differs from the medium-tier default; otherwise fall
+    # through to dispatcher_default so operator-configured defaults still apply.
+    if task_class == "design":
+        return ModelSelection(value=policy_model, source=policy_source)
     return ModelSelection(
         value=normalize_codex_model(dispatcher_default_codex_model, label="dispatcher default codex model"),
         source="dispatcher_default",
@@ -475,10 +492,50 @@ def resolve_worker_claude_model(snapshot: dict[str, Any], dispatcher_default_cla
     task_override = normalize_optional_string(execution_metadata.get("claude_model"))
     if task_override is not None:
         return ModelSelection(value=task_override, source="task_override")
+    task_class = resolve_task_class(snapshot)
+    if task_class == "design":
+        policy_model, policy_source = resolve_policy_model(task_class, "claude")
+        return ModelSelection(value=policy_model, source=policy_source)
     return ModelSelection(
         value=normalize_codex_model(dispatcher_default_claude_model, label="dispatcher default claude model"),
         source="dispatcher_default",
     )
+
+
+def resolve_task_class(snapshot: dict[str, Any]) -> str:
+    """Return the task class ('design' or 'routine') for model policy selection.
+
+    Detection priority:
+    1. execution.metadata.task_class explicit override
+    2. metadata.tags contains a high-tier tag (design, architecture, planning, spec)
+    3. metadata.phase contains 'design' or 'architecture'
+    4. Default: 'routine'
+    """
+    execution_metadata = (snapshot.get("execution") or {}).get("metadata") or {}
+    explicit_class = normalize_optional_string(execution_metadata.get("task_class"))
+    if explicit_class is not None:
+        return explicit_class.lower()
+    metadata = snapshot.get("metadata") or {}
+    tags = {str(t).lower() for t in (metadata.get("tags") or [])}
+    if tags & HIGH_TIER_TAGS:
+        return "design"
+    phase = normalize_optional_string(metadata.get("phase")) or ""
+    if any(kw in phase.lower() for kw in ("design", "architecture", "planning", "spec")):
+        return "design"
+    return "routine"
+
+
+def resolve_policy_model(task_class: str, backend: str) -> tuple[str, str]:
+    """Return (model, source) for the given task_class and backend.
+
+    Returns the high-tier model for 'design' tasks, medium-tier for everything else.
+    Source tag is 'policy_default' so callers can inspect where the model came from.
+    """
+    if task_class == "design":
+        model = HIGH_TIER_CLAUDE_MODEL if backend == "claude" else HIGH_TIER_CODEX_MODEL
+    else:
+        model = MEDIUM_TIER_CLAUDE_MODEL if backend == "claude" else MEDIUM_TIER_CODEX_MODEL
+    return model, "policy_default"
 
 
 def resolve_default_worker_model(worker_mode: str, explicit: str | None) -> str:
@@ -576,15 +633,41 @@ def load_autonomy_runner():
 
 
 def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: str) -> list[str]:
-    """Build the command list for a Claude Code worker."""
-    cmd = [
-        "claude",
-        "-p",
-        "--dangerously-skip-permissions",
-        "--model", model,
-        "--output-format", "json",
-    ]
-    return cmd
+    """Build a shell command that runs claude -p and converts output to worker_result schema."""
+    task_id = worker_task.get("id") or worker_task.get("task_id") or "unknown"
+    run_id = worker_task.get("run_id") or "unknown"
+    # Shell script: run claude, capture raw JSON, convert to worker_result schema, write to result_path
+    script = (
+        "import json, subprocess, sys\n"
+        "proc = subprocess.run(\n"
+        f"    ['claude', '-p', '--dangerously-skip-permissions', '--model', {model!r}, '--output-format', 'json'],\n"
+        "    stdin=sys.stdin, capture_output=True, text=True\n"
+        ")\n"
+        "raw = proc.stdout.strip()\n"
+        "try:\n"
+        "    claude_result = json.loads(raw) if raw else {}\n"
+        "except json.JSONDecodeError:\n"
+        "    claude_result = {'result': raw}\n"
+        "is_error = claude_result.get('is_error', False) or claude_result.get('type') == 'error'\n"
+        "summary = str(claude_result.get('result', '') or claude_result.get('error', {}).get('message', 'no result'))[:2000]\n"
+        "payload = {\n"
+        "    'schema_version': 1,\n"
+        f"    'task_id': {task_id!r},\n"
+        f"    'run_id': {run_id!r},\n"
+        "    'status': 'FAILED' if is_error or proc.returncode != 0 else 'COMPLETED',\n"
+        "    'summary': summary,\n"
+        "    'completed_items': [summary] if not is_error else [],\n"
+        "    'remaining_items': [],\n"
+        "    'validation': {},\n"
+        "    'artifacts': [],\n"
+        "    'claude_raw': claude_result,\n"
+        "}\n"
+        "from pathlib import Path\n"
+        f"Path({str(result_path)!r}).write_text(json.dumps(payload, indent=2), encoding='utf-8')\n"
+        "print(json.dumps({'status': payload['status'], 'summary_preview': summary[:200]}))\n"
+        "sys.exit(proc.returncode)\n"
+    )
+    return [sys.executable, "-c", script]
 
 
 def build_stub_command(snapshot: dict[str, Any], run_id: str, result_path: Path) -> list[str]:
@@ -689,6 +772,70 @@ class ClaudeBackend(WorkerBackend):
         prompt_text = worker_task["prompt_body"]
         command = build_claude_command(worker_task, result_path, worker_task["worker_model"])
         return prompt_text, command, subprocess.PIPE
+
+
+def normalize_claude_result(log_path: Path, result_path: Path, task_id: str, run_id: str) -> bool:
+    """Parse claude -p JSON output from log_path and write normalized worker_result to result_path.
+
+    claude -p --output-format json writes a final JSON line to stdout of the form:
+        {"type": "result", "subtype": "success", "is_error": false, "result": "...", ...}
+
+    The reaper expects result_path to contain worker_result.schema.json format:
+        {"status": "COMPLETED", "schema_version": 1, "task_id": "...", "summary": "...", ...}
+
+    Returns True if a result line was found and written, False otherwise.
+    """
+    if not log_path.exists():
+        return False
+    claude_result: dict[str, Any] | None = None
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict) and obj.get("type") == "result":
+                    claude_result = obj
+                    break
+            except json.JSONDecodeError:
+                continue
+    except Exception:
+        return False
+    if claude_result is None:
+        return False
+    is_error = bool(claude_result.get("is_error"))
+    raw_result = str(claude_result.get("result") or "")
+    status = "FAILED" if is_error else "COMPLETED"
+    payload: dict[str, Any] = {
+        "status": status,
+        "schema_version": 1,
+        "task_id": task_id,
+        "run_id": run_id,
+        "summary": raw_result[:2000] if raw_result else ("claude worker error" if is_error else "claude worker completed"),
+        "completed_items": [] if is_error else ["claude worker run finished"],
+        "remaining_items": [],
+        "decisions": [],
+        "discoveries": [],
+        "blockers": [],
+        "validation": [{"name": "claude-exit", "passed": not is_error, "notes": f"is_error={is_error}"}],
+        "files_changed": [],
+        "warnings": [],
+        "artifacts": [],
+        "_claude_meta": {
+            "subtype": claude_result.get("subtype"),
+            "session_id": claude_result.get("session_id"),
+            "num_turns": claude_result.get("num_turns"),
+            "cost_usd": claude_result.get("cost_usd"),
+            "duration_ms": claude_result.get("duration_ms"),
+        },
+    }
+    try:
+        result_path.write_text(json.dumps(payload), encoding="utf-8")
+        return True
+    except Exception:
+        return False
 
 
 class StubBackend(WorkerBackend):
@@ -1306,6 +1453,8 @@ class CentralDispatcher:
                     notes=" ".join(runtime_notes),
                     artifacts=[],
                     actor_id="central.dispatcher",
+                    effective_worker_model=worker_task.get("worker_model") or None,
+                    worker_model_source=worker_task.get("worker_model_source") or None,
                 )
         finally:
             conn.close()
@@ -1420,12 +1569,14 @@ class CentralDispatcher:
             )
             if not process_matches(state.pid, state.process_start_token):
                 if state.result_path.exists() or state.log_path.exists() or state.prompt_path.exists():
+                    handoff_state = (metadata.get("handoff") or {}).get("state", "")
+                    was_interrupted = handoff_state in {"interrupted_by_restart", "pending_adoption"}
                     self.logger.emit(
                         "INF",
                         "central.dispatcher",
-                        f"worker_reconcile_post_restart task={snapshot['task_id']} run={state.run_id} pid={state.pid}",
+                        f"worker_reconcile_post_restart task={snapshot['task_id']} run={state.run_id} pid={state.pid} interrupted={was_interrupted}",
                     )
-                    self._finalize_worker(state, timed_out=False)
+                    self._finalize_worker(state, timed_out=False, interrupted_by_restart=was_interrupted)
                 continue
             self._persist_worker_supervision(
                 state,
@@ -1489,7 +1640,7 @@ class CentralDispatcher:
             f"dispatcher_handoff_prepared active_workers={handed_off}",
         )
 
-    def _finalize_worker(self, state: ActiveWorker, *, timed_out: bool = False) -> None:
+    def _finalize_worker(self, state: ActiveWorker, *, timed_out: bool = False, interrupted_by_restart: bool = False) -> None:
         task_id = state.task["task_id"]
         terminal_artifacts = [str(state.prompt_path), str(state.log_path)]
         conn = self._connect()
@@ -1539,7 +1690,21 @@ class CentralDispatcher:
                     error_text = f"result parse failed: {exc}"
             else:
                 runtime_status = "failed"
-                error_text = "worker exited without result file"
+                if interrupted_by_restart:
+                    error_text = "interrupted_by_restart"
+                    notes = "worker was interrupted by dispatcher restart or force-stop before result emission"
+                elif state.proc is not None:
+                    rc = state.proc.returncode
+                    if rc is not None and rc == 0:
+                        error_text = "result_emit_failed"
+                        notes = "worker exited cleanly (exit 0) but did not write result file"
+                    else:
+                        code_str = str(rc) if rc is not None else "unknown"
+                        error_text = f"worker_crashed (exit {code_str})"
+                        notes = f"worker process exited with code {code_str}"
+                else:
+                    error_text = "worker_crashed"
+                    notes = "worker process not found; presumed crashed before result emission"
 
             with conn:
                 task_db.runtime_transition(
@@ -1702,6 +1867,23 @@ class CentralDispatcher:
                 self._process_active()
                 if self._force_stop:
                     for state in self._active.values():
+                        try:
+                            self._persist_worker_supervision(
+                                state,
+                                handoff={
+                                    "state": "interrupted_by_restart",
+                                    "interrupted_at": utc_now(),
+                                    "interrupted_by_dispatcher_pid": os.getpid(),
+                                },
+                                event_type="runtime.worker_interrupted",
+                                event_payload={
+                                    "run_id": state.run_id,
+                                    "worker_id": state.worker_id,
+                                    "reason": "force_stop",
+                                },
+                            )
+                        except Exception:
+                            pass
                         terminate_process(state.pid, state.proc)
                     break
                 if self._stop_requested:
