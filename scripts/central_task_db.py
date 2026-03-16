@@ -1755,10 +1755,11 @@ def task_is_eligible(snapshot: dict[str, Any]) -> bool:
     runtime = snapshot["runtime"]
     if runtime is None:
         return True
-    if runtime["runtime_status"] not in {"queued", "failed", "timeout"}:
+    status = runtime["runtime_status"]
+    if status not in {"queued", "failed", "timeout"}:
         return False
-    # Don't re-dispatch tasks that have exceeded max retries
-    if runtime.get("retry_count", 0) >= 5 and runtime.get("last_runtime_error") == "max_retries_exceeded":
+    # Don't re-dispatch failed tasks that have exceeded max retries
+    if status == "failed" and runtime.get("retry_count", 0) >= 5 and runtime.get("last_runtime_error") == "max_retries_exceeded":
         return False
     return True
 
