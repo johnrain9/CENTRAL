@@ -13,6 +13,11 @@ import shlex
 import sqlite3
 import sys
 import uuid
+try:
+    import yaml as _yaml
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -228,6 +233,62 @@ def load_json_document(path_value: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         die("JSON input must be an object")
     return payload
+
+
+def load_batch_document(path_value: str) -> dict[str, Any]:
+    """Load a YAML or JSON batch file.
+
+    Accepts two shapes:
+    - A list of task items (shorthand).
+    - An object with optional ``series``, ``repo``, ``defaults`` keys and a
+      required ``tasks`` list.
+
+    Returns a normalised dict with keys: series, repo, defaults, tasks.
+    """
+    if path_value == "-":
+        raw = sys.stdin.read()
+        source_fmt = "json"
+    else:
+        p = Path(path_value)
+        raw = p.read_text(encoding="utf-8")
+        source_fmt = "yaml" if p.suffix.lower() in {".yaml", ".yml"} else "json"
+
+    parsed: Any = None
+    if source_fmt == "yaml":
+        if not _YAML_AVAILABLE:
+            die("PyYAML is required for YAML batch files: pip install pyyaml")
+        try:
+            parsed = _yaml.safe_load(raw)
+        except Exception as exc:
+            die(f"invalid YAML in {path_value}: {exc}")
+    else:
+        # Try JSON first; fall back to YAML if suffix mismatch.
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            if _YAML_AVAILABLE:
+                try:
+                    parsed = _yaml.safe_load(raw)
+                except Exception as exc:
+                    die(f"invalid JSON/YAML in {path_value}: {exc}")
+            else:
+                die(f"invalid JSON in {path_value}")
+
+    if isinstance(parsed, list):
+        return {"series": None, "repo": None, "defaults": {}, "tasks": parsed}
+    if isinstance(parsed, dict):
+        tasks = parsed.get("tasks")
+        if tasks is None:
+            die("batch document must have a 'tasks' list or be a bare list")
+        if not isinstance(tasks, list):
+            die("batch 'tasks' must be a list")
+        return {
+            "series": parsed.get("series"),
+            "repo": parsed.get("repo"),
+            "defaults": parsed.get("defaults") or {},
+            "tasks": tasks,
+        }
+    die(f"batch document must be a list or object, got {type(parsed).__name__}")
 
 
 def parse_bool(value: Any, *, field: str) -> bool:
@@ -1529,6 +1590,7 @@ def fetch_task_snapshots(
     task_id: str | None = None,
     repo_id: str | None = None,
     planner_status: str | None = None,
+    initiative: str | None = None,
 ) -> list[dict[str, Any]]:
     clauses = ["t.archived_at IS NULL"]
     params: list[Any] = []
@@ -1541,6 +1603,9 @@ def fetch_task_snapshots(
     if planner_status is not None:
         clauses.append("t.planner_status = ?")
         params.append(planner_status)
+    if initiative is not None:
+        clauses.append("t.initiative = ?")
+        params.append(initiative)
     query = f"""
         SELECT
             t.*,
@@ -1565,6 +1630,8 @@ def fetch_task_snapshots(
             rs.retry_count,
             rs.last_transition_at,
             rs.runtime_metadata_json,
+            rs.effective_worker_model,
+            rs.worker_model_source,
             al.lease_owner_kind,
             al.lease_owner_id,
             al.assignment_state AS lease_assignment_state,
@@ -1612,6 +1679,8 @@ def fetch_task_snapshots(
                 "retry_count": row["retry_count"],
                 "last_transition_at": row["last_transition_at"],
                 "metadata": parse_json_text(row["runtime_metadata_json"], default={}),
+                "effective_worker_model": row["effective_worker_model"],
+                "worker_model_source": row["worker_model_source"],
             }
         lease = None
         if row["lease_owner_kind"] is not None:
@@ -1651,6 +1720,7 @@ def fetch_task_snapshots(
                 "target_repo_is_active": bool(row["repo_is_active"]),
                 "approval_required": bool(row["approval_required"]),
                 "source_kind": row["source_kind"],
+                "initiative": row["initiative"],
                 "archived_at": row["archived_at"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
@@ -1685,7 +1755,12 @@ def task_is_eligible(snapshot: dict[str, Any]) -> bool:
     runtime = snapshot["runtime"]
     if runtime is None:
         return True
-    return runtime["runtime_status"] in {"queued", "failed", "timeout", "canceled"}
+    if runtime["runtime_status"] not in {"queued", "failed", "timeout"}:
+        return False
+    # Don't re-dispatch tasks that have exceeded max retries
+    if runtime.get("retry_count", 0) >= 5 and runtime.get("last_runtime_error") == "max_retries_exceeded":
+        return False
+    return True
 
 
 def order_eligible_snapshots(snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1727,11 +1802,12 @@ def validate_task_payload(payload: dict[str, Any], *, for_update: bool) -> dict[
         "target_repo_root",
         "target_repo_display_name",
         "source_kind",
+        "initiative",
     ]
     for field in text_fields:
         if field in payload:
             value = payload[field]
-            if value is None and field == "worker_owner":
+            if value is None and field in ("worker_owner", "initiative"):
                 normalized[field] = None
                 continue
             if value is None:
@@ -1858,13 +1934,14 @@ def create_task(conn: sqlite3.Connection, payload: dict[str, Any], *, actor_kind
             target_repo_id,
             approval_required,
             source_kind,
+            initiative,
             archived_at,
             created_at,
             updated_at,
             closed_at,
             metadata_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
         """,
         (
             normalized["task_id"],
@@ -1887,6 +1964,7 @@ def create_task(conn: sqlite3.Connection, payload: dict[str, Any], *, actor_kind
             normalized["target_repo_id"],
             1 if normalized["approval_required"] else 0,
             normalized["source_kind"],
+            normalized.get("initiative"),
             timestamp,
             timestamp,
             timestamp if normalized["planner_status"] == "done" else None,
@@ -1957,6 +2035,7 @@ def update_task(
         "worker_owner",
         "target_repo_id",
         "source_kind",
+        "initiative",
     ]:
         if field in normalized:
             merged[field] = normalized[field]
@@ -1995,6 +2074,7 @@ def update_task(
             target_repo_id = ?,
             approval_required = ?,
             source_kind = ?,
+            initiative = ?,
             updated_at = ?,
             closed_at = ?,
             metadata_json = ?
@@ -2021,6 +2101,7 @@ def update_task(
             merged["target_repo_id"],
             merged["approval_required"],
             merged["source_kind"],
+            merged.get("initiative"),
             merged["updated_at"],
             merged["closed_at"],
             merged["metadata_json"],
@@ -2247,13 +2328,14 @@ def auto_reconcile_runtime_success(
     return fetch_task_snapshots(conn, task_id=task_id)[0]
 
 
-def summarize_portfolio(conn: sqlite3.Connection) -> dict[str, Any]:
+def summarize_portfolio(conn: sqlite3.Connection, *, initiative: str | None = None) -> dict[str, Any]:
     generated_at = now_iso()
-    snapshots = fetch_task_snapshots(conn)
+    snapshots = fetch_task_snapshots(conn, initiative=initiative)
     eligible = order_eligible_snapshots(snapshots)
     planner_counts: dict[str, int] = {status: 0 for status in sorted(PLANNER_STATUSES)}
     runtime_counts: dict[str, int] = {status: 0 for status in sorted(RUNTIME_STATUSES)}
     per_repo: dict[str, dict[str, int]] = defaultdict(lambda: {"total": 0, "eligible": 0, "blocked": 0, "pending_review": 0, "running": 0})
+    per_initiative: dict[str, dict[str, int]] = defaultdict(lambda: {"total": 0, "todo": 0, "in_progress": 0, "done": 0, "blocked": 0})
     blocked_rows: list[dict[str, Any]] = []
     review_rows: list[dict[str, Any]] = []
     mismatch_rows: list[dict[str, Any]] = []
@@ -2276,6 +2358,12 @@ def summarize_portfolio(conn: sqlite3.Connection) -> dict[str, Any]:
             repo_summary["running"] += 1
         if snapshot["status_mismatch"]:
             mismatch_rows.append(snapshot)
+        if snapshot.get("initiative"):
+            init_summary = per_initiative[snapshot["initiative"]]
+            init_summary["total"] += 1
+            ps = snapshot["planner_status"]
+            if ps in init_summary:
+                init_summary[ps] += 1
     return {
         "generated_at": generated_at,
         "planner_counts": planner_counts,
@@ -2319,6 +2407,13 @@ def summarize_portfolio(conn: sqlite3.Connection) -> dict[str, Any]:
             }
             for repo_id, counts in sorted(per_repo.items())
         ],
+        "per_initiative": [
+            {
+                "initiative": initiative,
+                **counts,
+            }
+            for initiative, counts in sorted(per_initiative.items())
+        ],
     }
 
 
@@ -2351,6 +2446,10 @@ def format_summary_text(summary: dict[str, Any]) -> str:
         lines.append(render_table(summary["per_repo"], [("repo", "repo_id"), ("total", "total"), ("eligible", "eligible"), ("blocked", "blocked"), ("review", "pending_review"), ("running", "running")]))
     else:
         lines.append("(no repos)")
+    if summary.get("per_initiative"):
+        lines.append("")
+        lines.append("Per initiative:")
+        lines.append(render_table(summary["per_initiative"], [("initiative", "initiative"), ("total", "total"), ("todo", "todo"), ("in_progress", "in_progress"), ("done", "done"), ("blocked", "blocked")]))
     return "\n".join(lines)
 
 
@@ -2408,6 +2507,8 @@ def format_assignments_rows(snapshots: list[dict[str, Any]]) -> list[dict[str, A
                 "lease_owner": snapshot["lease"]["lease_owner_id"] if snapshot["lease"] else "",
                 "lease_expires_at": snapshot["lease"]["lease_expires_at"] if snapshot["lease"] else "",
                 "runtime_status": snapshot["runtime"]["runtime_status"] if snapshot["runtime"] else "",
+                "effective_worker_model": snapshot["runtime"]["effective_worker_model"] if snapshot["runtime"] else "",
+                "worker_model_source": snapshot["runtime"]["worker_model_source"] if snapshot["runtime"] else "",
                 "title": snapshot["title"],
             }
         )
@@ -2454,9 +2555,12 @@ def render_task_card(snapshot: dict[str, Any]) -> dict[str, Any]:
         "priority": snapshot["priority"],
         "planner_status": snapshot["planner_status"],
         "runtime_status": snapshot["runtime"]["runtime_status"] if snapshot["runtime"] else None,
+        "effective_worker_model": snapshot["runtime"]["effective_worker_model"] if snapshot["runtime"] else None,
+        "worker_model_source": snapshot["runtime"]["worker_model_source"] if snapshot["runtime"] else None,
         "status_mismatch": snapshot["status_mismatch"],
         "target_repo_id": snapshot["target_repo_id"],
         "target_repo_root": snapshot["target_repo_root"],
+        "initiative": snapshot["initiative"],
         "planner_owner": snapshot["planner_owner"],
         "worker_owner": snapshot["worker_owner"],
         "objective_md": snapshot["objective_md"],
@@ -2491,6 +2595,10 @@ def render_task_card_markdown(snapshot: dict[str, Any], *, generated_at: str) ->
         f"- Task ID: `{snapshot['task_id']}`",
         f"- Planner Status: `{snapshot['planner_status']}`",
         f"- Runtime Status: `{runtime_status}`",
+        *([
+            f"- Effective Worker Model: `{snapshot['runtime']['effective_worker_model']}` (source: `{snapshot['runtime']['worker_model_source'] or 'unknown'}`)",
+        ] if snapshot.get("runtime") and snapshot["runtime"].get("effective_worker_model") else []),
+        *([f"- Initiative: `{snapshot['initiative']}`"] if snapshot.get("initiative") else []),
         f"- Priority: `{snapshot['priority']}`",
         f"- Target Repo: `{snapshot['target_repo_id']}` ({snapshot['target_repo_root']})",
         f"- Planner Owner: `{snapshot['planner_owner']}`",
@@ -2577,11 +2685,14 @@ def render_generated_tasks_board(summary: dict[str, Any], snapshots: list[dict[s
         lines: list[str] = []
         for snapshot in task_rows:
             runtime_status = snapshot["runtime"]["runtime_status"] if snapshot["runtime"] else "none"
+            effective_model = snapshot["runtime"]["effective_worker_model"] if snapshot.get("runtime") else None
+            model_source = snapshot["runtime"]["worker_model_source"] if snapshot.get("runtime") else None
+            model_suffix = f" | model: {effective_model} ({model_source})" if effective_model else ""
             lines.append(
                 f"- [{snapshot['planner_status']}] {snapshot['task_id']} - {snapshot['title']}"
             )
             lines.append(
-                f"  - priority: {snapshot['priority']} | repo: {snapshot['target_repo_id']} | runtime: {runtime_status}"
+                f"  - priority: {snapshot['priority']} | repo: {snapshot['target_repo_id']} | runtime: {runtime_status}{model_suffix}"
             )
         return lines
 
@@ -2847,6 +2958,8 @@ def runtime_transition(
     notes: str | None,
     artifacts: list[str],
     actor_id: str,
+    effective_worker_model: str | None = None,
+    worker_model_source: str | None = None,
 ) -> dict[str, Any]:
     if status not in RUNTIME_STATUSES:
         die(f"invalid runtime status: {status}")
@@ -2878,6 +2991,11 @@ def runtime_transition(
         pending_review_at = None if status not in {"pending_review"} else pending_review_at
     if status in {"failed", "timeout"}:
         retry_count += 1
+    # Preserve existing model columns unless caller provides new values.
+    existing_model = current.get("effective_worker_model")
+    existing_source = current.get("worker_model_source")
+    resolved_model = effective_worker_model if effective_worker_model is not None else existing_model
+    resolved_source = worker_model_source if worker_model_source is not None else existing_source
     conn.execute(
         """
         UPDATE task_runtime_state
@@ -2891,7 +3009,9 @@ def runtime_transition(
             last_runtime_error = ?,
             retry_count = ?,
             last_transition_at = ?,
-            runtime_metadata_json = ?
+            runtime_metadata_json = ?,
+            effective_worker_model = ?,
+            worker_model_source = ?
         WHERE task_id = ?
         """,
         (
@@ -2906,6 +3026,8 @@ def runtime_transition(
             retry_count,
             transition_at,
             compact_json({"notes": notes} if notes else {}),
+            resolved_model,
+            resolved_source,
             task_id,
         ),
     )
@@ -2983,6 +3105,57 @@ def runtime_recover_stale(conn: sqlite3.Connection, *, limit: int, actor_id: str
         recovered.append({"task_id": task_id, "worker_id": worker_id, "expired_at": row["lease_expires_at"]})
     conn.commit()
     return {"recovered_count": len(recovered), "recovered": recovered, "recovered_at": now_value}
+
+
+def runtime_clear_stale_failed(conn: sqlite3.Connection, *, actor_id: str) -> dict[str, Any]:
+    """Set runtime_status=done for tasks where planner_status=done and runtime_status=failed.
+
+    These are cosmetic mismatches from pre-fix worker runs where the planner
+    successfully closed the task but the runtime record was never updated.
+    """
+    begin_immediate(conn)
+    now_value = now_iso()
+    rows = conn.execute(
+        """
+        SELECT rs.task_id
+        FROM task_runtime_state rs
+        JOIN tasks t ON t.task_id = rs.task_id
+        WHERE rs.runtime_status = 'failed'
+          AND t.planner_status = 'done'
+        ORDER BY rs.task_id ASC
+        """,
+    ).fetchall()
+    cleared: list[str] = []
+    for row in rows:
+        task_id = str(row["task_id"])
+        conn.execute(
+            """
+            UPDATE task_runtime_state
+            SET runtime_status = 'done',
+                finished_at = COALESCE(finished_at, ?),
+                last_transition_at = ?,
+                last_runtime_error = NULL,
+                runtime_metadata_json = ?
+            WHERE task_id = ?
+            """,
+            (
+                now_value,
+                now_value,
+                compact_json({"cleared_stale_failed_at": now_value}),
+                task_id,
+            ),
+        )
+        insert_event(
+            conn,
+            task_id=task_id,
+            event_type="runtime.stale_failed_cleared",
+            actor_kind="runtime",
+            actor_id=actor_id,
+            payload={"reason": "planner_done_runtime_failed cosmetic mismatch cleared"},
+        )
+        cleared.append(task_id)
+    conn.commit()
+    return {"cleared_count": len(cleared), "cleared": cleared, "cleared_at": now_value}
 
 
 def parse_task_markdown(path: Path) -> dict[str, Any]:
@@ -3100,6 +3273,218 @@ def parse_packet_tasks(path: Path) -> dict[str, dict[str, Any]]:
             "dependencies": [],
         }
     return payloads
+
+
+# ---------------------------------------------------------------------------
+# Repo health snapshot persistence (CENTRAL-OPS-38)
+# ---------------------------------------------------------------------------
+
+DEFAULT_HEALTH_TTL_SECONDS = 3600  # 1 hour
+
+
+def _health_insert_snapshot(conn: sqlite3.Connection, report: dict[str, Any], ttl_seconds: int) -> int:
+    """Insert one per-repo report into repo_health_snapshots; return snapshot_id."""
+    repo_section = report.get("repo") or {}
+    summary = report.get("summary") or {}
+    repo_id = str(repo_section.get("repo_id") or "unknown")
+    captured_at = str(report.get("generated_at") or now_iso())
+    cur = conn.execute(
+        """
+        INSERT INTO repo_health_snapshots
+            (repo_id, captured_at, ttl_seconds,
+             working_status, evidence_quality, overall_status,
+             adapter_name, adapter_version, profile, report_json)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            repo_id,
+            captured_at,
+            ttl_seconds,
+            str(summary.get("working_status") or "unknown"),
+            str(summary.get("evidence_quality") or "none"),
+            str(summary.get("overall_status") or "unknown"),
+            str(repo_section.get("adapter_name") or "unknown"),
+            str(repo_section.get("adapter_version") or "unknown"),
+            str(repo_section.get("profile") or "unknown"),
+            json.dumps(report, sort_keys=True),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def _health_is_stale(captured_at: str, ttl_seconds: int, now: str) -> bool:
+    """Return True when a snapshot has aged past its TTL."""
+    try:
+        from datetime import datetime, timezone as _tz
+
+        def _parse(s: str) -> datetime:
+            s = s.replace("+00:00", "Z")
+            for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
+                try:
+                    return datetime.strptime(s, fmt).replace(tzinfo=_tz.utc)
+                except ValueError:
+                    continue
+            raise ValueError(f"unrecognised datetime: {s!r}")
+
+        return (_parse(now) - _parse(captured_at)).total_seconds() > ttl_seconds
+    except Exception:
+        return False
+
+
+def _health_annotate_stale(rows: list[dict[str, Any]], now_str: str) -> list[dict[str, Any]]:
+    for row in rows:
+        row["is_stale"] = _health_is_stale(
+            str(row.get("captured_at") or ""),
+            int(row.get("ttl_seconds") or DEFAULT_HEALTH_TTL_SECONDS),
+            now_str,
+        )
+        row["freshness"] = "stale" if row["is_stale"] else "fresh"
+    return rows
+
+
+def _health_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "snapshot_id": row["snapshot_id"],
+        "repo_id": row["repo_id"],
+        "captured_at": row["captured_at"],
+        "ttl_seconds": row["ttl_seconds"],
+        "working_status": row["working_status"],
+        "evidence_quality": row["evidence_quality"],
+        "overall_status": row["overall_status"],
+        "adapter_name": row["adapter_name"],
+        "adapter_version": row["adapter_version"],
+        "profile": row["profile"],
+        "created_at": row["created_at"],
+        "report_json": row["report_json"],
+    }
+
+
+def command_health_snapshot_write(args: argparse.Namespace) -> int:
+    """Write repo health snapshots from a bundle JSON into the CENTRAL DB."""
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        raw = sys.stdin.read() if args.bundle_file == "-" else Path(args.bundle_file).read_text(encoding="utf-8")
+        bundle = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        die(f"could not read bundle: {exc}")
+
+    repos = bundle.get("repos") if isinstance(bundle, dict) else None
+    if isinstance(repos, list):
+        reports = repos
+    elif isinstance(bundle, dict) and "repo" in bundle:
+        reports = [bundle]
+    else:
+        die("bundle must be a repo-health-bundle (with 'repos') or a single report (with 'repo')")
+
+    ttl = int(getattr(args, "ttl_seconds", DEFAULT_HEALTH_TTL_SECONDS))
+    written: list[dict[str, Any]] = []
+    try:
+        with conn:
+            for report in reports:
+                sid = _health_insert_snapshot(conn, report, ttl)
+                repo_section = report.get("repo") or {}
+                written.append(
+                    {
+                        "snapshot_id": sid,
+                        "repo_id": str(repo_section.get("repo_id") or "unknown"),
+                        "captured_at": str(report.get("generated_at") or ""),
+                        "working_status": str((report.get("summary") or {}).get("working_status") or "unknown"),
+                    }
+                )
+    finally:
+        conn.close()
+
+    return print_or_json(
+        {"written": written, "count": len(written)},
+        as_json=args.json,
+        formatter=lambda d: "Wrote {} health snapshot(s): {}".format(
+            d["count"],
+            ", ".join("{}@{}(id={})".format(w["repo_id"], w["captured_at"], w["snapshot_id"]) for w in d["written"]),
+        ),
+    )
+
+
+def command_health_snapshot_latest(args: argparse.Namespace) -> int:
+    """Show the latest health snapshot per repo, with stale flags."""
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        if getattr(args, "repo_id", None):
+            cur = conn.execute(
+                "SELECT * FROM repo_health_snapshots WHERE repo_id = ? ORDER BY captured_at DESC LIMIT 1",
+                (args.repo_id,),
+            )
+        else:
+            cur = conn.execute(
+                """
+                SELECT s.* FROM repo_health_snapshots s
+                INNER JOIN (
+                    SELECT repo_id, MAX(captured_at) AS max_captured
+                    FROM repo_health_snapshots GROUP BY repo_id
+                ) latest ON s.repo_id = latest.repo_id AND s.captured_at = latest.max_captured
+                ORDER BY s.repo_id
+                """
+            )
+        rows = [_health_row_to_dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    now_str = now_iso()
+    rows = _health_annotate_stale(rows, now_str)
+
+    def fmt(data: list[dict[str, Any]]) -> str:
+        if not data:
+            return "No health snapshots found. Run: python3 scripts/repo_health.py snapshot --persist"
+        cols: list[tuple[str, int]] = [
+            ("repo_id", 20), ("working_status", 9), ("evidence_quality", 10),
+            ("freshness", 7), ("captured_at", 22), ("overall_status", 9),
+        ]
+        header = "  ".join(h.ljust(w) for h, w in cols)
+        table_rows = ["  ".join(str(row.get(h) or "").ljust(w) for h, w in cols) for row in data]
+        lines = ["Latest repo health snapshots (as of {})".format(now_str), "", header, "-" * len(header)] + table_rows
+        stale = [r for r in data if r.get("is_stale")]
+        if stale:
+            lines += ["", "WARNING: {} snapshot(s) are stale. Re-run: python3 scripts/repo_health.py snapshot --persist".format(len(stale))]
+        return "\n".join(lines)
+
+    return print_or_json(rows, as_json=args.json, formatter=fmt)
+
+
+def command_health_snapshot_history(args: argparse.Namespace) -> int:
+    """Show recent health snapshot history for trend/drift inspection."""
+    conn, _ = open_initialized_connection(args.db_path)
+    limit = int(getattr(args, "limit", 20))
+    try:
+        if getattr(args, "repo_id", None):
+            cur = conn.execute(
+                "SELECT * FROM repo_health_snapshots WHERE repo_id = ? ORDER BY captured_at DESC LIMIT ?",
+                (args.repo_id, limit),
+            )
+        else:
+            cur = conn.execute(
+                "SELECT * FROM repo_health_snapshots ORDER BY captured_at DESC LIMIT ?",
+                (limit,),
+            )
+        rows = [_health_row_to_dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    now_str = now_iso()
+    rows = _health_annotate_stale(rows, now_str)
+
+    def fmt(data: list[dict[str, Any]]) -> str:
+        if not data:
+            return "No health snapshot history found."
+        cols: list[tuple[str, int]] = [
+            ("snapshot_id", 12), ("repo_id", 20), ("working_status", 9),
+            ("freshness", 7), ("captured_at", 22),
+        ]
+        header = "  ".join(h.ljust(w) for h, w in cols)
+        table_rows = ["  ".join(str(row.get(h) or "").ljust(w) for h, w in cols) for row in data]
+        return "\n".join(
+            ["Repo health snapshot history ({} records)".format(len(data)), "", header, "-" * len(header)] + table_rows
+        )
+
+    return print_or_json(rows, as_json=args.json, formatter=fmt)
 
 
 def migrate_bootstrap(
@@ -3456,6 +3841,186 @@ def command_repo_show(args: argparse.Namespace) -> int:
     return print_or_json(payload, as_json=args.json, formatter=render_repo_detail)
 
 
+def _build_batch_task_payload(
+    item: dict[str, Any],
+    *,
+    task_id: str,
+    resolved_repo: dict[str, Any],
+    defaults: dict[str, Any],
+    series: str,
+    actor_id: str,
+) -> dict[str, Any]:
+    """Merge batch defaults + item fields into a full task payload."""
+    merged = {**defaults, **item}
+    title = merged.get("title") or ""
+    repo_id = str(resolved_repo["repo_id"])
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "title": title,
+        "summary": merged.get("summary") or markdown_summary(merged.get("objective") or title, fallback=title),
+        "objective_md": merged.get("objective") or merged.get("objective_md") or f"Implement and verify {title}.",
+        "context_md": merged.get("context") or merged.get("context_md") or "Context is TBD.",
+        "scope_md": merged.get("scope") or merged.get("scope_md") or "Scope is narrow and aligned to this task.",
+        "deliverables_md": merged.get("deliverables") or merged.get("deliverables_md") or "- [ ] Implement requested changes.\n- [ ] Add/update verification and docs where needed.",
+        "acceptance_md": merged.get("acceptance") or merged.get("acceptance_md") or "- [ ] Task matches objective.\n- [ ] Planner and runtime expectations are satisfied.",
+        "testing_md": merged.get("testing") or merged.get("testing_md") or "Run task-specific checks and record outcomes.",
+        "dispatch_md": merged.get("dispatch") or merged.get("dispatch_md") or f"Dispatch from CENTRAL using repo={repo_id} do task {task_id}.",
+        "closeout_md": merged.get("closeout") or merged.get("closeout_md") or f"Summarize results and closeout evidence for {task_id}.",
+        "reconciliation_md": merged.get("reconciliation") or merged.get("reconciliation_md") or "Reconcile planner and runtime state according to normal closeout policy.",
+        "planner_status": merged.get("planner_status", "todo"),
+        "priority": merged.get("priority", 100),
+        "task_type": merged.get("task_type", "mutating"),
+        "planner_owner": merged.get("planner_owner", actor_id),
+        "worker_owner": merged.get("worker_owner"),
+        "target_repo_id": repo_id,
+        "target_repo_root": str(resolved_repo["repo_root"]),
+        "target_repo_display_name": str(resolved_repo["display_name"]),
+        "approval_required": merged.get("approval_required", False),
+        "source_kind": merged.get("source_kind", "batch_scaffold"),
+        "metadata": {
+            **(merged.get("metadata") or {}),
+            "batch_series": series,
+            "generated_by": "task-batch-create",
+        },
+        "execution": merged.get("execution") or {
+            "task_kind": merged.get("task_kind", "mutating"),
+            "sandbox_mode": merged.get("sandbox_mode", "workspace-write"),
+            "approval_policy": merged.get("approval_policy", "never"),
+            "additional_writable_dirs": merged.get("additional_writable_dirs") or [],
+            "timeout_seconds": merged.get("timeout_seconds", 3600),
+        },
+        "dependencies": merged.get("dependencies") or [],
+    }
+    return payload
+
+
+def command_task_batch_create(args: argparse.Namespace) -> int:
+    """Create multiple tasks from a YAML or JSON batch file."""
+    doc = load_batch_document(args.input)
+    items = doc["tasks"]
+    if not items:
+        die("batch 'tasks' list is empty")
+
+    actor_id: str = args.actor_id
+    series: str = (args.series or doc.get("series") or DEFAULT_TASK_ID_SERIES).strip().upper()
+    repo_ref: str = (args.repo or doc.get("repo") or "CENTRAL").strip()
+    defaults: dict[str, Any] = doc.get("defaults") or {}
+    dry_run: bool = args.dry_run
+
+    # Validate items before touching the DB.
+    validation_errors: list[dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            validation_errors.append({"index": idx, "error": f"item must be an object, got {type(item).__name__}"})
+            continue
+        title = item.get("title") or defaults.get("title")
+        if not title:
+            validation_errors.append({"index": idx, "item": item, "error": "missing required field: title"})
+    if validation_errors:
+        print(json.dumps({"status": "validation_failed", "errors": validation_errors}, indent=2))
+        return 1
+
+    conn, _ = open_initialized_connection(args.db_path)
+    results: list[dict[str, Any]] = []
+    created_count = 0
+    failed_count = 0
+    try:
+        # Resolve repo once for the whole batch.
+        resolved_repo = resolve_repo_reference(conn, repo_ref, field="target_repo", allow_missing=True)
+        if resolved_repo is None:
+            die_repo_onboarding_required(
+                conn,
+                operation="batch task creation",
+                repo_id=repo_ref,
+                repo_root=None,
+                reason=f"target repo is not registered: {repo_ref!r}.",
+                aliases=[repo_ref],
+            )
+
+        # Reserve a contiguous ID range for items that don't supply explicit task_ids.
+        needs_id_count = sum(1 for item in items if not item.get("task_id"))
+        reserved_ids: list[str] = []
+        if needs_id_count > 0 and not dry_run:
+            with conn:
+                reservation = reserve_task_id_range(
+                    conn,
+                    series=series,
+                    count=needs_id_count,
+                    reserved_by=actor_id,
+                    reserved_for="task-batch-create",
+                    note=f"batch of {len(items)} tasks",
+                    reservation_hours=DEFAULT_TASK_ID_RESERVATION_HOURS,
+                )
+            start = int(reservation["range_start"])
+            reserved_ids = [make_task_id(series, start + i) for i in range(needs_id_count)]
+        elif needs_id_count > 0 and dry_run:
+            # For dry-run, compute IDs without persisting.
+            next_payload = next_task_id_payload(conn, series=series, actor_id=actor_id)
+            start = int(next_payload["next_number"])
+            reserved_ids = [make_task_id(series, start + i) for i in range(needs_id_count)]
+
+        id_iter = iter(reserved_ids)
+        for idx, item in enumerate(items):
+            task_id = item.get("task_id") or next(id_iter)
+            # Per-item repo override.
+            item_repo_ref = item.get("repo") or repo_ref
+            if item_repo_ref != repo_ref:
+                item_resolved_repo = resolve_repo_reference(conn, item_repo_ref, field="target_repo", allow_missing=True)
+                if item_resolved_repo is None:
+                    results.append({"index": idx, "task_id": task_id, "status": "error",
+                                    "error": f"repo not registered: {item_repo_ref!r}"})
+                    failed_count += 1
+                    continue
+            else:
+                item_resolved_repo = resolved_repo
+
+            try:
+                payload = _build_batch_task_payload(
+                    item,
+                    task_id=task_id,
+                    resolved_repo=item_resolved_repo,
+                    defaults=defaults,
+                    series=series,
+                    actor_id=actor_id,
+                )
+                validated = validate_task_payload(payload, for_update=False)
+            except SystemExit:
+                results.append({"index": idx, "task_id": task_id, "status": "error",
+                                "error": "payload validation failed"})
+                failed_count += 1
+                continue
+
+            if dry_run:
+                results.append({"index": idx, "task_id": task_id, "status": "dry_run",
+                                "title": validated.get("title")})
+                created_count += 1
+                continue
+
+            try:
+                with conn:
+                    create_task(conn, validated, actor_kind="planner", actor_id=actor_id)
+                results.append({"index": idx, "task_id": task_id, "status": "created",
+                                "title": validated.get("title")})
+                created_count += 1
+            except Exception as exc:
+                results.append({"index": idx, "task_id": task_id, "status": "error",
+                                "error": str(exc)})
+                failed_count += 1
+    finally:
+        conn.close()
+
+    summary = {
+        "status": "done" if failed_count == 0 else "partial",
+        "dry_run": dry_run,
+        "total": len(items),
+        "created": created_count,
+        "failed": failed_count,
+        "results": results,
+    }
+    print(json.dumps(summary, indent=2))
+    return 1 if failed_count > 0 else 0
+
+
 def command_task_create(args: argparse.Namespace) -> int:
     payload = load_json_document(args.input)
     conn, _ = open_initialized_connection(args.db_path)
@@ -3552,6 +4117,7 @@ def command_planner_new(args: argparse.Namespace) -> int:
                 "target_repo_display_name": str(resolved_repo["display_name"]),
                 "approval_required": args.approval_required,
                 "source_kind": "planner_scaffold",
+                "initiative": getattr(args, "initiative", None) or None,
                 "metadata": {
                     "planner_new_series": args.series,
                     "planner_new_next_number": next_payload["next_number"],
@@ -3571,8 +4137,15 @@ def command_planner_new(args: argparse.Namespace) -> int:
             }
             payload = validate_task_payload(payload, for_update=False)
             resolve_task_repo_target(conn, payload)
+            create_task(conn, payload, actor_kind="planner", actor_id=args.actor_id)
     finally:
         conn.close()
+    if not args.depends_on:
+        print(
+            f"NOTE: {task_id} created with no --depends-on. "
+            "Run 'dep-lint' after creation to check for undeclared dependency edges.",
+            file=sys.stderr,
+        )
     return print_or_json(payload, as_json=True, formatter=json_dumps)
 
 
@@ -3594,7 +4167,8 @@ def command_task_list(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
         repo_id = resolve_repo_filter(conn, args.repo_id)
-        snapshots = fetch_task_snapshots(conn, repo_id=repo_id, planner_status=args.planner_status)
+        initiative_filter = getattr(args, "initiative", None) or None
+        snapshots = fetch_task_snapshots(conn, repo_id=repo_id, planner_status=args.planner_status, initiative=initiative_filter)
         rows = [
             {
                 "task_id": snapshot["task_id"],
@@ -3602,6 +4176,7 @@ def command_task_list(args: argparse.Namespace) -> int:
                 "planner_status": snapshot["planner_status"],
                 "runtime_status": snapshot["runtime"]["runtime_status"] if snapshot["runtime"] else "",
                 "repo": snapshot["target_repo_id"],
+                "initiative": snapshot["initiative"] or "",
                 "planner_owner": snapshot["planner_owner"],
                 "worker_owner": snapshot["worker_owner"] or "",
                 "version": snapshot["version"],
@@ -3611,7 +4186,7 @@ def command_task_list(args: argparse.Namespace) -> int:
         ]
     finally:
         conn.close()
-    return print_or_json(rows, as_json=args.json, formatter=lambda data: render_table(data, [("task_id", "task_id"), ("p", "priority"), ("planner", "planner_status"), ("runtime", "runtime_status"), ("repo", "repo"), ("version", "version"), ("title", "title")]))
+    return print_or_json(rows, as_json=args.json, formatter=lambda data: render_table(data, [("task_id", "task_id"), ("p", "priority"), ("planner", "planner_status"), ("runtime", "runtime_status"), ("repo", "repo"), ("initiative", "initiative"), ("version", "version"), ("title", "title")]))
 
 
 def command_task_id_next(args: argparse.Namespace) -> int:
@@ -3730,7 +4305,8 @@ def command_task_id_reservations(args: argparse.Namespace) -> int:
 def command_view_summary(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
-        summary = summarize_portfolio(conn)
+        initiative_filter = getattr(args, "initiative", None) or None
+        summary = summarize_portfolio(conn, initiative=initiative_filter)
     finally:
         conn.close()
     return print_or_json(summary, as_json=args.json, formatter=format_summary_text)
@@ -3831,6 +4407,151 @@ def command_view_task_card(args: argparse.Namespace) -> int:
     finally:
         conn.close()
     return print_or_json(payload, as_json=args.json, formatter=json_dumps)
+
+
+def command_dep_show(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        snapshots = fetch_task_snapshots(conn, task_id=args.task_id)
+        if not snapshots:
+            die(f"task not found: {args.task_id}")
+        snapshot = snapshots[0]
+        forward = snapshot["dependencies"]
+        reverse_rows = conn.execute(
+            """
+            SELECT d.task_id, t.planner_status, t.title
+            FROM task_dependencies d
+            JOIN tasks t ON t.task_id = d.task_id
+            WHERE d.depends_on_task_id = ?
+            ORDER BY d.task_id
+            """,
+            (args.task_id,),
+        ).fetchall()
+        reverse = [{"task_id": r["task_id"], "planner_status": r["planner_status"], "title": r["title"]} for r in reverse_rows]
+        result = {
+            "task_id": args.task_id,
+            "title": snapshot["title"],
+            "planner_status": snapshot["planner_status"],
+            "depends_on": forward,
+            "depended_on_by": reverse,
+        }
+    finally:
+        conn.close()
+
+    def fmt(data: dict[str, Any]) -> str:
+        lines = [f"Task: {data['task_id']} ({data['planner_status']}) — {data['title']}", ""]
+        lines.append("Depends on:")
+        if data["depends_on"]:
+            for dep in data["depends_on"]:
+                marker = "[done]" if dep["depends_on_status"] == "done" else "[open]"
+                lines.append(f"  {marker} {dep['depends_on_task_id']} ({dep['depends_on_status']}) — {dep['depends_on_title']}")
+        else:
+            lines.append("  (none)")
+        lines.append("")
+        lines.append("Depended on by:")
+        if data["depended_on_by"]:
+            for dep in data["depended_on_by"]:
+                lines.append(f"  [open] {dep['task_id']} ({dep['planner_status']}) — {dep['title']}")
+        else:
+            lines.append("  (none)")
+        return "\n".join(lines)
+
+    return print_or_json(result, as_json=args.json, formatter=fmt)
+
+
+def command_dep_graph(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        query = """
+            SELECT d.task_id, d.depends_on_task_id, d.dependency_kind,
+                   t1.planner_status AS from_status, t1.title AS from_title,
+                   t2.planner_status AS to_status, t2.title AS to_title
+            FROM task_dependencies d
+            JOIN tasks t1 ON t1.task_id = d.task_id
+            JOIN tasks t2 ON t2.task_id = d.depends_on_task_id
+        """
+        params: list[Any] = []
+        if not args.include_done:
+            query += " WHERE t1.planner_status != 'done' OR t2.planner_status != 'done'"
+        query += " ORDER BY d.task_id, d.depends_on_task_id"
+        rows = conn.execute(query, params).fetchall()
+        edges = [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+    def fmt(data: list[dict[str, Any]]) -> str:
+        if not data:
+            return "No dependency edges found."
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for edge in data:
+            grouped.setdefault(edge["task_id"], []).append(edge)
+        lines = []
+        for task_id, task_edges in grouped.items():
+            first = task_edges[0]
+            lines.append(f"{task_id} ({first['from_status']}) — {first['from_title']}")
+            for edge in task_edges:
+                marker = "[done]" if edge["to_status"] == "done" else "[open]"
+                lines.append(f"  → {marker} {edge['depends_on_task_id']} ({edge['to_status']}) — {edge['to_title']}")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    return print_or_json(edges, as_json=args.json, formatter=fmt)
+
+
+_TASK_ID_PATTERN = re.compile(r"\b([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*-\d+)\b")
+
+
+def command_dep_lint(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        snapshots = fetch_task_snapshots(conn)
+        known_ids = {s["task_id"] for s in snapshots}
+        warnings: list[dict[str, Any]] = []
+        for s in snapshots:
+            if s["planner_status"] == "done":
+                continue
+            existing_deps = {d["depends_on_task_id"] for d in s["dependencies"]}
+            text = " ".join(
+                filter(
+                    None,
+                    [
+                        s.get("title"),
+                        s.get("summary"),
+                        s.get("objective_md"),
+                        s.get("context_md"),
+                        s.get("scope_md"),
+                        s.get("deliverables_md"),
+                    ],
+                )
+            )
+            mentioned = (_TASK_ID_PATTERN.findall(text) and set(_TASK_ID_PATTERN.findall(text))) or set()
+            mentioned = mentioned & known_ids - {s["task_id"]}
+            missing = mentioned - existing_deps
+            for m in sorted(missing):
+                warnings.append(
+                    {
+                        "task_id": s["task_id"],
+                        "title": s["title"],
+                        "mentioned_task_id": m,
+                        "warning": "task ID referenced in text but not declared as a dependency",
+                    }
+                )
+    finally:
+        conn.close()
+
+    def fmt(data: list[dict[str, Any]]) -> str:
+        if not data:
+            return "dep-lint: no missing dependency edges detected."
+        lines = [f"dep-lint: {len(data)} potential missing edge(s) found.", ""]
+        for w in data:
+            lines.append(f"  {w['task_id']} — {w['title']}")
+            lines.append(f"    mentions {w['mentioned_task_id']} in text but no dependency edge declared")
+        return "\n".join(lines)
+
+    if warnings:
+        print_or_json(warnings, as_json=args.json, formatter=fmt)
+        return 1
+    return print_or_json(warnings, as_json=args.json, formatter=fmt)
 
 
 def command_export_summary_md(args: argparse.Namespace) -> int:
@@ -4069,6 +4790,8 @@ def command_runtime_transition(args: argparse.Namespace) -> int:
             notes=args.notes,
             artifacts=args.artifact,
             actor_id=args.actor_id,
+            effective_worker_model=args.effective_worker_model,
+            worker_model_source=args.worker_model_source,
         )
     finally:
         conn.close()
@@ -4079,6 +4802,15 @@ def command_runtime_recover_stale(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
         payload = runtime_recover_stale(conn, limit=args.limit, actor_id=args.actor_id)
+    finally:
+        conn.close()
+    return print_or_json(payload, as_json=args.json, formatter=json_dumps)
+
+
+def command_runtime_clear_stale_failed(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        payload = runtime_clear_stale_failed(conn, actor_id=args.actor_id)
     finally:
         conn.close()
     return print_or_json(payload, as_json=args.json, formatter=json_dumps)
@@ -4201,6 +4933,30 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_argument(task_create_parser)
     task_create_parser.set_defaults(func=command_task_create)
 
+    task_batch_create_parser = subparsers.add_parser(
+        "task-batch-create",
+        help="Create multiple planner-owned tasks from a YAML or JSON batch file.",
+    )
+    add_db_argument(task_batch_create_parser)
+    task_batch_create_parser.add_argument(
+        "--input", required=True,
+        help="Path to a YAML or JSON batch file (list of tasks, or object with 'tasks' key), or - for stdin.",
+    )
+    task_batch_create_parser.add_argument(
+        "--series", default=None,
+        help=f"Task ID series for auto-allocation. Overrides batch-level series. Default: {DEFAULT_TASK_ID_SERIES}",
+    )
+    task_batch_create_parser.add_argument(
+        "--repo", default=None,
+        help="Default repo for all tasks. Overrides batch-level repo. Default: CENTRAL.",
+    )
+    task_batch_create_parser.add_argument("--actor-id", default="planner/coordinator")
+    task_batch_create_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Validate and preview IDs without writing to the DB.",
+    )
+    task_batch_create_parser.set_defaults(func=command_task_batch_create)
+
     planner_new_parser = subparsers.add_parser(
         "planner-new",
         help="Generate a planner-ready task payload scaffold with auto task-ID allocation.",
@@ -4234,7 +4990,16 @@ def build_parser() -> argparse.ArgumentParser:
         dest="additional_writable_dir",
         help="Repeatable path to add to execution.additional_writable_dirs.",
     )
-    planner_new_parser.add_argument("--depends-on", action="append", default=[], help="Repeatable dependency task ID.")
+    planner_new_parser.add_argument(
+        "--depends-on",
+        action="append",
+        default=[],
+        help=(
+            "Declare an upstream task ID this task must wait for (repeatable). "
+            "IMPORTANT: declare all known blockers at creation time — use dep-lint after creation to catch missing edges."
+        ),
+    )
+    planner_new_parser.add_argument("--initiative", default=None, help="Optional initiative/epic tag for grouping (e.g. 'dispatcher-infrastructure').")
     planner_new_parser.add_argument("--actor-id", default="planner/coordinator")
     add_json_argument(planner_new_parser)
     planner_new_parser.set_defaults(func=command_planner_new)
@@ -4272,6 +5037,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_db_argument(task_list_parser)
     task_list_parser.add_argument("--repo-id")
     task_list_parser.add_argument("--planner-status", choices=sorted(PLANNER_STATUSES))
+    task_list_parser.add_argument("--initiative", default=None, help="Filter by initiative/epic tag.")
     add_json_argument(task_list_parser)
     task_list_parser.set_defaults(func=command_task_list)
 
@@ -4316,6 +5082,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     view_summary_parser = subparsers.add_parser("view-summary", help="Show portfolio summary generated from DB state.")
     add_db_argument(view_summary_parser)
+    view_summary_parser.add_argument("--initiative", default=None, help="Filter summary to a single initiative/epic tag.")
     add_json_argument(view_summary_parser)
     view_summary_parser.set_defaults(func=command_view_summary)
 
@@ -4351,6 +5118,23 @@ def build_parser() -> argparse.ArgumentParser:
     view_task_parser.add_argument("--task-id", required=True)
     add_json_argument(view_task_parser)
     view_task_parser.set_defaults(func=command_view_task_card)
+
+    dep_show_parser = subparsers.add_parser("dep-show", help="Show forward and reverse dependency edges for a task.")
+    add_db_argument(dep_show_parser)
+    dep_show_parser.add_argument("--task-id", required=True, help="Task ID to inspect.")
+    add_json_argument(dep_show_parser)
+    dep_show_parser.set_defaults(func=command_dep_show)
+
+    dep_graph_parser = subparsers.add_parser("dep-graph", help="Show the dependency graph for active tasks.")
+    add_db_argument(dep_graph_parser)
+    dep_graph_parser.add_argument("--include-done", action="store_true", help="Include edges where both tasks are done.")
+    add_json_argument(dep_graph_parser)
+    dep_graph_parser.set_defaults(func=command_dep_graph)
+
+    dep_lint_parser = subparsers.add_parser("dep-lint", help="Flag task IDs referenced in text with no declared dependency edge.")
+    add_db_argument(dep_lint_parser)
+    add_json_argument(dep_lint_parser)
+    dep_lint_parser.set_defaults(func=command_dep_lint)
 
     export_summary_parser = subparsers.add_parser("export-summary-md", help="Write a non-canonical markdown portfolio summary.")
     add_db_argument(export_summary_parser)
@@ -4437,6 +5221,8 @@ def build_parser() -> argparse.ArgumentParser:
     runtime_transition_parser.add_argument("--notes")
     runtime_transition_parser.add_argument("--artifact", action="append", default=[])
     runtime_transition_parser.add_argument("--actor-id", default="dispatcher")
+    runtime_transition_parser.add_argument("--effective-worker-model", dest="effective_worker_model", default=None, help="Effective model used by the worker (e.g. claude-sonnet-4-6).")
+    runtime_transition_parser.add_argument("--worker-model-source", dest="worker_model_source", default=None, choices=["task_override", "policy_default", "dispatcher_default"], help="How the model was selected.")
     add_json_argument(runtime_transition_parser)
     runtime_transition_parser.set_defaults(func=command_runtime_transition)
 
@@ -4447,6 +5233,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_argument(runtime_recover_parser)
     runtime_recover_parser.set_defaults(func=command_runtime_recover_stale)
 
+    runtime_clear_stale_failed_parser = subparsers.add_parser(
+        "runtime-clear-stale-failed",
+        help="Set runtime_status=done for tasks where planner_status=done but runtime_status=failed (cosmetic mismatch cleanup).",
+    )
+    add_db_argument(runtime_clear_stale_failed_parser)
+    runtime_clear_stale_failed_parser.add_argument("--actor-id", default="planner")
+    add_json_argument(runtime_clear_stale_failed_parser)
+    runtime_clear_stale_failed_parser.set_defaults(func=command_runtime_clear_stale_failed)
+
     migrate_parser = subparsers.add_parser("migrate-bootstrap", help="Import bootstrap markdown task records into the CENTRAL DB.")
     add_db_argument(migrate_parser)
     migrate_parser.add_argument("--tasks-dir", default=str(DEFAULT_TASKS_DIR))
@@ -4455,6 +5250,43 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_parser.add_argument("--update-existing", action="store_true")
     add_json_argument(migrate_parser)
     migrate_parser.set_defaults(func=command_migrate_bootstrap)
+
+    health_write_parser = subparsers.add_parser(
+        "health-snapshot-write",
+        help="Persist repo health snapshots from a bundle JSON into the CENTRAL DB.",
+    )
+    add_db_argument(health_write_parser)
+    health_write_parser.add_argument(
+        "bundle_file",
+        help="Path to a repo-health bundle JSON file, or '-' to read from stdin.",
+    )
+    health_write_parser.add_argument(
+        "--ttl-seconds",
+        type=int,
+        default=DEFAULT_HEALTH_TTL_SECONDS,
+        help="Freshness TTL in seconds (default 3600). Snapshots older than this are shown as stale.",
+    )
+    add_json_argument(health_write_parser)
+    health_write_parser.set_defaults(func=command_health_snapshot_write)
+
+    health_latest_parser = subparsers.add_parser(
+        "health-snapshot-latest",
+        help="Show the latest health snapshot per repo instantly from CENTRAL DB (no live checks).",
+    )
+    add_db_argument(health_latest_parser)
+    health_latest_parser.add_argument("--repo-id", default=None, help="Filter to a single repo.")
+    add_json_argument(health_latest_parser)
+    health_latest_parser.set_defaults(func=command_health_snapshot_latest)
+
+    health_history_parser = subparsers.add_parser(
+        "health-snapshot-history",
+        help="Show recent health snapshot history for trend and drift inspection.",
+    )
+    add_db_argument(health_history_parser)
+    health_history_parser.add_argument("--repo-id", default=None, help="Filter to a single repo.")
+    health_history_parser.add_argument("--limit", type=int, default=20, help="Maximum rows to return (default 20).")
+    add_json_argument(health_history_parser)
+    health_history_parser.set_defaults(func=command_health_snapshot_history)
 
     return parser
 
