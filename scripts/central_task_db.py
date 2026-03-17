@@ -4103,8 +4103,8 @@ def command_planner_new(args: argparse.Namespace) -> int:
                 "context_md": args.context or "Context is TBD.",
                 "scope_md": args.scope or "Scope is narrow and aligned to this task.",
                 "deliverables_md": args.deliverables or "- [ ] Implement requested changes.\n- [ ] Add/update verification and docs where needed.",
-                "acceptance_md": args.acceptance or "- [ ] Task matches objective.\n- [ ] Planner and runtime expectations are satisfied.",
-                "testing_md": args.testing or "Run task-specific checks and record outcomes.",
+                "acceptance_md": args.acceptance or "- [ ] Task matches objective.\n- [ ] `scripts/build.sh` exits 0 (smoke test + full tests + build).",
+                "testing_md": args.testing or "Run `scripts/build.sh` in the target repo. Task fails if the build script fails.",
                 "dispatch_md": args.dispatch or f"Dispatch from CENTRAL using repo={repo_reference} do task {task_id}.",
                 "closeout_md": args.closeout or f"Summarize results and closeout evidence for {task_id}.",
                 "reconciliation_md": args.reconciliation or "Reconcile planner and runtime state according to normal closeout policy.",
@@ -4355,6 +4355,38 @@ def command_view_repo(args: argparse.Namespace) -> int:
     finally:
         conn.close()
     return print_or_json(rows, as_json=args.json, formatter=lambda data: "\n".join([generated_banner(now_iso()), "", render_table(data, [("task_id", "task_id"), ("p", "priority"), ("planner", "planner_status"), ("runtime", "runtime_status"), ("dep_blocked", "dependency_blocked"), ("planner_owner", "planner_owner"), ("lease_owner", "lease_owner"), ("title", "title")])]))
+
+
+def command_view_active(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        snapshots = fetch_task_snapshots(conn)
+        # Filter to non-terminal states only
+        active_snapshots = []
+        for snapshot in snapshots:
+            planner_status = snapshot["planner_status"]
+            runtime_status = snapshot["runtime"]["runtime_status"] if snapshot["runtime"] else ""
+
+            # Include if planner is not done
+            if planner_status != "done":
+                # And if runtime is non-terminal or empty
+                if runtime_status == "" or runtime_status in {"queued", "claimed", "running", "pending_review"}:
+                    active_snapshots.append(snapshot)
+
+        rows = [
+            {
+                "task_id": snapshot["task_id"],
+                "priority": snapshot["priority"],
+                "planner_status": snapshot["planner_status"],
+                "runtime_status": snapshot["runtime"]["runtime_status"] if snapshot["runtime"] else "",
+                "repo": snapshot["target_repo_id"],
+                "title": snapshot["title"],
+            }
+            for snapshot in active_snapshots
+        ]
+    finally:
+        conn.close()
+    return print_or_json(rows, as_json=args.json, formatter=lambda data: "\n".join([generated_banner(now_iso()), "", render_table(data, [("task_id", "task_id"), ("p", "priority"), ("planner", "planner_status"), ("runtime", "runtime_status"), ("repo", "repo"), ("title", "title")])]))
 
 
 def command_view_assignments(args: argparse.Namespace) -> int:
@@ -5103,6 +5135,11 @@ def build_parser() -> argparse.ArgumentParser:
     view_repo_parser.add_argument("--repo-id", required=True)
     add_json_argument(view_repo_parser)
     view_repo_parser.set_defaults(func=command_view_repo)
+
+    view_active_parser = subparsers.add_parser("view-active", help="Show only non-terminal tasks (running, queued, claimed, blocked, pending_review) across all repos.")
+    add_db_argument(view_active_parser)
+    add_json_argument(view_active_parser)
+    view_active_parser.set_defaults(func=command_view_active)
 
     view_assignments_parser = subparsers.add_parser("view-assignments", help="Show planner assignments and active leases.")
     add_db_argument(view_assignments_parser)
