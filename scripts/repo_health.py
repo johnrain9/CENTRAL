@@ -925,58 +925,190 @@ def build_registry(args: argparse.Namespace | None = None) -> dict[str, AdapterS
     }
 
 
+_STATUS_MARKER: dict[str, str] = {
+    "pass": "PASS",
+    "warn": "WARN",
+    "fail": "FAIL",
+    "unknown": "UNKN",
+    "not_applicable": "N/A ",
+}
+
+_OVERALL_MARKER: dict[str, str] = {
+    "pass": "HEALTHY",
+    "warn": "DEGRADED",
+    "fail": "FAILING",
+    "unknown": "UNKNOWN",
+}
+
+
+def status_marker(status: str) -> str:
+    return _STATUS_MARKER.get(str(status).lower(), str(status).upper()[:4].ljust(4))
+
+
+def overall_marker(status: str) -> str:
+    return _OVERALL_MARKER.get(str(status).lower(), str(status).upper())
+
+
+def render_checks(checks: list[dict[str, Any]], indent: str = "  ") -> list[str]:
+    lines = []
+    for check in checks:
+        marker = status_marker(check.get("status", "unknown"))
+        label = check.get("label") or check.get("check_id") or "?"
+        summary = check.get("summary", "")
+        req = check.get("requirement", "required")
+        req_tag = "" if req == "required" else f" [{req}]"
+        lines.append(f"{indent}[{marker}] {label}{req_tag}: {summary}")
+    return lines
+
+
 def render_report(bundle: dict[str, Any]) -> str:
     repos = bundle.get("repos")
     if not isinstance(repos, list):
         return json_dumps(bundle)
     summary = bundle.get("summary", {})
+    overall = overall_marker(str(summary.get("overall_status", "unknown")))
     lines = [
-        f"Repo health snapshot generated at {bundle.get('generated_at')}",
-        (
-            f"working={summary.get('working_status')} "
-            f"evidence={summary.get('evidence_quality')} "
-            f"overall={summary.get('overall_status')}"
-        ),
+        f"=== Repo Health Snapshot ===",
+        f"Generated : {bundle.get('generated_at')}",
+        f"Overall   : {overall}  (working={summary.get('working_status')}  evidence={summary.get('evidence_quality')})",
         "",
     ]
-    repo_width = max([len("repo"), *[len(str(report["repo"]["display_name"])) for report in repos]])
-    work_width = max([len("working"), *[len(str(report["summary"]["working_status"])) for report in repos]])
-    evidence_width = max([len("evidence"), *[len(str(report["summary"]["evidence_quality"])) for report in repos]])
-    coverage_width = max([len("coverage"), *[len(str(report["coverage"]["status"])) for report in repos]])
+    repo_width = max(len("repo"), *[len(str(r["repo"]["display_name"])) for r in repos])
+    cov_width = 16
     lines.append(
-        f"{'repo'.ljust(repo_width)}  "
-        f"{'working'.ljust(work_width)}  "
-        f"{'evidence'.ljust(evidence_width)}  "
-        f"{'coverage'.ljust(coverage_width)}  headline"
+        f"{'repo'.ljust(repo_width)}  status  evidence    coverage          headline"
     )
     lines.append(
-        f"{'-' * repo_width}  {'-' * work_width}  {'-' * evidence_width}  {'-' * coverage_width}  {'-' * 8}"
+        f"{'-' * repo_width}  ------  ----------  ----------------  {'-' * 8}"
     )
     for report in repos:
         coverage = report["coverage"]
-        coverage_text = str(coverage["status"])
-        if coverage["status"] == "measured":
-            coverage_text = f"{coverage_text} {coverage['measured_percent']:.1f}%"
+        cov_text = str(coverage["status"])
+        if coverage["status"] == "measured" and "measured_percent" in coverage:
+            cov_text = f"measured {coverage['measured_percent']:.1f}%"
+        working = report["summary"]["working_status"]
+        marker = status_marker(working)
+        evidence = str(report["summary"]["evidence_quality"])
+        headline = report["summary"].get("headline", "")
         lines.append(
             f"{report['repo']['display_name'].ljust(repo_width)}  "
-            f"{report['summary']['working_status'].ljust(work_width)}  "
-            f"{report['summary']['evidence_quality'].ljust(evidence_width)}  "
-            f"{coverage_text.ljust(coverage_width)}  "
-            f"{report['summary']['headline']}"
+            f"[{marker}]  "
+            f"{evidence.ljust(10)}  "
+            f"{cov_text.ljust(cov_width)}  "
+            f"{headline}"
         )
+
+    # Per-repo check detail
     for report in repos:
         coverage = report["coverage"]
-        lines.extend(
-            [
-                "",
-                f"[{report['repo']['display_name']}]",
-                f"- working {report['summary']['working_status']}: {report['summary']['headline']}",
-                f"- evidence {report['summary']['evidence_quality']}: coverage={coverage['status']} ({coverage['summary']})",
-            ]
-        )
-        for check in report["checks"]:
-            lines.append(f"- {check['check_id']} {check['status']}: {check['summary']}")
+        cov_text = str(coverage["status"])
+        if coverage["status"] == "measured" and "measured_percent" in coverage:
+            cov_text = f"measured {coverage['measured_percent']:.1f}%"
+        working = report["summary"]["working_status"]
+        marker = status_marker(working)
+        lines.extend([
+            "",
+            f"--- {report['repo']['display_name']} [{marker}] ---",
+            f"  {report['summary'].get('headline', '')}",
+            f"  evidence: {report['summary']['evidence_quality']}  coverage: {cov_text}",
+        ])
+        lines.extend(render_checks(report.get("checks", [])))
     return "\n".join(lines)
+
+
+def render_latest_rows(rows: list[dict[str, Any]], now_str: str, repo_id: str | None = None) -> str:
+    """Render DB-backed snapshot rows as a human-readable operator report."""
+    if not rows:
+        return (
+            "No health snapshots found.\n"
+            "Run: python3 scripts/repo_health.py snapshot --persist"
+        )
+    lines = [
+        f"=== Latest Repo Health (from DB) ===",
+        f"As of : {now_str}",
+        "",
+    ]
+    repo_width = max(len("repo"), *[len(str(r.get("repo_id", ""))) for r in rows])
+    lines.append(
+        f"{'repo'.ljust(repo_width)}  status  evidence    freshness  captured_at           headline"
+    )
+    lines.append(
+        f"{'-' * repo_width}  ------  ----------  ---------  --------------------  {'-' * 8}"
+    )
+    for row in rows:
+        working = str(row.get("working_status", "unknown"))
+        marker = status_marker(working)
+        freshness = str(row.get("freshness", "?"))
+        fresh_tag = "STALE" if freshness == "stale" else "fresh"
+        evidence = str(row.get("evidence_quality", "?"))
+        captured = str(row.get("captured_at", "?"))
+        # Parse headline from stored report_json if available
+        headline = ""
+        report_json_raw = row.get("report_json")
+        report_detail: dict[str, Any] | None = None
+        if report_json_raw:
+            try:
+                report_detail = json.loads(report_json_raw)
+                headline = (report_detail.get("summary") or {}).get("headline", "")
+            except (json.JSONDecodeError, AttributeError):
+                pass
+        lines.append(
+            f"{str(row.get('repo_id', '')).ljust(repo_width)}  "
+            f"[{marker}]  "
+            f"{evidence.ljust(10)}  "
+            f"{fresh_tag.ljust(9)}  "
+            f"{captured.ljust(20)}  "
+            f"{headline}"
+        )
+
+    # Drill-down checks when a specific repo is requested
+    if repo_id and len(rows) == 1:
+        row = rows[0]
+        report_json_raw = row.get("report_json")
+        if report_json_raw:
+            try:
+                report_detail = json.loads(report_json_raw)
+                coverage = (report_detail.get("coverage") or {})
+                cov_text = str(coverage.get("status", "?"))
+                if coverage.get("status") == "measured" and "measured_percent" in coverage:
+                    cov_text = f"measured {coverage['measured_percent']:.1f}%"
+                freshness = str(row.get("freshness", "?"))
+                fresh_tag = "STALE" if freshness == "stale" else "fresh"
+                lines.extend([
+                    "",
+                    f"--- {row.get('repo_id')} checks (snapshot {row.get('snapshot_id')}, {fresh_tag}) ---",
+                    f"  captured: {row.get('captured_at')}  coverage: {cov_text}",
+                ])
+                lines.extend(render_checks(report_detail.get("checks", [])))
+            except (json.JSONDecodeError, AttributeError):
+                lines.append("  (could not parse stored report_json for check details)")
+
+    stale = [r for r in rows if r.get("is_stale") or r.get("freshness") == "stale"]
+    if stale:
+        lines.append("")
+        lines.append(
+            f"WARNING: {len(stale)} snapshot(s) are stale. "
+            "Re-run: python3 scripts/repo_health.py snapshot --persist"
+        )
+    return "\n".join(lines)
+
+
+def persist_bundle(bundle: dict[str, Any], ttl_seconds: int) -> None:
+    """Write a health bundle to the CENTRAL DB via central_task_db.py."""
+    db_script = REPO_ROOT / "scripts" / "central_task_db.py"
+    import io
+    import subprocess as _sp
+    payload = json_dumps(bundle).encode()
+    result = _sp.run(
+        [sys.executable, str(db_script), "health-snapshot-write", "-", f"--ttl-seconds={ttl_seconds}"],
+        input=payload,
+        capture_output=True,
+        cwd=str(REPO_ROOT),
+    )
+    if result.returncode != 0:
+        print(f"[repo_health] WARNING: could not persist snapshots: {result.stderr.decode().strip()}", file=sys.stderr)
+    else:
+        print(f"[repo_health] {result.stdout.decode().strip()}", file=sys.stderr)
 
 
 def command_snapshot(args: argparse.Namespace) -> int:
@@ -989,10 +1121,54 @@ def command_snapshot(args: argparse.Namespace) -> int:
             raise SystemExit(f"unknown repo id: {repo_id}")
         reports.append(spec.runner(args))
     bundle = build_bundle(reports, metadata={"requested_repos": requested})
+    if args.persist:
+        persist_bundle(bundle, args.ttl_seconds)
     if args.json:
         print(json_dumps(bundle))
     else:
         print(render_report(bundle))
+    return 0
+
+
+def command_latest(args: argparse.Namespace) -> int:
+    """Read the latest health snapshot from CENTRAL DB without invoking live checks."""
+    db_script = REPO_ROOT / "scripts" / "central_task_db.py"
+    import subprocess as _sp
+
+    # Always fetch JSON from DB so we can render it ourselves
+    cmd = [sys.executable, str(db_script), "health-snapshot-latest", "--json"]
+    repo_id: str | None = getattr(args, "repo", None)
+    if repo_id:
+        cmd += ["--repo-id", repo_id]
+    result = _sp.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        return result.returncode
+
+    if args.json:
+        print(result.stdout, end="")
+        return 0
+
+    try:
+        rows = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        sys.stderr.write(f"could not parse DB output as JSON\n{result.stdout}\n")
+        return 1
+
+    now_str = utc_now()
+    # Annotate stale/freshness client-side (DB already does this but we keep it resilient)
+    for row in rows:
+        if "freshness" not in row:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                captured = _dt.fromisoformat(str(row.get("captured_at", "")).replace("Z", "+00:00"))
+                ttl = int(row.get("ttl_seconds") or 3600)
+                now_dt = _dt.fromisoformat(now_str.replace("Z", "+00:00"))
+                row["is_stale"] = (now_dt - captured).total_seconds() > ttl
+                row["freshness"] = "stale" if row["is_stale"] else "fresh"
+            except (ValueError, TypeError):
+                row["freshness"] = "?"
+    print(render_latest_rows(rows, now_str, repo_id=repo_id))
     return 0
 
 
@@ -1015,7 +1191,20 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot_parser.add_argument("--command-timeout", type=float, default=60.0, help="Timeout in seconds for each command probe.")
     snapshot_parser.add_argument("--skip-smoke", action="store_true", help="Skip the dispatcher self-check.")
     snapshot_parser.add_argument("--json", action="store_true", help="Emit JSON instead of the operator table.")
+    snapshot_parser.add_argument("--persist", action="store_true", help="Write the collected snapshot to the CENTRAL DB for instant future reads.")
+    snapshot_parser.add_argument("--ttl-seconds", type=int, default=3600, help="Freshness TTL when persisting (default 3600s).")
     snapshot_parser.set_defaults(func=command_snapshot)
+
+    latest_parser = subparsers.add_parser("latest", help="Read the latest health snapshot instantly from CENTRAL DB (no live checks).")
+    latest_parser.add_argument(
+        "--repo",
+        choices=["dispatcher", "aimSoloAnalysis", "motoHelper"],
+        default=None,
+        help="Restrict to a single repo.",
+    )
+    latest_parser.add_argument("--json", action="store_true", help="Emit JSON.")
+    latest_parser.set_defaults(func=command_latest)
+
     return parser
 
 

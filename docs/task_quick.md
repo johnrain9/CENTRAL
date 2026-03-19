@@ -18,10 +18,38 @@ That's it. The tool picks the `feature` template by default, allocates the next 
 | `bugfix` | bugfix | 70 | Diagnosed or reported defect |
 | `refactor` | refactor | 40 | Code quality improvement, no behavior change |
 | `infrastructure` | infrastructure | 60 | Tooling, CI, config, or platform work |
+| `design` | design | 30 | Architecture or design brief; output is a doc, not code |
+| `docs` | docs | 35 | Create or update documentation |
+| `repo-health` | repo-health | 55 | Health adapter, repo onboarding, or health integration |
+| `validation` | validation | 65 | End-to-end acceptance test or smoke-test run |
+| `cleanup` | cleanup | 45 | Remove dead code, deprecated layers, or unused artifacts |
+| `planner-ops` | planner-ops | 50 | CENTRAL planner tooling, workflow scripts, dispatch infra |
 
 ```sh
 python3 scripts/task_quick.py --list-templates   # show all templates with details
 ```
+
+## When to Use Each Template
+
+**feature** — Adding new behavior that does not exist yet. Worker produces running code and tests.
+
+**bugfix** — A specific defect has been identified. Worker diagnoses root cause, fixes minimally, adds regression test.
+
+**refactor** — Code quality work with no external behavior change. Worker must run tests before and after.
+
+**infrastructure** — CI, config, tooling, or platform changes. Worker validates end-to-end in the real environment.
+
+**design** — Output is a doc or decision record, not code. Use before implementation tasks when the approach is not yet settled. Worker proposes follow-on implementation tasks.
+
+**docs** — README, reference docs, or guides. Worker writes or updates docs without touching implementation code.
+
+**repo-health** — Implementing the CENTRAL repo health adapter contract for a target repo. Worker validates adapter returns valid status and repo is registered.
+
+**validation** — Running acceptance criteria in a real environment and documenting results. Worker does not implement fixes — files follow-on tasks for failures.
+
+**cleanup** — Removing dead code, deprecated APIs, or unused layers. Worker verifies nothing in use is removed.
+
+**planner-ops** — Changes to CENTRAL planner tooling (`task_quick.py`, `planner-new`, dispatcher workflows, etc.). Worker must smoke-test the changed tooling end-to-end.
 
 ## Examples
 
@@ -38,12 +66,38 @@ python3 scripts/task_quick.py --title "Refactor DB layer" --repo CENTRAL --templ
 # Infrastructure
 python3 scripts/task_quick.py --title "Add CI pipeline" --repo PHOTO_AUTO_TAGGING --template infrastructure
 
+# Design brief (produces a doc, not code)
+python3 scripts/task_quick.py --title "Design auth overhaul" --repo CENTRAL --template design
+
+# Documentation task
+python3 scripts/task_quick.py --title "Write README for voice_transcription" --repo VOICE_TRANSCRIPTION --template docs
+
+# Repo health adapter
+python3 scripts/task_quick.py --title "Add health adapter" --repo PHOTO_AUTO_TAGGING --template repo-health
+
+# End-to-end validation run
+python3 scripts/task_quick.py --title "Validate voice PTT on real desktop" --repo CENTRAL --template validation
+
+# Remove deprecated layer
+python3 scripts/task_quick.py --title "Remove .worker-reports layer" --repo CENTRAL --template cleanup
+
+# Planner tooling change
+python3 scripts/task_quick.py --title "Add planner macro tool" --repo CENTRAL --template planner-ops
+
+# With initiative tag (groups work by feature area in view-summary)
+python3 scripts/task_quick.py --title "Add runtime heartbeat tuning" --repo CENTRAL \
+  --template infrastructure --initiative dispatcher-infrastructure
+
 # With dependency
 python3 scripts/task_quick.py --title "Add search UI" --repo AIM_SOLO_ANALYSIS --depends-on CENTRAL-OPS-42
 
 # Override any field while keeping the template for the rest
 python3 scripts/task_quick.py --title "Add dark mode" --repo PHOTO_AUTO_TAGGING \
   --scope "Only update the CSS theme layer. Do not touch layout."
+
+# Different task ID series
+python3 scripts/task_quick.py --title "Debug transaction nesting" --repo PHOTO_AUTO_TAGGING \
+  --template bugfix --series AUT-OPS
 ```
 
 ## All Flags
@@ -52,7 +106,8 @@ python3 scripts/task_quick.py --title "Add dark mode" --repo PHOTO_AUTO_TAGGING 
 |---|---|---|
 | `--title` | yes | Task title |
 | `--repo` | yes | Target repo ID or alias |
-| `--template` | no | `feature` (default), `bugfix`, `refactor`, `infrastructure` |
+| `--template` | no | Template name (default: `feature`) |
+| `--series` | no | Task ID series (default: `CENTRAL-OPS`) |
 | `--priority` | no | Override priority (0–100) |
 | `--task-type` | no | Override task_type string |
 | `--objective` | no | Override objective section |
@@ -63,6 +118,7 @@ python3 scripts/task_quick.py --title "Add dark mode" --repo PHOTO_AUTO_TAGGING 
 | `--testing` | no | Override testing section |
 | `--reconciliation` | no | Override reconciliation section |
 | `--depends-on` | no | Dependency task ID (repeatable) |
+| `--initiative` | no | Initiative/epic tag for grouping (e.g. `dispatcher-infrastructure`) |
 | `--list-templates` | no | Print template details and exit |
 
 ## AI Planner Usage
@@ -90,12 +146,25 @@ Only override individual sections when the task genuinely diverges from the temp
 Created CENTRAL-OPS-62: Add export API endpoint
   template:  feature
   repo:      AIM_SOLO_ANALYSIS
+  series:    CENTRAL-OPS
   priority:  50
   dispatch:  repo=AIM_SOLO_ANALYSIS do task CENTRAL-OPS-62
+```
+
+If `--initiative` was supplied, it appears on its own line:
+
+```
+Created CENTRAL-OPS-63: Add runtime heartbeat tuning
+  template:  infrastructure
+  repo:      CENTRAL
+  series:    CENTRAL-OPS
+  priority:  60
+  initiative: dispatcher-infrastructure
+  dispatch:  repo=CENTRAL do task CENTRAL-OPS-63
 ```
 
 The dispatch line is ready to use directly as a planner dispatch message.
 
 ## Underlying Contract
 
-`task_quick.py` is a thin wrapper: it calls `planner-new` to generate the scaffold, then pipes the JSON to `task-create`. The full `planner-new` contract (task ID allocation via monotonic high watermark, `CENTRAL-OPS` series, execution defaults) is preserved underneath. Tasks created this way are indistinguishable from tasks created via the raw pipeline.
+`task_quick.py` is a thin wrapper: it calls `planner-new` to generate the scaffold, then pipes the JSON to `task-create`. The full `planner-new` contract (task ID allocation via monotonic high watermark, execution defaults) is preserved underneath. Tasks created this way are indistinguishable from tasks created via the raw pipeline.

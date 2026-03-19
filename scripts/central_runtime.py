@@ -107,6 +107,7 @@ class DispatcherConfig:
     worker_mode: str
     default_worker_model: str | None = None
     default_codex_model: str = DEFAULT_CODEX_MODEL
+    max_retries: int = 5
 
     def __post_init__(self) -> None:
         # Unify: if only one is set, sync them
@@ -127,6 +128,12 @@ class ModelSelection:
 
 # Backward-compatible alias
 CodexModelSelection = ModelSelection
+
+
+def snapshot_retry_count(snapshot: dict[str, Any]) -> int:
+    """Return the current retry_count from a claimed task snapshot, or 0 if absent."""
+    runtime = snapshot.get("runtime") or {}
+    return int(runtime.get("retry_count") or 0)
 
 
 def resolve_state_dir(explicit: str | None) -> Path:
@@ -676,7 +683,7 @@ def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: 
         "    'decisions': [],\n"
         "    'discoveries': [],\n"
         "    'blockers': [],\n"
-        "    'validation': {},\n"
+        "    'validation': [],\n"
         "    'artifacts': [],\n"
         "    'claude_raw': claude_result,\n"
         "}\n"
@@ -1832,11 +1839,45 @@ class CentralDispatcher:
                 f"stale_recovery recovered={result['recovered_count']}",
             )
 
+    def _abort_if_max_retries(self, snapshot: dict[str, Any]) -> bool:
+        """Transition task to failed with max_retries_exceeded if retry_count >= max_retries.
+
+        Returns True if the task was aborted, False if it should proceed to spawn.
+        """
+        retry_count = snapshot_retry_count(snapshot)
+        if retry_count < self.config.max_retries:
+            return False
+        task_id = snapshot["task_id"]
+        worker_id = (snapshot.get("lease") or {}).get("lease_owner_id")
+        self.logger.emit(
+            "WRN",
+            "central.dispatcher",
+            f"max_retries_exceeded task={task_id} retry_count={retry_count} max_retries={self.config.max_retries}",
+        )
+        conn = self._connect()
+        try:
+            with conn:
+                task_db.runtime_transition(
+                    conn,
+                    task_id=task_id,
+                    status="failed",
+                    worker_id=worker_id,
+                    error_text="max_retries_exceeded",
+                    notes=f"retry_count={retry_count} reached max_retries={self.config.max_retries}; halting automatic retry",
+                    artifacts=[],
+                    actor_id="central.dispatcher",
+                )
+        finally:
+            conn.close()
+        return True
+
     def _fill_workers(self) -> None:
         while len(self._active) < self.config.max_workers and not self._stop_requested:
             snapshot = self._claim_next()
             if snapshot is None:
                 break
+            if self._abort_if_max_retries(snapshot):
+                continue
             try:
                 self._spawn_worker(snapshot)
             except Exception as exc:
@@ -1863,6 +1904,10 @@ class CentralDispatcher:
         if snapshot is None:
             if emit_result:
                 print(json_dumps({"claimed": False, "reason": "no_eligible_task"}))
+            return 0
+        if self._abort_if_max_retries(snapshot):
+            if emit_result:
+                print(json_dumps({"claimed": True, "task_id": snapshot["task_id"], "aborted": "max_retries_exceeded"}))
             return 0
         self._spawn_worker(snapshot)
         while self._active:

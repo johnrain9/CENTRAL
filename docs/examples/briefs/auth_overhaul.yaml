@@ -1,0 +1,37 @@
+# auth_overhaul.yaml — Example design brief for brief_to_pack.py
+#
+# Usage:
+#   python3 scripts/brief_to_pack.py --brief docs/examples/briefs/auth_overhaul.yaml
+#   python3 scripts/brief_to_pack.py --brief docs/examples/briefs/auth_overhaul.yaml --commit --dry-run
+#   python3 scripts/brief_to_pack.py --brief docs/examples/briefs/auth_overhaul.yaml --output /tmp/draft_auth.yaml
+
+title: "Auth module overhaul"
+repo: CENTRAL
+series: CENTRAL-OPS
+context: >
+  The current auth module stores session tokens in a way that does not meet
+  the new compliance requirements flagged by legal. The goal is to replace the
+  existing session handling with a compliant approach without breaking existing
+  auth flows.
+priority: 65
+
+tasks:
+  - title: "Design compliant session token storage"
+    template: design
+    priority: 75
+    context: "Produce a written recommendation before any implementation begins."
+
+  - title: "Implement compliant session token storage"
+    template: feature
+    priority: 65
+    depends_on: [previous]
+
+  - title: "Remove deprecated session middleware"
+    template: cleanup
+    priority: 60
+    depends_on: [previous]
+
+  - title: "Validate auth flows end-to-end after overhaul"
+    template: validation
+    priority: 70
+    depends_on: [previous]

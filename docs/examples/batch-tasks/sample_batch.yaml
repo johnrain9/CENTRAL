@@ -1,0 +1,23 @@
+# sample_batch.yaml — Example batch task file for task-batch-create
+#
+# Usage:
+#   python3 scripts/central_task_db.py task-batch-create --input docs/examples/batch-tasks/sample_batch.yaml --dry-run
+#   python3 scripts/central_task_db.py task-batch-create --input docs/examples/batch-tasks/sample_batch.yaml
+
+series: CENTRAL-OPS
+repo: CENTRAL
+defaults:
+  priority: 9
+  planner_status: todo
+
+tasks:
+  - title: "Example task: define scope"
+    objective: "Write a concise scope document for the feature."
+    context: "Kick off a new feature design pass."
+    priority: 8
+
+  - title: "Example task: implement core logic"
+    objective: "Build the primary implementation described in the scope."
+
+  - title: "Example task: add tests and docs"
+    objective: "Cover implementation with tests and update documentation."
