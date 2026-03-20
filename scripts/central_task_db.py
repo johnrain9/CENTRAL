@@ -33,7 +33,7 @@ DEFAULT_GENERATED_DIR = REPO_ROOT / "generated"
 DEFAULT_TASKS_DIR = REPO_ROOT / "tasks"
 DEFAULT_PACKET_PATH = REPO_ROOT / "central_task_system_tasks.md"
 DEFAULT_DURABILITY_DIR = REPO_ROOT / "durability" / "central_db"
-PLANNER_STATUSES = {"todo", "in_progress", "blocked", "done"}
+PLANNER_STATUSES = {"todo", "in_progress", "awaiting_audit", "failed", "done"}
 RUNTIME_STATUSES = {"queued", "claimed", "running", "pending_review", "failed", "timeout", "canceled", "done"}
 ACTIVE_RUNTIME_STATUSES = {"claimed", "running", "pending_review"}
 TERMINAL_RUNTIME_STATUSES = {"pending_review", "failed", "timeout", "canceled", "done"}
@@ -421,7 +421,13 @@ def normalize_task_id_series(series: str | None) -> str:
 
 
 def parse_task_id(task_id: str) -> tuple[str, int]:
-    match = TASK_ID_RE.match(task_id.strip().upper())
+    canonical = task_id.strip().upper()
+    # Strip well-known suffixes (e.g. -AUDIT) before matching
+    for suffix in ("-AUDIT",):
+        if canonical.endswith(suffix):
+            canonical = canonical[: -len(suffix)]
+            break
+    match = TASK_ID_RE.match(canonical)
     if match is None:
         die(f"invalid task_id: {task_id!r}")
     return match.group("series"), int(match.group("number"))
@@ -1549,11 +1555,15 @@ def detect_status_mismatch(
     task_id: str,
     planner_status: str,
     runtime_status: str | None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if runtime_status is None or runtime_status not in TERMINAL_RUNTIME_STATUSES:
         return None
     if runtime_status == "done":
         if planner_status == "done":
+            return None
+        # awaiting_audit is a valid terminal planner state when the task has a paired audit child
+        if planner_status == "awaiting_audit" and metadata and metadata.get("child_audit_task_id"):
             return None
         severity = "warning" if planner_status in AUTO_RECONCILE_PLANNER_STATUSES else "error"
         return {
@@ -1653,7 +1663,7 @@ def fetch_task_snapshots(
     snapshots: list[dict[str, Any]] = []
     for row in rows:
         dependencies = dependency_map.get(str(row["task_id"]), [])
-        blocker_ids = [item["depends_on_task_id"] for item in dependencies if item["dependency_kind"] == "hard" and item["depends_on_status"] != "done"]
+        blocker_ids = [item["depends_on_task_id"] for item in dependencies if item["dependency_kind"] == "hard" and item["depends_on_status"] not in {"done", "awaiting_audit"}]
         metadata = parse_json_text(row["metadata_json"], default={})
         execution = None
         if row["task_kind"] is not None:
@@ -1737,6 +1747,7 @@ def fetch_task_snapshots(
                     task_id=str(row["task_id"]),
                     planner_status=str(row["planner_status"]),
                     runtime_status=str(row["runtime_status"]) if row["runtime_status"] is not None else None,
+                    metadata=metadata,
                 ),
             }
         )
@@ -1991,6 +2002,159 @@ def create_task(conn: sqlite3.Connection, payload: dict[str, Any], *, actor_kind
     return fetch_task_snapshots(conn, task_id=normalized["task_id"])[0]
 
 
+def task_requires_audit(*, task_type: str, source_kind: str, metadata: dict[str, Any]) -> bool:
+    """Return True when the task's metadata indicates an audit is required."""
+    return bool(metadata.get("audit_required"))
+
+
+def build_audit_task_payload(parent_payload: dict[str, Any], audit_override: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build an audit task payload derived from a parent task payload."""
+    parent_task_id = str(parent_payload["task_id"])
+    parent_title = str(parent_payload.get("title") or parent_task_id)
+    audit_task_id = f"{parent_task_id}-AUDIT"
+
+    # Fields inherited from parent
+    inherited_fields = [
+        "priority",
+        "target_repo_id",
+        "target_repo_root",
+        "target_repo_display_name",
+        "planner_owner",
+        "worker_owner",
+        "initiative",
+        "execution",
+        "source_kind",
+    ]
+
+    audit_payload: dict[str, Any] = {
+        "task_id": audit_task_id,
+        "task_type": "audit",
+        "title": f"Audit {parent_task_id}: {parent_title}",
+        "summary": f"Verify that {parent_task_id} built the correct thing in the real system.",
+        "dependencies": [parent_task_id],
+        "metadata": {
+            "audit_required": False,
+            "parent_task_id": parent_task_id,
+            "relationship_kind": "audit",
+            "fixup_threshold": "bounded_only",
+        },
+        "planner_status": "todo",
+        "approval_required": False,
+        "objective_md": f"Audit `{parent_task_id}` for requirement fidelity, real-environment behavior, and whole-system fit.",
+        "context_md": (
+            f"Parent task: `{parent_task_id}`.\n\n"
+            "Ground the audit in the parent objective, acceptance criteria, artifacts, and runtime evidence."
+        ),
+        "scope_md": "Validate the delivered change against requirements and full-system behavior.",
+        "deliverables_md": "Record an audit verdict with concrete evidence and any bounded fixups.",
+        "acceptance_md": "Confirm the implementation matches intent, works in reality, and does not fail outside a narrow local window.",
+        "testing_md": "Run reality-based validation and record commands, artifacts, and observed outcomes.",
+        "dispatch_md": f"Dispatch after `{parent_task_id}` reaches `awaiting_audit`.",
+        "closeout_md": "Record audit evidence, final verdict, and any bounded fixups performed during the audit.",
+        "reconciliation_md": (
+            f"When this audit is `done`, `{parent_task_id}` closes automatically. "
+            "If this audit fails, planner follow-up is required."
+        ),
+    }
+
+    for field in inherited_fields:
+        if field in parent_payload and parent_payload[field] is not None:
+            audit_payload[field] = parent_payload[field]
+
+    if audit_override:
+        audit_payload.update(audit_override)
+
+    return audit_payload
+
+
+def create_task_graph(
+    conn: sqlite3.Connection,
+    payload: dict[str, Any],
+    *,
+    actor_kind: str,
+    actor_id: str,
+) -> dict[str, Any]:
+    """Create a task and, if audit is required, a paired audit task.
+
+    Returns the parent task snapshot.
+    """
+    task_id = str(payload.get("task_id") or "")
+    metadata = dict(payload.get("metadata") or {})
+    task_type = str(payload.get("task_type") or "implementation")
+    source_kind = str(payload.get("source_kind") or "planner")
+
+    if task_requires_audit(task_type=task_type, source_kind=source_kind, metadata=metadata):
+        audit_task_id = f"{task_id}-AUDIT"
+        # Inject audit linkage into parent metadata
+        parent_metadata = dict(metadata)
+        parent_metadata["child_audit_task_id"] = audit_task_id
+        parent_metadata["audit_verdict"] = "pending"
+        parent_payload = dict(payload)
+        parent_payload["metadata"] = parent_metadata
+        parent_snapshot = create_task(conn, parent_payload, actor_kind=actor_kind, actor_id=actor_id)
+        audit_payload = build_audit_task_payload(parent_payload)
+        create_task(conn, audit_payload, actor_kind=actor_kind, actor_id=actor_id)
+        return parent_snapshot
+    else:
+        return create_task(conn, payload, actor_kind=actor_kind, actor_id=actor_id)
+
+
+def runtime_requeue_task(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    actor_id: str,
+    reason: str,
+    reset_retry_count: bool = False,
+) -> dict[str, Any]:
+    """Requeue a task by resetting its runtime_status to 'queued' and clearing the lease."""
+    begin_immediate(conn)
+    runtime_row = conn.execute("SELECT * FROM task_runtime_state WHERE task_id = ?", (task_id,)).fetchone()
+    if runtime_row is None:
+        conn.rollback()
+        raise RuntimeError(f"runtime state missing for {task_id}")
+    lease = fetch_active_lease(conn, task_id)
+    had_active_lease = lease is not None
+    if had_active_lease:
+        close_active_assignments(
+            conn,
+            task_id=task_id,
+            assignee_kind="worker",
+            assignee_id=str(lease["lease_owner_id"]),
+        )
+        conn.execute("DELETE FROM task_active_leases WHERE task_id = ?", (task_id,))
+    current = row_to_dict(runtime_row) or {}
+    retry_count = int(current.get("retry_count") or 0) if not reset_retry_count else 0
+    transition_at = now_iso()
+    conn.execute(
+        """
+        UPDATE task_runtime_state
+        SET runtime_status = 'queued',
+            last_runtime_error = NULL,
+            finished_at = NULL,
+            pending_review_at = NULL,
+            retry_count = ?,
+            last_transition_at = ?
+        WHERE task_id = ?
+        """,
+        (retry_count, transition_at, task_id),
+    )
+    insert_event(
+        conn,
+        task_id=task_id,
+        event_type="runtime.requeued",
+        actor_kind="runtime",
+        actor_id=actor_id,
+        payload={
+            "summary": reason,
+            "had_active_lease": had_active_lease,
+            "reset_retry_count": reset_retry_count,
+        },
+    )
+    conn.commit()
+    return fetch_task_snapshots(conn, task_id=task_id)[0]
+
+
 def update_task(
     conn: sqlite3.Connection,
     *,
@@ -2168,7 +2332,7 @@ def reconcile_task(
     actor_kind: str,
     actor_id: str,
 ) -> dict[str, Any]:
-    if outcome not in {"done", "blocked"}:
+    if outcome not in {"done", "awaiting_audit", "failed"}:
         die(f"invalid reconcile outcome: {outcome}")
     current_row = fetch_task_row(conn, task_id)
     if current_row is None:
@@ -2184,8 +2348,6 @@ def reconcile_task(
         "reconciled_at": now_iso(),
         "actor_id": actor_id,
     }
-    if outcome == "blocked":
-        metadata["blocker_summary"] = summary
     updated_at = now_iso()
     next_version = int(current_row["version"]) + 1
     conn.execute(
@@ -2268,8 +2430,16 @@ def auto_reconcile_runtime_success(
     closeout_tests = tests.strip() if tests else None
     updated_at = now_iso()
     metadata = merge_task_metadata(current_row["metadata_json"], None)
+
+    # Determine outcome: awaiting_audit when paired audit exists, otherwise done
+    has_audit = bool(metadata.get("child_audit_task_id"))
+    outcome = "awaiting_audit" if has_audit else "done"
+
+    if has_audit:
+        metadata["audit_verdict"] = "pending"
+
     metadata["closeout"] = {
-        "outcome": "done",
+        "outcome": outcome,
         "summary": closeout_summary,
         "notes": closeout_notes,
         "tests": closeout_tests,
@@ -2284,7 +2454,7 @@ def auto_reconcile_runtime_success(
     conn.execute(
         """
         UPDATE tasks
-        SET planner_status = 'done',
+        SET planner_status = ?,
             version = ?,
             worker_owner = NULL,
             updated_at = ?,
@@ -2293,9 +2463,10 @@ def auto_reconcile_runtime_success(
         WHERE task_id = ? AND version = ?
         """,
         (
+            outcome,
             next_version,
             updated_at,
-            updated_at,
+            updated_at if outcome == "done" else None,
             compact_json(metadata),
             task_id,
             int(current_row["version"]),
@@ -2308,7 +2479,7 @@ def auto_reconcile_runtime_success(
             artifact_kind="planner_closeout",
             path_or_uri=artifact,
             label=Path(artifact).name,
-            metadata={"reconciled_by": actor_id, "outcome": "done", "source": "runtime_auto_reconcile"},
+            metadata={"reconciled_by": actor_id, "outcome": outcome, "source": "runtime_auto_reconcile"},
         )
     insert_event(
         conn,
@@ -2317,7 +2488,7 @@ def auto_reconcile_runtime_success(
         actor_kind="runtime",
         actor_id=actor_id,
         payload={
-            "outcome": "done",
+            "outcome": outcome,
             "summary": closeout_summary,
             "notes": closeout_notes,
             "tests": closeout_tests,
@@ -2327,6 +2498,85 @@ def auto_reconcile_runtime_success(
     )
     conn.commit()
     return fetch_task_snapshots(conn, task_id=task_id)[0]
+
+
+def reconcile_audit_rework(
+    conn,
+    *,
+    audit_task_id: str,
+    summary: str,
+    actor_id: str,
+):
+    """Fail an audit task (verdict=rework_required) and propagate failure to the parent task."""
+    begin_immediate(conn)
+    audit_row = fetch_task_row(conn, audit_task_id)
+    if audit_row is None:
+        conn.rollback()
+        raise RuntimeError(f"audit task not found: {audit_task_id}")
+
+    audit_metadata = parse_json_text(audit_row["metadata_json"], default={})
+    parent_task_id = str(audit_metadata.get("parent_task_id") or "")
+    updated_at = now_iso()
+    audit_version = int(audit_row["version"])
+
+    audit_closeout = {
+        "outcome": "failed",
+        "summary": summary,
+        "notes": "audit verdict: rework_required",
+        "reconciled_at": updated_at,
+        "actor_id": actor_id,
+    }
+    audit_metadata["closeout"] = audit_closeout
+    conn.execute(
+        """
+        UPDATE tasks
+        SET planner_status = 'failed',
+            version = ?,
+            worker_owner = NULL,
+            updated_at = ?,
+            metadata_json = ?
+        WHERE task_id = ? AND version = ?
+        """,
+        (audit_version + 1, updated_at, compact_json(audit_metadata), audit_task_id, audit_version),
+    )
+    insert_event(
+        conn,
+        task_id=audit_task_id,
+        event_type="planner.task_reconciled",
+        actor_kind="runtime",
+        actor_id=actor_id,
+        payload={"outcome": "failed", "summary": summary, "tests": None, "artifacts": []},
+    )
+
+    if parent_task_id:
+        parent_row = fetch_task_row(conn, parent_task_id)
+        if parent_row is not None:
+            parent_metadata = parse_json_text(parent_row["metadata_json"], default={})
+            parent_metadata["audit_verdict"] = "failed"
+            parent_version = int(parent_row["version"])
+            parent_updated_at = now_iso()
+            conn.execute(
+                """
+                UPDATE tasks
+                SET planner_status = 'failed',
+                    version = ?,
+                    updated_at = ?,
+                    metadata_json = ?
+                WHERE task_id = ? AND version = ?
+                """,
+                (parent_version + 1, parent_updated_at, compact_json(parent_metadata), parent_task_id, parent_version),
+            )
+            insert_event(
+                conn,
+                task_id=parent_task_id,
+                event_type="planner.task_failed_by_audit",
+                actor_kind="runtime",
+                actor_id=actor_id,
+                payload={"audit_task_id": audit_task_id, "summary": summary},
+            )
+
+    conn.commit()
+    return fetch_task_snapshots(conn, task_id=audit_task_id)[0]
 
 
 def summarize_portfolio(conn: sqlite3.Connection, *, initiative: str | None = None) -> dict[str, Any]:
@@ -4840,6 +5090,176 @@ def command_runtime_recover_stale(args: argparse.Namespace) -> int:
     return print_or_json(payload, as_json=args.json, formatter=json_dumps)
 
 
+def operator_fail_task(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    actor_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Forcibly set runtime_status=failed for a task, recording an operator event."""
+    begin_immediate(conn)
+    runtime_row = conn.execute("SELECT * FROM task_runtime_state WHERE task_id = ?", (task_id,)).fetchone()
+    if runtime_row is None:
+        # Create a minimal runtime state row so we can set failed
+        conn.rollback()
+        raise RuntimeError(f"runtime state missing for {task_id}; run runtime-transition first or use task-show to confirm the task exists")
+    lease = fetch_active_lease(conn, task_id)
+    if lease is not None:
+        close_active_assignments(conn, task_id=task_id, assignee_kind="worker", assignee_id=str(lease["lease_owner_id"]))
+        conn.execute("DELETE FROM task_active_leases WHERE task_id = ?", (task_id,))
+    current = row_to_dict(runtime_row) or {}
+    retry_count = int(current.get("retry_count") or 0) + 1
+    transition_at = now_iso()
+    conn.execute(
+        """
+        UPDATE task_runtime_state
+        SET runtime_status = 'failed',
+            last_runtime_error = ?,
+            finished_at = ?,
+            last_transition_at = ?,
+            retry_count = ?
+        WHERE task_id = ?
+        """,
+        (reason, transition_at, transition_at, retry_count, task_id),
+    )
+    insert_event(
+        conn,
+        task_id=task_id,
+        event_type="operator.fail",
+        actor_kind="operator",
+        actor_id=actor_id,
+        payload={"summary": reason},
+    )
+    conn.commit()
+    return fetch_task_snapshots(conn, task_id=task_id)[0]
+
+
+def build_planner_panel(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Aggregate the richest single planner view used by the UI."""
+    snapshots = fetch_task_snapshots(conn)
+    generated_at = now_iso()
+
+    eligible_work = []
+    awaiting_audit = []
+    recent_failures = []
+    changed_since: list[dict[str, Any]] = []
+    changed_cutoff_hours = 24
+    from datetime import timedelta
+
+    cutoff_dt = None
+    try:
+        from datetime import datetime, timezone, timedelta
+        cutoff_dt = (datetime.now(timezone.utc) - timedelta(hours=changed_cutoff_hours)).isoformat()
+    except Exception:
+        pass
+
+    for snapshot in snapshots:
+        runtime = snapshot["runtime"]
+        planner_status = snapshot["planner_status"]
+        runtime_status = runtime["runtime_status"] if runtime else None
+        task_type = snapshot.get("task_type") or "task"
+
+        base = {
+            "task_id": snapshot["task_id"],
+            "title": snapshot["title"],
+            "priority": snapshot["priority"],
+            "repo": snapshot["target_repo_id"],
+            "planner_status": planner_status,
+            "runtime_status": runtime_status or "",
+            "planner_owner": snapshot["planner_owner"],
+            "worker_owner": snapshot["worker_owner"] or "",
+            "task_type": task_type,
+        }
+
+        if task_is_eligible(snapshot):
+            eligible_work.append(base)
+
+        if planner_status == "awaiting_audit":
+            awaiting_audit.append(base)
+
+        if runtime_status == "failed":
+            recent_failures.append({
+                **base,
+                "last_error": runtime.get("last_runtime_error") or "",
+                "retry_count": runtime.get("retry_count", 0),
+            })
+
+        if cutoff_dt and snapshot.get("updated_at") and snapshot["updated_at"] >= cutoff_dt:
+            changed_since.append({
+                **base,
+                "updated_at": snapshot["updated_at"],
+            })
+
+    # ready_audits: audit-type tasks that are eligible
+    ready_audits = [t for t in eligible_work if t.get("task_type") == "audit"]
+
+    # Sort eligible by priority
+    eligible_work.sort(key=lambda t: t["priority"])
+    changed_since.sort(key=lambda t: t.get("updated_at", ""), reverse=True)
+
+    summary = {
+        "eligible_count": len(eligible_work),
+        "awaiting_audit_count": len(awaiting_audit),
+        "failed_audit_count": sum(1 for s in snapshots if s.get("task_type") == "audit" and s["planner_status"] == "failed"),
+        "stale_count": sum(
+            1 for s in snapshots
+            if s["runtime"] and s["runtime"]["runtime_status"] in {"timeout", "failed"}
+            and s["planner_status"] in {"todo", "in_progress"}
+        ),
+        "changed_since_count": len(changed_since),
+    }
+
+    return {
+        "generated_at": generated_at,
+        "eligible_work": eligible_work,
+        "awaiting_audit": awaiting_audit,
+        "ready_audits": ready_audits,
+        "recent_failures": recent_failures,
+        "changed_since": changed_since[:20],
+        "summary": summary,
+    }
+
+
+def build_audits_view(conn: sqlite3.Connection, *, section: str | None = None) -> list[dict[str, Any]]:
+    """Return audit-related tasks. Section 'failed' filters to failed audit tasks."""
+    snapshots = fetch_task_snapshots(conn)
+    rows = []
+    for snapshot in snapshots:
+        task_type = snapshot.get("task_type") or "task"
+        planner_status = snapshot["planner_status"]
+        runtime = snapshot["runtime"]
+        runtime_status = runtime["runtime_status"] if runtime else ""
+
+        is_audit_type = task_type == "audit"
+        is_awaiting_audit = planner_status == "awaiting_audit"
+
+        if not is_audit_type and not is_awaiting_audit:
+            continue
+
+        row = {
+            "task_id": snapshot["task_id"],
+            "task_type": task_type,
+            "title": snapshot["title"],
+            "priority": snapshot["priority"],
+            "repo": snapshot["target_repo_id"],
+            "planner_status": planner_status,
+            "runtime_status": runtime_status,
+            "planner_owner": snapshot["planner_owner"],
+            "worker_owner": snapshot["worker_owner"] or "",
+            "updated_at": snapshot["updated_at"],
+        }
+
+        if section == "failed":
+            if planner_status == "failed" or runtime_status == "failed":
+                rows.append(row)
+        else:
+            rows.append(row)
+
+    rows.sort(key=lambda r: r["priority"])
+    return rows
+
+
 def command_runtime_clear_stale_failed(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
@@ -4862,6 +5282,75 @@ def command_migrate_bootstrap(args: argparse.Namespace) -> int:
     finally:
         conn.close()
     return print_or_json(payload, as_json=args.json, formatter=json_dumps)
+
+
+def command_view_planner_panel(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        panel = build_planner_panel(conn)
+    finally:
+        conn.close()
+    return print_or_json(panel, as_json=args.json, formatter=json_dumps)
+
+
+def command_view_audits(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        section = getattr(args, "section", None) or None
+        rows = build_audits_view(conn, section=section)
+    finally:
+        conn.close()
+    return print_or_json(
+        rows,
+        as_json=args.json,
+        formatter=lambda data: "\n".join(
+            [
+                generated_banner(now_iso()),
+                "",
+                render_table(
+                    data,
+                    [
+                        ("task_id", "task_id"),
+                        ("type", "task_type"),
+                        ("repo", "repo"),
+                        ("planner", "planner_status"),
+                        ("runtime", "runtime_status"),
+                        ("updated_at", "updated_at"),
+                        ("title", "title"),
+                    ],
+                ),
+            ]
+        ),
+    )
+
+
+def command_runtime_requeue_task(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        snapshot = runtime_requeue_task(
+            conn,
+            task_id=args.task_id,
+            actor_id=args.actor_id,
+            reason=args.reason,
+            reset_retry_count=args.reset_retry_count,
+        )
+    finally:
+        conn.close()
+    return print_or_json(render_task_card(snapshot), as_json=args.json, formatter=json_dumps)
+
+
+def command_operator_fail_task(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        snapshot = operator_fail_task(
+            conn,
+            task_id=args.task_id,
+            actor_id=args.actor_id,
+            reason=args.reason,
+        )
+    finally:
+        conn.close()
+    return print_or_json(render_task_card(snapshot), as_json=args.json, formatter=json_dumps)
 
 
 def add_db_argument(parser: argparse.ArgumentParser) -> None:
@@ -5325,6 +5814,34 @@ def build_parser() -> argparse.ArgumentParser:
     health_history_parser.add_argument("--limit", type=int, default=20, help="Maximum rows to return (default 20).")
     add_json_argument(health_history_parser)
     health_history_parser.set_defaults(func=command_health_snapshot_history)
+
+    view_planner_panel_parser = subparsers.add_parser("view-planner-panel", help="Show richest single planner view: eligible work, audits, recent failures, and recent changes.")
+    add_db_argument(view_planner_panel_parser)
+    add_json_argument(view_planner_panel_parser)
+    view_planner_panel_parser.set_defaults(func=command_view_planner_panel)
+
+    view_audits_parser = subparsers.add_parser("view-audits", help="Show audit-related tasks (audit-type tasks and tasks awaiting audit).")
+    add_db_argument(view_audits_parser)
+    view_audits_parser.add_argument("--section", choices=["failed"], help="Filter to a specific audit section (e.g. 'failed').")
+    add_json_argument(view_audits_parser)
+    view_audits_parser.set_defaults(func=command_view_audits)
+
+    runtime_requeue_parser = subparsers.add_parser("runtime-requeue-task", help="Requeue a task by resetting runtime_status to queued and clearing the lease.")
+    add_db_argument(runtime_requeue_parser)
+    runtime_requeue_parser.add_argument("--task-id", required=True)
+    runtime_requeue_parser.add_argument("--reason", required=True)
+    runtime_requeue_parser.add_argument("--reset-retry-count", action="store_true", help="Reset retry_count to 0 before requeue.")
+    runtime_requeue_parser.add_argument("--actor-id", default="operator")
+    add_json_argument(runtime_requeue_parser)
+    runtime_requeue_parser.set_defaults(func=command_runtime_requeue_task)
+
+    operator_fail_parser = subparsers.add_parser("operator-fail-task", help="Forcibly set runtime_status=failed for a task, recording an operator event.")
+    add_db_argument(operator_fail_parser)
+    operator_fail_parser.add_argument("--task-id", required=True)
+    operator_fail_parser.add_argument("--reason", required=True)
+    operator_fail_parser.add_argument("--actor-id", default="operator")
+    add_json_argument(operator_fail_parser)
+    operator_fail_parser.set_defaults(func=command_operator_fail_task)
 
     return parser
 

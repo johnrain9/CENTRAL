@@ -426,7 +426,7 @@ class CentralRuntimeReconcileTest(unittest.TestCase):
                 task_db.update_task(
                     conn,
                     task_id=task_id,
-                    payload={"planner_status": "blocked", "metadata": {"forced_drift": True}},
+                    payload={"planner_status": "awaiting_audit", "metadata": {"forced_drift": True}},
                     expected_version=1,
                     actor_kind="planner",
                     actor_id="central.runtime.tests",
@@ -487,7 +487,7 @@ class CentralRuntimeReconcileTest(unittest.TestCase):
             dispatcher._finalize_worker(state)
 
         snapshot = self.fetch_snapshot(task_id)
-        self.assertIn(snapshot["planner_status"], {"blocked", "failed"})
+        self.assertIn(snapshot["planner_status"], {"awaiting_audit", "failed"})
         self.assertEqual(snapshot["runtime"]["runtime_status"], "done")
         mismatch = snapshot["status_mismatch"]
         if snapshot["planner_status"] != "failed":

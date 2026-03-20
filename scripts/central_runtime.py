@@ -1203,6 +1203,11 @@ class CentralDispatcher:
         self._active: dict[str, ActiveWorker] = {}
         self._last_recovery_monotonic = 0.0
         self._last_status_heartbeat_monotonic = 0.0
+        self._capacity_backoff_until: float = 0.0
+
+    def _capacity_backoff_active(self) -> bool:
+        """Return True if the dispatcher is currently in a capacity backoff window."""
+        return time.monotonic() < self._capacity_backoff_until
 
     def _signal_handler(self, _signum: int, _frame: Any) -> None:
         if not self._stop_requested:
@@ -1665,6 +1670,17 @@ class CentralDispatcher:
             f"dispatcher_handoff_prepared active_workers={handed_off}",
         )
 
+    _CODEX_USAGE_LIMIT_MARKER = "you've hit your usage limit"
+
+    @staticmethod
+    def _detect_codex_capacity_hit(log_path: Any) -> bool:
+        """Return True if the codex log file contains a usage-limit signal."""
+        try:
+            text = Path(log_path).read_text(encoding="utf-8", errors="replace").lower()
+            return CentralDispatcher._CODEX_USAGE_LIMIT_MARKER in text
+        except Exception:
+            return False
+
     def _finalize_worker(self, state: ActiveWorker, *, timed_out: bool = False, interrupted_by_restart: bool = False) -> None:
         task_id = state.task["task_id"]
         terminal_artifacts = [str(state.prompt_path), str(state.log_path)]
@@ -1689,6 +1705,7 @@ class CentralDispatcher:
             error_text = None
             notes = None
             tests = None
+            result = None
             extra_artifacts: list[tuple[str, str, dict[str, Any]]] = []
             result_artifacts = terminal_artifacts.copy()
             # For Claude workers, claude -p JSON output goes to the log file (stdout=log_handle).
@@ -1739,52 +1756,109 @@ class CentralDispatcher:
                     error_text = "worker_crashed"
                     notes = "worker process not found; presumed crashed before result emission"
 
-            with conn:
-                task_db.runtime_transition(
-                    conn,
-                    task_id=task_id,
-                    status=runtime_status,
-                    worker_id=state.worker_id,
-                    error_text=error_text,
-                    notes=notes,
-                    artifacts=result_artifacts,
-                    actor_id="central.dispatcher",
-                )
-            if runtime_status == "done":
-                reconcile_conn = self._connect()
+            # Detect codex capacity limit: requeue instead of failing
+            if (
+                runtime_status == "failed"
+                and getattr(state, "selected_worker_backend", None) == "codex"
+                and self._detect_codex_capacity_hit(state.log_path)
+            ):
+                requeue_conn = self._connect()
                 try:
-                    reconciled = task_db.auto_reconcile_runtime_success(
-                        reconcile_conn,
+                    task_db.runtime_requeue_task(
+                        requeue_conn,
                         task_id=task_id,
-                        summary=notes or "runtime completed successfully",
-                        notes=notes,
-                        tests=tests,
-                        artifacts=result_artifacts,
                         actor_id="central.dispatcher",
-                        run_id=state.run_id,
-                    )
-                    self.logger.emit(
-                        "INF",
-                        "central.dispatcher",
-                        f"worker_auto_reconciled task={task_id} run={state.run_id} planner_status={reconciled['planner_status']} version={reconciled['version']}",
-                    )
-                except Exception as exc:
-                    with reconcile_conn:
-                        task_db.insert_event(
-                            reconcile_conn,
-                            task_id=task_id,
-                            event_type="planner.task_auto_reconcile_failed",
-                            actor_kind="runtime",
-                            actor_id="central.dispatcher",
-                            payload={"run_id": state.run_id, "error": str(exc)},
-                        )
-                    self.logger.emit(
-                        "ERR",
-                        "central.dispatcher",
-                        f"worker_auto_reconcile_failed task={task_id} run={state.run_id} error={exc}",
+                        reason="codex usage limit reached; requeueing for later dispatch",
+                        reset_retry_count=True,
                     )
                 finally:
-                    reconcile_conn.close()
+                    requeue_conn.close()
+                backoff_seconds = 300
+                self._capacity_backoff_until = time.monotonic() + backoff_seconds
+                self.logger.emit(
+                    "INF",
+                    "central.dispatcher",
+                    f"worker_capacity_requeued task={task_id} run={state.run_id} backend=codex",
+                )
+                self.logger.emit(
+                    "INF",
+                    "central.dispatcher",
+                    f"dispatcher_capacity_backoff backend=codex backoff_seconds={backoff_seconds}",
+                )
+            else:
+                with conn:
+                    task_db.runtime_transition(
+                        conn,
+                        task_id=task_id,
+                        status=runtime_status,
+                        worker_id=state.worker_id,
+                        error_text=error_text,
+                        notes=notes,
+                        artifacts=result_artifacts,
+                        actor_id="central.dispatcher",
+                    )
+                if runtime_status == "done":
+                    reconcile_conn = self._connect()
+                    try:
+                        # Audit task with rework_required verdict: fail audit + propagate to parent
+                        is_audit_rework = (
+                            str(state.task.get("task_type") or "") == "audit"
+                            and result is not None
+                            and str(getattr(result, "verdict", "") or "") == "rework_required"
+                        )
+                        if is_audit_rework:
+                            task_db.reconcile_audit_rework(
+                                reconcile_conn,
+                                audit_task_id=task_id,
+                                summary=notes or "audit verdict: rework_required",
+                                actor_id="central.dispatcher",
+                            )
+                            self.logger.emit(
+                                "INF",
+                                "central.dispatcher",
+                                f"worker_audit_rework task={task_id} run={state.run_id}",
+                            )
+                        else:
+                            reconciled = task_db.auto_reconcile_runtime_success(
+                                reconcile_conn,
+                                task_id=task_id,
+                                summary=notes or "runtime completed successfully",
+                                notes=notes,
+                                tests=tests,
+                                artifacts=result_artifacts,
+                                actor_id="central.dispatcher",
+                                run_id=state.run_id,
+                            )
+                            reconciled_planner_status = reconciled["planner_status"]
+                            if reconciled_planner_status == "awaiting_audit":
+                                self.logger.emit(
+                                    "INF",
+                                    "central.dispatcher",
+                                    f"worker_auto_reconcile_skipped task={task_id} run={state.run_id} reason=awaiting_audit",
+                                )
+                            else:
+                                self.logger.emit(
+                                    "INF",
+                                    "central.dispatcher",
+                                    f"worker_auto_reconciled task={task_id} run={state.run_id} planner_status={reconciled_planner_status} version={reconciled['version']}",
+                                )
+                    except Exception as exc:
+                        with reconcile_conn:
+                            task_db.insert_event(
+                                reconcile_conn,
+                                task_id=task_id,
+                                event_type="planner.task_auto_reconcile_failed",
+                                actor_kind="runtime",
+                                actor_id="central.dispatcher",
+                                payload={"run_id": state.run_id, "error": str(exc)},
+                            )
+                        self.logger.emit(
+                            "ERR",
+                            "central.dispatcher",
+                            f"worker_auto_reconcile_failed task={task_id} run={state.run_id} error={exc}",
+                        )
+                    finally:
+                        reconcile_conn.close()
             if extra_artifacts:
                 add_artifacts(task_id, extra_artifacts, self.config.db_path)
             self.logger.emit(
