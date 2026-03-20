@@ -1149,31 +1149,69 @@ def classify_worker_run(
     return "idle", "no active worker lease"
 
 
+def worker_log_signal(
+    snapshot: dict[str, Any],
+    *,
+    log_info: dict[str, Any],
+    log_growth: dict[str, Any],
+    stale_threshold: float = 60.0,
+) -> dict[str, Any]:
+    """Return a signal dict describing the log file's growth state."""
+    growth_bytes = log_growth.get("bytes_since_last_inspection")
+    age = log_info.get("age_seconds")
+    is_stale = isinstance(age, (int, float)) and age > stale_threshold
+    if isinstance(growth_bytes, int) and growth_bytes > 0:
+        state = "growing"
+    elif is_stale:
+        state = "stale"
+    else:
+        state = "flat"
+    return {"state": state, "stale": is_stale}
+
+
 def worker_status_text(payload: dict[str, Any]) -> str:
     def _fmt_seconds(value: Any) -> str:
         if not isinstance(value, (int, float)):
             return "-"
         return f"{value:.1f}"
 
+    def _fmt_bytes(value: Any) -> str:
+        if not isinstance(value, (int, float)):
+            return "-"
+        if value >= 1024 * 1024:
+            return f"{value / (1024 * 1024):.1f}MB"
+        if value >= 1024:
+            return f"{value / 1024:.1f}KB"
+        return f"{int(value)}B"
+
     summary = payload["summary"]
+    runtime_paths = payload.get("runtime_paths") or {}
     lines = [
         f"Worker status: {summary['overall_status']}",
         summary["headline"],
-        f"Structured results: {payload['runtime_paths']['worker_results_dir']}",
-        (
-            "Active workers: "
-            f"{summary['active_count']} | healthy={summary['healthy_count']} "
-            f"| low_activity={summary['low_activity_count']} | potentially_stuck={summary['potentially_stuck_count']}"
-        ),
     ]
+    if runtime_paths.get("worker_results_dir"):
+        lines.append(f"Structured results: {runtime_paths['worker_results_dir']}")
+    lines.append(
+        "Active workers: "
+        f"{summary['active_count']} | healthy={summary['healthy_count']} "
+        f"| low_activity={summary['low_activity_count']} | potentially_stuck={summary['potentially_stuck_count']}"
+    )
     if payload["active_workers"]:
         for worker in payload["active_workers"]:
+            log = worker.get("log") or {}
+            log_size = _fmt_bytes(log.get("size_bytes"))
+            growth = log.get("growth") or {}
+            growth_bytes = growth.get("bytes_since_last_inspection")
+            log_delta = (f"+{_fmt_bytes(growth_bytes)}" if isinstance(growth_bytes, int) and growth_bytes > 0
+                         else (f"{_fmt_bytes(growth_bytes)}" if isinstance(growth_bytes, int) else "-"))
+            log_signal = (log.get("signal") or {}).get("state") or "-"
             lines.append(
                 (
-                    f"- {worker['observed_state']}: {worker['task_id']} run={worker['run_id'] or '-'} "
-                    f"runtime={worker['runtime_status']} heartbeat_age={_fmt_seconds(worker['heartbeat']['age_seconds'])}s "
-                    f"log_age={_fmt_seconds(worker['log']['age_seconds'])}s "
-                    f"model={((worker.get('worker') or {}).get('model') or '-')} reason={worker['reason']}"
+                    f"- {worker['observed_state']}: {worker['task_id']} run={worker.get('run_id') or '-'} "
+                    f"runtime={worker['runtime_status']} heartbeat_age={_fmt_seconds((worker.get('heartbeat') or {}).get('age_seconds'))}s "
+                    f"log_size={log_size} log_delta={log_delta} log_signal={log_signal} "
+                    f"model={((worker.get('worker') or {}).get('model') or '-')} reason={worker.get('reason', '-')}"
                 )
             )
     else:
@@ -2223,10 +2261,7 @@ def worker_status_payload(
             "log": {
                 **log_info,
                 "growth": log_growth,
-                "signal": {
-                    "state": "growing" if isinstance(log_growth.get("bytes_since_last_inspection"), int) and log_growth["bytes_since_last_inspection"] > 0 else "flat",
-                    "stale": isinstance(log_info.get("age_seconds"), (int, float)) and log_info["age_seconds"] > 120,
-                },
+                "signal": worker_log_signal(snapshot, log_info=log_info, log_growth=log_growth),
             },
             "prompt": file_metadata(run_paths["prompt"], now=now),
             "result": file_metadata(run_paths["result"], now=now),
