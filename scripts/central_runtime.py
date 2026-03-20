@@ -695,6 +695,12 @@ def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: 
         "    'discoveries': [],\n"
         "    'blockers': [],\n"
         "    'validation': [],\n"
+        # Infer verdict for audit tasks from response text; default '' (pass) for non-audit
+        "    'verdict': 'rework_required' if any(m in summary.lower() for m in ('rework_required', 'verdict: fail', 'verdict: rework', '— fail', '- fail', ': fail\\n', 'audit verdict: fail')) else '',\n"
+        "    'requirements_assessment': '',\n"
+        "    'system_fit_assessment': '',\n"
+        "    'files_changed': [],\n"
+        "    'warnings': [],\n"
         "    'artifacts': [],\n"
         "    'claude_raw': claude_result,\n"
         "}\n"
