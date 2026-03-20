@@ -1880,13 +1880,10 @@ class CentralDispatcher:
                 if runtime_status == "done":
                     reconcile_conn = self._connect()
                     try:
-                        # Audit task with rework_required verdict: fail audit + propagate to parent
-                        is_audit_rework = (
-                            str(state.task.get("task_type") or "") == "audit"
-                            and result is not None
-                            and str(getattr(result, "verdict", "") or "") == "rework_required"
-                        )
-                        if is_audit_rework:
+                        is_audit_task = str(state.task.get("task_type") or "") == "audit"
+                        verdict = str(getattr(result, "verdict", "") or "") if result is not None else ""
+                        # Audit task with rework_required verdict: auto-requeue parent with findings
+                        if is_audit_task and verdict == "rework_required":
                             rework_snap = task_db.reconcile_audit_rework(
                                 reconcile_conn,
                                 audit_task_id=task_id,
@@ -1895,8 +1892,6 @@ class CentralDispatcher:
                             )
                             audit_meta = rework_snap.get("metadata") or {}
                             parent_id = audit_meta.get("parent_task_id") or "?"
-                            rework_count = (rework_snap.get("metadata") or {}).get("rework_count")
-                            # Fetch parent metadata for rework_count (it's on the parent, not audit)
                             try:
                                 parent_snap = task_db.fetch_task_snapshots(reconcile_conn, task_id=parent_id)
                                 rework_count = (parent_snap[0].get("metadata") or {}).get("rework_count", "?") if parent_snap else "?"
@@ -1907,6 +1902,26 @@ class CentralDispatcher:
                                 "INF",
                                 "central.dispatcher",
                                 f"worker_audit_rework task={task_id} run={state.run_id} parent={parent_id} rework_count={rework_count} parent_status={parent_status}",
+                            )
+                        # Audit task with accepted verdict: close audit + auto-close parent
+                        elif is_audit_task and verdict in {"accepted", "pass", "passed", "done", ""}:
+                            pass_snap = task_db.reconcile_audit_pass(
+                                reconcile_conn,
+                                audit_task_id=task_id,
+                                summary=notes or "audit verdict: accepted",
+                                actor_id="central.dispatcher",
+                            )
+                            audit_meta = pass_snap.get("metadata") or {}
+                            parent_id = audit_meta.get("parent_task_id") or "?"
+                            try:
+                                parent_snap = task_db.fetch_task_snapshots(reconcile_conn, task_id=parent_id)
+                                parent_status = parent_snap[0].get("planner_status", "?") if parent_snap else "?"
+                            except Exception:
+                                parent_status = "?"
+                            self.logger.emit(
+                                "INF",
+                                "central.dispatcher",
+                                f"worker_audit_pass task={task_id} run={state.run_id} parent={parent_id} parent_status={parent_status}",
                             )
                         else:
                             reconciled = task_db.auto_reconcile_runtime_success(

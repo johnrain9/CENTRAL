@@ -2718,6 +2718,109 @@ def reconcile_audit_rework(
     return fetch_task_snapshots(conn, task_id=audit_task_id)[0]
 
 
+def reconcile_audit_pass(
+    conn,
+    *,
+    audit_task_id: str,
+    summary: str,
+    actor_id: str,
+) -> dict[str, Any]:
+    """Handle audit verdict=accepted (or any non-rework verdict that closes the audit as done).
+
+    - Close the audit task as done.
+    - Close the parent task (awaiting_audit → done) and align its runtime_status.
+    Returns the audit task snapshot.
+    """
+    begin_immediate(conn)
+    audit_row = fetch_task_row(conn, audit_task_id)
+    if audit_row is None:
+        conn.rollback()
+        raise RuntimeError(f"audit task not found: {audit_task_id}")
+
+    audit_metadata = parse_json_text(audit_row["metadata_json"], default={})
+    parent_task_id = str(audit_metadata.get("parent_task_id") or "")
+    updated_at = now_iso()
+    audit_version = int(audit_row["version"])
+
+    # Close the audit as done
+    audit_metadata["closeout"] = {
+        "outcome": "done",
+        "summary": summary,
+        "notes": "audit verdict: accepted",
+        "reconciled_at": updated_at,
+        "actor_id": actor_id,
+    }
+    conn.execute(
+        """
+        UPDATE tasks
+        SET planner_status = 'done',
+            version = ?,
+            worker_owner = NULL,
+            updated_at = ?,
+            closed_at = ?,
+            metadata_json = ?
+        WHERE task_id = ? AND version = ?
+        """,
+        (audit_version + 1, updated_at, updated_at, compact_json(audit_metadata), audit_task_id, audit_version),
+    )
+    conn.execute(
+        "UPDATE task_runtime_state SET runtime_status = 'done', last_transition_at = ?, finished_at = COALESCE(finished_at, ?) WHERE task_id = ?",
+        (updated_at, updated_at, audit_task_id),
+    )
+    insert_event(
+        conn,
+        task_id=audit_task_id,
+        event_type="planner.task_reconciled",
+        actor_kind="runtime",
+        actor_id=actor_id,
+        payload={"outcome": "done", "summary": summary, "tests": None, "artifacts": []},
+    )
+
+    if not parent_task_id:
+        conn.commit()
+        return fetch_task_snapshots(conn, task_id=audit_task_id)[0]
+
+    parent_row = fetch_task_row(conn, parent_task_id)
+    if parent_row is None or str(parent_row["planner_status"]) != "awaiting_audit":
+        conn.commit()
+        return fetch_task_snapshots(conn, task_id=audit_task_id)[0]
+
+    parent_metadata = parse_json_text(parent_row["metadata_json"], default={})
+    parent_version = int(parent_row["version"])
+    parent_metadata["audit_verdict"] = "accepted"
+    parent_updated_at = now_iso()
+    conn.execute(
+        """
+        UPDATE tasks
+        SET planner_status = 'done',
+            version = ?,
+            worker_owner = NULL,
+            updated_at = ?,
+            closed_at = ?,
+            metadata_json = ?
+        WHERE task_id = ? AND version = ?
+        """,
+        (parent_version + 1, parent_updated_at, parent_updated_at, compact_json(parent_metadata), parent_task_id, parent_version),
+    )
+    conn.execute(
+        """UPDATE task_runtime_state
+           SET runtime_status = 'done', last_transition_at = ?, finished_at = COALESCE(finished_at, ?)
+           WHERE task_id = ? AND runtime_status NOT IN ('done', 'canceled')""",
+        (parent_updated_at, parent_updated_at, parent_task_id),
+    )
+    insert_event(
+        conn,
+        task_id=parent_task_id,
+        event_type="planner.task_closed_by_audit",
+        actor_kind="runtime",
+        actor_id=actor_id,
+        payload={"audit_task_id": audit_task_id, "summary": summary},
+    )
+
+    conn.commit()
+    return fetch_task_snapshots(conn, task_id=audit_task_id)[0]
+
+
 def summarize_portfolio(conn: sqlite3.Connection, *, initiative: str | None = None) -> dict[str, Any]:
     generated_at = now_iso()
     snapshots = fetch_task_snapshots(conn, initiative=initiative)
