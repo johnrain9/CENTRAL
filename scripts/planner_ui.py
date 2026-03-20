@@ -878,6 +878,7 @@ tr.selected td { background: #1a2540; }
               <th onclick="sortTable('tasks-table',5)">Planner Status <span class="sort-arrow">↕</span></th>
               <th onclick="sortTable('tasks-table',6)">Runtime <span class="sort-arrow">↕</span></th>
               <th onclick="sortTable('tasks-table',7)">Audit <span class="sort-arrow">↕</span></th>
+              <th onclick="sortTable('tasks-table',8)">Completed <span class="sort-arrow">↕</span></th>
             </tr>
           </thead>
           <tbody id="tasks-tbody"></tbody>
@@ -1207,6 +1208,7 @@ function buildTaskExplorer(d, allTasksFromApi) {
       runtime_status: t.runtime_status || '',
       initiative: t.initiative || '',
       audit_verdict: '',
+      closed_at: t.closed_at || null,
     }));
   } else {
     // Fallback: build from partial DATA sections
@@ -1266,10 +1268,26 @@ function applyFilters() {
   renderTasksTable(FILTER_TASKS);
 }
 
+function fmtClosedAt(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const now = new Date();
+  const diffMs = now - d;
+  const diffH = diffMs / 3600000;
+  if (diffH < 24) return fmtTime(d);           // same day: HH:MM
+  if (diffH < 24 * 7) return fmtDate(d);       // this week: Mon DD
+  return d.toISOString().slice(0, 10);          // older: YYYY-MM-DD
+}
+
+function fmtDate(d) {
+  return d.toLocaleDateString(undefined, {weekday:'short', month:'short', day:'numeric'});
+}
+
 function renderTasksTable(tasks) {
   const tbody = document.getElementById('tasks-tbody');
   if (!tasks.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No tasks match filters.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" class="empty-state">No tasks match filters.</td></tr>';
     return;
   }
   tbody.innerHTML = tasks.map(t => `
@@ -1282,6 +1300,7 @@ function renderTasksTable(tasks) {
       <td>${plannerStatusBadge(t.planner_status)}</td>
       <td>${runtimeStatusBadge(t.runtime_status)}</td>
       <td>${auditBadge(t.audit_verdict || t.audit_link)}</td>
+      <td style="color:var(--text-muted);white-space:nowrap" data-sort="${t.closed_at || ''}">${fmtClosedAt(t.closed_at)}</td>
     </tr>`).join('');
 }
 
@@ -1406,8 +1425,14 @@ function sortTable(tableId, colIndex) {
   sortStates[tableId] = {col: colIndex, asc};
 
   rows.sort((a, b) => {
-    const av = a.cells[colIndex]?.textContent.trim() || '';
-    const bv = b.cells[colIndex]?.textContent.trim() || '';
+    const cell_a = a.cells[colIndex];
+    const cell_b = b.cells[colIndex];
+    // Use data-sort attribute if present (e.g. raw ISO date), else textContent
+    const av = cell_a?.dataset.sort ?? cell_a?.textContent.trim() ?? '';
+    const bv = cell_b?.dataset.sort ?? cell_b?.textContent.trim() ?? '';
+    // Empty values always sort last
+    if (!av && bv) return 1;
+    if (av && !bv) return -1;
     return asc ? av.localeCompare(bv) : bv.localeCompare(av);
   });
 

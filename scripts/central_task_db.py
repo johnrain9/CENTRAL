@@ -4447,6 +4447,7 @@ def command_task_list(args: argparse.Namespace) -> int:
                 "worker_owner": snapshot["worker_owner"] or "",
                 "version": snapshot["version"],
                 "title": snapshot["title"],
+                "closed_at": snapshot.get("closed_at"),
             }
             for snapshot in snapshots
         ]
