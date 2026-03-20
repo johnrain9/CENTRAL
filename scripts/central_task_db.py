@@ -2515,6 +2515,9 @@ def auto_reconcile_runtime_success(
     return fetch_task_snapshots(conn, task_id=task_id)[0]
 
 
+MAX_REWORK_RETRIES = 3
+
+
 def reconcile_audit_rework(
     conn,
     *,
@@ -2522,7 +2525,16 @@ def reconcile_audit_rework(
     summary: str,
     actor_id: str,
 ):
-    """Fail an audit task (verdict=rework_required) and propagate failure to the parent task."""
+    """Handle audit verdict=rework_required.
+
+    If the parent task is within MAX_REWORK_RETRIES:
+      - Reset parent planner_status to todo and requeue runtime with audit
+        findings injected as rework_context so the next worker knows exactly
+        what to fix.
+      - Reset the audit task to todo so it re-runs after the rework lands.
+    If the limit is exceeded:
+      - Fail both tasks permanently and surface for operator attention.
+    """
     begin_immediate(conn)
     audit_row = fetch_task_row(conn, audit_task_id)
     if audit_row is None:
@@ -2534,14 +2546,14 @@ def reconcile_audit_rework(
     updated_at = now_iso()
     audit_version = int(audit_row["version"])
 
-    audit_closeout = {
+    # Always close out the audit task as failed (verdict was rework_required)
+    audit_metadata["closeout"] = {
         "outcome": "failed",
         "summary": summary,
         "notes": "audit verdict: rework_required",
         "reconciled_at": updated_at,
         "actor_id": actor_id,
     }
-    audit_metadata["closeout"] = audit_closeout
     conn.execute(
         """
         UPDATE tasks
@@ -2554,6 +2566,11 @@ def reconcile_audit_rework(
         """,
         (audit_version + 1, updated_at, compact_json(audit_metadata), audit_task_id, audit_version),
     )
+    # Align runtime_status for the audit task
+    conn.execute(
+        "UPDATE task_runtime_state SET runtime_status = 'done', last_transition_at = ?, finished_at = COALESCE(finished_at, ?) WHERE task_id = ?",
+        (updated_at, updated_at, audit_task_id),
+    )
     insert_event(
         conn,
         task_id=audit_task_id,
@@ -2563,32 +2580,108 @@ def reconcile_audit_rework(
         payload={"outcome": "failed", "summary": summary, "tests": None, "artifacts": []},
     )
 
-    if parent_task_id:
-        parent_row = fetch_task_row(conn, parent_task_id)
-        if parent_row is not None:
-            parent_metadata = parse_json_text(parent_row["metadata_json"], default={})
-            parent_metadata["audit_verdict"] = "failed"
-            parent_version = int(parent_row["version"])
-            parent_updated_at = now_iso()
-            conn.execute(
-                """
-                UPDATE tasks
-                SET planner_status = 'failed',
-                    version = ?,
-                    updated_at = ?,
-                    metadata_json = ?
-                WHERE task_id = ? AND version = ?
-                """,
-                (parent_version + 1, parent_updated_at, compact_json(parent_metadata), parent_task_id, parent_version),
-            )
-            insert_event(
-                conn,
-                task_id=parent_task_id,
-                event_type="planner.task_failed_by_audit",
-                actor_kind="runtime",
-                actor_id=actor_id,
-                payload={"audit_task_id": audit_task_id, "summary": summary},
-            )
+    if not parent_task_id:
+        conn.commit()
+        return fetch_task_snapshots(conn, task_id=audit_task_id)[0]
+
+    parent_row = fetch_task_row(conn, parent_task_id)
+    if parent_row is None:
+        conn.commit()
+        return fetch_task_snapshots(conn, task_id=audit_task_id)[0]
+
+    parent_metadata = parse_json_text(parent_row["metadata_json"], default={})
+    parent_version = int(parent_row["version"])
+    rework_count = int(parent_metadata.get("rework_count") or 0) + 1
+    parent_updated_at = now_iso()
+
+    if rework_count > MAX_REWORK_RETRIES:
+        # Limit exceeded — fail permanently for operator attention
+        parent_metadata["audit_verdict"] = "failed"
+        parent_metadata["rework_count"] = rework_count
+        conn.execute(
+            """
+            UPDATE tasks
+            SET planner_status = 'failed',
+                version = ?,
+                updated_at = ?,
+                metadata_json = ?
+            WHERE task_id = ? AND version = ?
+            """,
+            (parent_version + 1, parent_updated_at, compact_json(parent_metadata), parent_task_id, parent_version),
+        )
+        insert_event(
+            conn,
+            task_id=parent_task_id,
+            event_type="planner.task_failed_by_audit",
+            actor_kind="runtime",
+            actor_id=actor_id,
+            payload={"audit_task_id": audit_task_id, "summary": summary,
+                     "rework_count": rework_count, "max_rework_retries": MAX_REWORK_RETRIES},
+        )
+        conn.commit()
+        return fetch_task_snapshots(conn, task_id=audit_task_id)[0]
+
+    # Within limit — auto-requeue parent with audit findings as rework context
+    parent_metadata["audit_verdict"] = "rework_required"
+    parent_metadata["rework_count"] = rework_count
+    parent_metadata["rework_context"] = summary  # injected into worker prompt
+    conn.execute(
+        """
+        UPDATE tasks
+        SET planner_status = 'todo',
+            version = ?,
+            worker_owner = NULL,
+            updated_at = ?,
+            metadata_json = ?
+        WHERE task_id = ? AND version = ?
+        """,
+        (parent_version + 1, parent_updated_at, compact_json(parent_metadata), parent_task_id, parent_version),
+    )
+    insert_event(
+        conn,
+        task_id=parent_task_id,
+        event_type="planner.task_auto_rework",
+        actor_kind="runtime",
+        actor_id=actor_id,
+        payload={"audit_task_id": audit_task_id, "rework_count": rework_count,
+                 "max_rework_retries": MAX_REWORK_RETRIES, "summary": summary},
+    )
+    # Requeue parent runtime (reset retry count for fresh attempt)
+    runtime_requeue_task(
+        conn,
+        task_id=parent_task_id,
+        actor_id=actor_id,
+        reason=f"auto-rework #{rework_count}: {summary[:300]}",
+        reset_retry_count=True,
+    )
+
+    # Reset audit task to todo so it re-runs after the rework lands
+    audit_reopen_version = int(fetch_task_row(conn, audit_task_id)["version"])
+    audit_metadata_reopen = parse_json_text(fetch_task_row(conn, audit_task_id)["metadata_json"], default={})
+    audit_metadata_reopen.pop("closeout", None)
+    conn.execute(
+        """
+        UPDATE tasks
+        SET planner_status = 'todo',
+            worker_owner = NULL,
+            updated_at = ?,
+            metadata_json = ?
+        WHERE task_id = ? AND version = ?
+        """,
+        (parent_updated_at, compact_json(audit_metadata_reopen), audit_task_id, audit_reopen_version),
+    )
+    conn.execute(
+        "UPDATE task_runtime_state SET runtime_status = 'queued', last_transition_at = ?, finished_at = NULL, last_runtime_error = NULL, retry_count = 0 WHERE task_id = ?",
+        (parent_updated_at, audit_task_id),
+    )
+    insert_event(
+        conn,
+        task_id=audit_task_id,
+        event_type="planner.audit_reset_for_rework",
+        actor_kind="runtime",
+        actor_id=actor_id,
+        payload={"rework_count": rework_count, "parent_task_id": parent_task_id},
+    )
 
     conn.commit()
     return fetch_task_snapshots(conn, task_id=audit_task_id)[0]

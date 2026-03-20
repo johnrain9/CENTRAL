@@ -108,6 +108,7 @@ class DispatcherConfig:
     default_worker_model: str | None = None
     default_codex_model: str = DEFAULT_CODEX_MODEL
     max_retries: int = 5
+    notify: bool = False
 
     def __post_init__(self) -> None:
         # Unify: if only one is set, sync them
@@ -599,7 +600,17 @@ def build_worker_task(snapshot: dict[str, Any], dispatcher_default_codex_model: 
     validation_commands = [item for item in validation_commands if item]
     deliverables = [item for item in deliverables if item]
     scope_notes = [item for item in scope_notes if item]
-    prompt_sections = [
+    rework_context = str(metadata.get("rework_context") or "").strip()
+    rework_count = int(metadata.get("rework_count") or 0)
+    prompt_sections = []
+    if rework_context:
+        prompt_sections.append(
+            f"## REWORK (attempt {rework_count})\n"
+            f"A previous attempt failed audit. Fix **only** the specific issues listed below.\n"
+            f"Do not explore unrelated code or documents. Make targeted changes only.\n\n"
+            f"{rework_context}"
+        )
+    prompt_sections += [
         f"## Objective\n{snapshot.get('objective_md', '').strip()}",
         f"## Context\n{snapshot.get('context_md', '').strip()}",
         f"## Scope\n{snapshot.get('scope_md', '').strip()}",
@@ -1728,6 +1739,26 @@ class CentralDispatcher:
         except Exception:
             return False
 
+    def _maybe_notify(self, *, title: str, runtime_status: str, summary: str | None = None) -> None:
+        if not self.config.notify:
+            return
+        import subprocess
+        if runtime_status in {"done", "pending_review"}:
+            notif_title = f"\u2705 {title}"
+            sound = "Glass"
+        elif runtime_status == "timeout":
+            notif_title = f"\u23f1 {title}"
+            sound = "Basso"
+        else:
+            notif_title = f"\u274c {title}"
+            sound = "Basso"
+        body = (summary or runtime_status)[:100].replace('"', '\\"')
+        notif_title = notif_title.replace('"', '\\"')
+        subprocess.run(
+            ["osascript", "-e", f'display notification "{body}" with title "{notif_title}" sound name "{sound}"'],
+            check=False,
+        )
+
     def _finalize_worker(self, state: ActiveWorker, *, timed_out: bool = False, interrupted_by_restart: bool = False) -> None:
         task_id = state.task["task_id"]
         terminal_artifacts = [str(state.prompt_path), str(state.log_path)]
@@ -1746,6 +1777,7 @@ class CentralDispatcher:
                         actor_id="central.dispatcher",
                     )
                 self.logger.emit("INF", "central.dispatcher", f"worker_timeout task={task_id} run={state.run_id}")
+                self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status="timeout", summary="hard timeout exceeded")
                 return
 
             runtime_status = "failed"
@@ -1844,6 +1876,7 @@ class CentralDispatcher:
                         artifacts=result_artifacts,
                         actor_id="central.dispatcher",
                     )
+                self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status=runtime_status, summary=notes or error_text)
                 if runtime_status == "done":
                     reconcile_conn = self._connect()
                     try:
@@ -1854,16 +1887,26 @@ class CentralDispatcher:
                             and str(getattr(result, "verdict", "") or "") == "rework_required"
                         )
                         if is_audit_rework:
-                            task_db.reconcile_audit_rework(
+                            rework_snap = task_db.reconcile_audit_rework(
                                 reconcile_conn,
                                 audit_task_id=task_id,
                                 summary=notes or "audit verdict: rework_required",
                                 actor_id="central.dispatcher",
                             )
+                            audit_meta = rework_snap.get("metadata") or {}
+                            parent_id = audit_meta.get("parent_task_id") or "?"
+                            rework_count = (rework_snap.get("metadata") or {}).get("rework_count")
+                            # Fetch parent metadata for rework_count (it's on the parent, not audit)
+                            try:
+                                parent_snap = task_db.fetch_task_snapshots(reconcile_conn, task_id=parent_id)
+                                rework_count = (parent_snap[0].get("metadata") or {}).get("rework_count", "?") if parent_snap else "?"
+                                parent_status = parent_snap[0].get("planner_status", "?") if parent_snap else "?"
+                            except Exception:
+                                rework_count, parent_status = "?", "?"
                             self.logger.emit(
                                 "INF",
                                 "central.dispatcher",
-                                f"worker_audit_rework task={task_id} run={state.run_id}",
+                                f"worker_audit_rework task={task_id} run={state.run_id} parent={parent_id} rework_count={rework_count} parent_status={parent_status}",
                             )
                         else:
                             reconciled = task_db.auto_reconcile_runtime_success(
@@ -2409,6 +2452,7 @@ def build_dispatcher_config(args: argparse.Namespace) -> DispatcherConfig:
             args.worker_mode,
             getattr(args, "default_worker_model", None) or getattr(args, "default_codex_model", None),
         ),
+        notify=getattr(args, "notify", False),
     )
 
 
@@ -2558,6 +2602,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--worker-mode", choices=["codex", "claude", "stub"], default=os.environ.get("CENTRAL_WORKER_MODE", "codex"))
         sub.add_argument("--default-codex-model")
         sub.add_argument("--default-worker-model", "--worker-model")
+        sub.add_argument("--notify", action="store_true", default=False)
         sub.set_defaults(func=func)
 
     self_check_parser = subparsers.add_parser("self-check", help="Run a stub-mode CENTRAL runtime smoke check")
