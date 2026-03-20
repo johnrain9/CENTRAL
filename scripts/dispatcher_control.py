@@ -507,19 +507,29 @@ def should_colorize() -> bool:
     return sys.stdout.isatty()
 
 
+_LEVEL_COLORS = {
+    "INF": "\033[32m",   # green
+    "WRN": "\033[33m",   # yellow
+    "ERR": "\033[31m",   # red
+    "DBG": "\033[36m",   # cyan
+}
+_RESET = "\033[0m"
+_DIM = "\033[2m"
+_BOLD = "\033[1m"
+
+
 def colorize_log_line(line: str) -> str:
     if not should_colorize():
         return line
     match = LOG_LEVEL_RE.match(line)
     if not match:
         return line
-    return central_runtime.format_log_console_line(
-        match.group("ts"),
-        match.group("level"),
-        match.group("component"),
-        match.group("message"),
-        use_color=True,
-    )
+    ts = match.group("ts")
+    level = match.group("level")
+    component = match.group("component")
+    message = match.group("message")
+    color = _LEVEL_COLORS.get(level, "")
+    return f"{_DIM}{ts}{_RESET} {color}{_BOLD}{level}{_RESET} {_DIM}[{component}]{_RESET} {message}"
 
 
 def stream_colored_logs(path: Path, *, lines: int = 120) -> int:
