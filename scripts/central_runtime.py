@@ -1380,6 +1380,13 @@ class CentralDispatcher:
             ).fetchall()
             active_leases = int(conn.execute("SELECT COUNT(*) AS c FROM task_active_leases").fetchone()["c"])
             counts = {str(row["runtime_status"]): int(row["c"]) for row in runtime_summary}
+            # actionable_failed: only tasks still open from the planner's perspective
+            actionable_failed = int(conn.execute(
+                "SELECT COUNT(*) AS c FROM task_runtime_state trs"
+                " JOIN tasks t ON t.task_id = trs.task_id"
+                " WHERE trs.runtime_status = 'failed'"
+                " AND t.planner_status NOT IN ('done', 'cancelled')"
+            ).fetchone()["c"])
             mismatch_count = sum(1 for snapshot in snapshots if snapshot.get("status_mismatch"))
         finally:
             conn.close()
@@ -1387,6 +1394,7 @@ class CentralDispatcher:
             "eligible_count": len(eligible),
             "next_eligible_task_id": eligible[0]["task_id"] if eligible else None,
             "runtime_counts": counts,
+            "actionable_failed": actionable_failed,
             "active_leases": active_leases,
             "mismatch_count": mismatch_count,
         }
@@ -1422,7 +1430,7 @@ class CentralDispatcher:
                 f"leases={snapshot['active_leases']} "
                 f"parked={snapshot['runtime_counts'].get('parked', 0)} "
                 f"review={snapshot['runtime_counts'].get('pending_review', 0)} "
-                f"failed={snapshot['runtime_counts'].get('failed', 0)} "
+                f"failed={snapshot['actionable_failed']} "
                 f"mismatch={snapshot['mismatch_count']}"
             ),
         )
