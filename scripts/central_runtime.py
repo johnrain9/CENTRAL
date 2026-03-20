@@ -1465,6 +1465,8 @@ class CentralDispatcher:
         snapshot = self._dispatcher_snapshot()
         active_ids = sorted(self._active)
         idle_slots = max(0, self.config.max_workers - len(active_ids))
+        backoff_remaining = max(0.0, self._capacity_backoff_until - time.monotonic())
+        backoff_str = f" quota_backoff={backoff_remaining:.0f}s" if backoff_remaining > 0 else ""
         self.logger.emit(
             "INF",
             "central.dispatcher",
@@ -1481,8 +1483,24 @@ class CentralDispatcher:
                 f"review={snapshot['runtime_counts'].get('pending_review', 0)} "
                 f"failed={snapshot['actionable_failed']} "
                 f"mismatch={snapshot['mismatch_count']}"
+                f"{backoff_str}"
             ),
         )
+        # Notify if dispatcher is fully stalled: backoff active, no running workers, tasks waiting
+        if (
+            backoff_remaining > 0
+            and len(active_ids) == 0
+            and snapshot["eligible_count"] > 0
+            and not getattr(self, "_quota_stall_notified", False)
+        ):
+            self._quota_stall_notified = True
+            self._maybe_notify(
+                title="⚠️ Dispatcher stalled — quota limit",
+                runtime_status="failed",
+                summary=f"{snapshot['eligible_count']} tasks waiting, no workers running. Switch backend or wait {backoff_remaining:.0f}s.",
+            )
+        elif backoff_remaining == 0:
+            self._quota_stall_notified = False
         self._last_status_heartbeat_monotonic = now
 
     def _claim_next(self) -> dict[str, Any] | None:
@@ -1729,6 +1747,15 @@ class CentralDispatcher:
         )
 
     _CODEX_USAGE_LIMIT_MARKER = "you've hit your usage limit"
+    _CLAUDE_QUOTA_MARKERS = (
+        "rate limit exceeded",
+        "rate_limit_error",
+        "too many requests",
+        "overloaded_error",
+        "529",  # Anthropic overload status
+        "quota exceeded",
+        "usage limit",
+    )
 
     @staticmethod
     def _detect_codex_capacity_hit(log_path: Any) -> bool:
@@ -1736,6 +1763,15 @@ class CentralDispatcher:
         try:
             text = Path(log_path).read_text(encoding="utf-8", errors="replace").lower()
             return CentralDispatcher._CODEX_USAGE_LIMIT_MARKER in text
+        except Exception:
+            return False
+
+    @staticmethod
+    def _detect_claude_capacity_hit(log_path: Any) -> bool:
+        """Return True if the claude log file contains a rate-limit or quota signal."""
+        try:
+            text = Path(log_path).read_text(encoding="utf-8", errors="replace").lower()
+            return any(m in text for m in CentralDispatcher._CLAUDE_QUOTA_MARKERS)
         except Exception:
             return False
 
@@ -1835,34 +1871,39 @@ class CentralDispatcher:
                     error_text = "worker_crashed"
                     notes = "worker process not found; presumed crashed before result emission"
 
-            # Detect codex capacity limit: requeue instead of failing
-            if (
+            # Detect capacity/quota limits: requeue instead of failing, notify operator
+            backend = str(getattr(state, "selected_worker_backend", None) or "")
+            _quota_hit = (
                 runtime_status == "failed"
-                and getattr(state, "selected_worker_backend", None) == "codex"
-                and self._detect_codex_capacity_hit(state.log_path)
-            ):
+                and (
+                    (backend == "codex" and self._detect_codex_capacity_hit(state.log_path))
+                    or (backend == "claude" and self._detect_claude_capacity_hit(state.log_path))
+                )
+            )
+            if _quota_hit:
                 requeue_conn = self._connect()
                 try:
                     task_db.runtime_requeue_task(
                         requeue_conn,
                         task_id=task_id,
                         actor_id="central.dispatcher",
-                        reason="codex usage limit reached; requeueing for later dispatch",
+                        reason=f"{backend} usage limit reached; requeueing for later dispatch",
                         reset_retry_count=True,
                     )
                 finally:
                     requeue_conn.close()
                 backoff_seconds = 300
                 self._capacity_backoff_until = time.monotonic() + backoff_seconds
+                task_title = str(state.task.get("title") or task_id)
                 self.logger.emit(
-                    "INF",
+                    "WRN",
                     "central.dispatcher",
-                    f"worker_capacity_requeued task={task_id} run={state.run_id} backend=codex",
+                    f"worker_quota_hit task={task_id} run={state.run_id} backend={backend} backoff_seconds={backoff_seconds}",
                 )
-                self.logger.emit(
-                    "INF",
-                    "central.dispatcher",
-                    f"dispatcher_capacity_backoff backend=codex backoff_seconds={backoff_seconds}",
+                self._maybe_notify(
+                    title=f"Quota limit hit — {backend}",
+                    runtime_status="failed",
+                    summary=f"{task_title} requeued; dispatcher backing off {backoff_seconds}s. Switch worker backend if persistent.",
                 )
             else:
                 with conn:
