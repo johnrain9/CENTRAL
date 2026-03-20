@@ -2566,11 +2566,6 @@ def reconcile_audit_rework(
         """,
         (audit_version + 1, updated_at, compact_json(audit_metadata), audit_task_id, audit_version),
     )
-    # Align runtime_status for the audit task
-    conn.execute(
-        "UPDATE task_runtime_state SET runtime_status = 'done', last_transition_at = ?, finished_at = COALESCE(finished_at, ?) WHERE task_id = ?",
-        (updated_at, updated_at, audit_task_id),
-    )
     insert_event(
         conn,
         task_id=audit_task_id,
@@ -2596,6 +2591,11 @@ def reconcile_audit_rework(
 
     if rework_count > MAX_REWORK_RETRIES:
         # Limit exceeded — fail permanently for operator attention
+        # Align audit runtime to done (it's truly closed)
+        conn.execute(
+            "UPDATE task_runtime_state SET runtime_status = 'done', last_transition_at = ?, finished_at = COALESCE(finished_at, ?) WHERE task_id = ?",
+            (updated_at, updated_at, audit_task_id),
+        )
         parent_metadata["audit_verdict"] = "failed"
         parent_metadata["rework_count"] = rework_count
         conn.execute(
