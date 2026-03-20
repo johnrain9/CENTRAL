@@ -2646,13 +2646,44 @@ def reconcile_audit_rework(
         payload={"audit_task_id": audit_task_id, "rework_count": rework_count,
                  "max_rework_retries": MAX_REWORK_RETRIES, "summary": summary},
     )
-    # Requeue parent runtime (reset retry count for fresh attempt)
-    runtime_requeue_task(
+    # Requeue parent runtime (reset retry count for fresh attempt).
+    # Inline the requeue here — we're already inside BEGIN IMMEDIATE so we
+    # cannot call runtime_requeue_task (which would issue its own BEGIN).
+    # Use INSERT OR IGNORE to create the runtime state row if it doesn't exist
+    # (e.g. parent was never claimed through the normal dispatch path).
+    _requeue_at = now_iso()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO task_runtime_state
+            (task_id, runtime_status, last_transition_at, retry_count, runtime_metadata_json)
+        VALUES (?, 'queued', ?, 0, '{}')
+        """,
+        (parent_task_id, _requeue_at),
+    )
+    conn.execute(
+        """
+        UPDATE task_runtime_state
+        SET runtime_status = 'queued',
+            last_runtime_error = NULL,
+            finished_at = NULL,
+            pending_review_at = NULL,
+            retry_count = 0,
+            last_transition_at = ?
+        WHERE task_id = ?
+        """,
+        (_requeue_at, parent_task_id),
+    )
+    insert_event(
         conn,
         task_id=parent_task_id,
+        event_type="runtime.requeued",
+        actor_kind="runtime",
         actor_id=actor_id,
-        reason=f"auto-rework #{rework_count}: {summary[:300]}",
-        reset_retry_count=True,
+        payload={
+            "summary": f"auto-rework #{rework_count}: {summary[:300]}",
+            "had_active_lease": False,
+            "reset_retry_count": True,
+        },
     )
 
     # Reset audit task to todo so it re-runs after the rework lands

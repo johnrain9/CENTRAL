@@ -340,10 +340,10 @@ class CentralRuntimeReconcileTest(unittest.TestCase):
         self.assertNotIn("worker_auto_reconcile_failed", log_text)
         self.assertIn("worker_auto_reconcile_skipped", log_text)
 
-    def test_audit_verdict_rework_required_fails_audit_and_parent(self) -> None:
-        task_id = "CENTRAL-OPS-9338"
+    def _setup_parent_and_audit(self, task_id: str, *, rework_count: int = 0) -> str:
+        """Create a parent+audit task pair with parent in awaiting_audit. Returns audit_task_id."""
         payload = task_payload(task_id)
-        payload["metadata"] = {"test_case": task_id, "audit_required": True}
+        payload["metadata"] = {"test_case": task_id, "audit_required": True, "rework_count": rework_count}
         conn = task_db.connect(self.db_path)
         try:
             with conn:
@@ -363,13 +363,17 @@ class CentralRuntimeReconcileTest(unittest.TestCase):
                 )
         finally:
             conn.close()
+        return f"{task_id}-AUDIT"
 
-        audit_task_id = f"{task_id}-AUDIT"
+    def test_audit_rework_auto_requeues_parent(self) -> None:
+        """First rework_required: parent reset to todo+queued with rework context, audit reset to todo+queued."""
+        task_id = "CENTRAL-OPS-9338"
+        audit_task_id = self._setup_parent_and_audit(task_id)
         audit_payload = self._worker_result_payload(
             task_id=audit_task_id,
             run_id="run-audit",
             verdict="rework_required",
-            summary="audit found unmet requirement",
+            summary="execute_turn_with_deps is never called; stub still runs",
         )
         dispatcher, state = self._prepare_worker_state(audit_task_id, "run-audit", audit_payload)
 
@@ -378,11 +382,142 @@ class CentralRuntimeReconcileTest(unittest.TestCase):
 
         audit_snapshot = self.fetch_snapshot(audit_task_id)
         parent_snapshot = self.fetch_snapshot(task_id)
-        self.assertEqual(audit_snapshot["runtime"]["runtime_status"], "done")
-        self.assertEqual(audit_snapshot["planner_status"], "failed")
+
+        # Audit reset to todo+queued so it re-runs after the rework lands
+        self.assertEqual(audit_snapshot["planner_status"], "todo")
+        self.assertEqual(audit_snapshot["runtime"]["runtime_status"], "queued")
+
+        # Parent auto-requeued (not permanently failed)
+        self.assertEqual(parent_snapshot["planner_status"], "todo")
+        self.assertEqual(parent_snapshot["runtime"]["runtime_status"], "queued")
+        self.assertEqual(parent_snapshot["runtime"]["retry_count"], 0)
+        self.assertIsNone(parent_snapshot["lease"])
+
+        # Rework metadata injected
+        meta = parent_snapshot["metadata"]
+        self.assertEqual(meta.get("rework_count"), 1)
+        self.assertEqual(meta.get("audit_verdict"), "rework_required")
+        self.assertIn("execute_turn_with_deps", meta.get("rework_context", ""))
+
+        # Events recorded
+        self.assertIn("planner.task_auto_rework", self.fetch_events(task_id))
+        self.assertIn("runtime.requeued", self.fetch_events(task_id))
+        self.assertIn("planner.audit_reset_for_rework", self.fetch_events(audit_task_id))
+
+        # Log line emitted
+        log_text = dispatcher.paths.log_path.read_text(encoding="utf-8")
+        self.assertIn("worker_audit_rework", log_text)
+        self.assertIn("rework_count=1", log_text)
+
+    def test_audit_rework_prompt_includes_rework_section(self) -> None:
+        """build_worker_task prepends a REWORK section when rework_context is in metadata."""
+        snapshot = {
+            "task_id": "CENTRAL-OPS-9341",
+            "title": "test rework prompt",
+            "objective_md": "do a thing",
+            "context_md": "some context",
+            "scope_md": "narrow scope",
+            "deliverables_md": "- deliver x",
+            "acceptance_md": "- x works",
+            "testing_md": "- run tests",
+            "dispatch_md": "dispatch instructions",
+            "closeout_md": "closeout",
+            "reconciliation_md": "reconcile",
+            "task_type": "implementation",
+            "target_repo_root": str(REPO_ROOT),
+            "target_repo_id": "CENTRAL",
+            "execution": {"task_kind": "mutating", "sandbox_mode": "workspace-write",
+                          "approval_policy": "never", "additional_writable_dirs": [], "metadata": {}},
+            "metadata": {
+                "rework_count": 2,
+                "rework_context": "execute_turn_with_deps is never called; stub still runs in state.rs:180",
+            },
+            "dependencies": [],
+        }
+        worker_task = central_runtime.build_worker_task(snapshot, "gpt-5-codex", worker_mode="codex")
+        prompt = worker_task["prompt_body"]
+
+        self.assertTrue(prompt.startswith("## REWORK"), f"prompt should start with REWORK section, got: {prompt[:80]!r}")
+        self.assertIn("attempt 2", prompt)
+        self.assertIn("execute_turn_with_deps", prompt)
+        self.assertIn("targeted changes only", prompt)
+        # Original sections still present after the rework header
+        self.assertIn("## Objective", prompt)
+        self.assertIn("do a thing", prompt)
+
+    def test_audit_rework_no_rework_section_on_first_attempt(self) -> None:
+        """build_worker_task omits REWORK section when no rework_context in metadata."""
+        snapshot = {
+            "task_id": "CENTRAL-OPS-9342",
+            "title": "test fresh prompt",
+            "objective_md": "do a thing",
+            "context_md": "", "scope_md": "", "deliverables_md": "",
+            "acceptance_md": "", "testing_md": "", "dispatch_md": "",
+            "closeout_md": "", "reconciliation_md": "",
+            "task_type": "implementation",
+            "target_repo_root": str(REPO_ROOT),
+            "target_repo_id": "CENTRAL",
+            "execution": {"task_kind": "mutating", "sandbox_mode": "workspace-write",
+                          "approval_policy": "never", "additional_writable_dirs": [], "metadata": {}},
+            "metadata": {},
+            "dependencies": [],
+        }
+        worker_task = central_runtime.build_worker_task(snapshot, "gpt-5-codex", worker_mode="codex")
+        self.assertNotIn("REWORK", worker_task["prompt_body"])
+
+    def test_audit_rework_fails_permanently_at_limit(self) -> None:
+        """After MAX_REWORK_RETRIES reworks the parent fails permanently."""
+        task_id = "CENTRAL-OPS-9343"
+        audit_task_id = self._setup_parent_and_audit(task_id, rework_count=task_db.MAX_REWORK_RETRIES)
+        audit_payload = self._worker_result_payload(
+            task_id=audit_task_id,
+            run_id="run-audit-final",
+            verdict="rework_required",
+            summary="still broken after max retries",
+        )
+        dispatcher, state = self._prepare_worker_state(audit_task_id, "run-audit-final", audit_payload)
+
+        with mock.patch.object(central_runtime, "load_autonomy_runner", return_value=FakeAutonomyRunner):
+            dispatcher._finalize_worker(state)
+
+        parent_snapshot = self.fetch_snapshot(task_id)
+        audit_snapshot = self.fetch_snapshot(audit_task_id)
+
+        # Both permanently failed — needs operator attention
         self.assertEqual(parent_snapshot["planner_status"], "failed")
-        self.assertEqual(parent_snapshot["metadata"].get("audit_verdict"), "failed")
-        self.assertIn("planner.task_reconciled", self.fetch_events(audit_task_id))
+        self.assertEqual(audit_snapshot["planner_status"], "failed")
+
+        # Audit runtime is done (truly closed, not reset)
+        self.assertEqual(audit_snapshot["runtime"]["runtime_status"], "done")
+
+        # rework_count exceeds limit
+        self.assertGreater(parent_snapshot["metadata"].get("rework_count", 0), task_db.MAX_REWORK_RETRIES)
+
+        # No auto-requeue event on parent
+        parent_events = self.fetch_events(task_id)
+        self.assertNotIn("planner.task_auto_rework", parent_events)
+        self.assertIn("planner.task_failed_by_audit", parent_events)
+
+    def test_audit_rework_increments_count_each_cycle(self) -> None:
+        """Second rework_required increments rework_count from 1 to 2, parent stays auto-requeued."""
+        task_id = "CENTRAL-OPS-9344"
+        audit_task_id = self._setup_parent_and_audit(task_id, rework_count=1)
+        audit_payload = self._worker_result_payload(
+            task_id=audit_task_id,
+            run_id="run-audit-2",
+            verdict="rework_required",
+            summary="still not wired correctly",
+        )
+        dispatcher, state = self._prepare_worker_state(audit_task_id, "run-audit-2", audit_payload)
+
+        with mock.patch.object(central_runtime, "load_autonomy_runner", return_value=FakeAutonomyRunner):
+            dispatcher._finalize_worker(state)
+
+        parent_snapshot = self.fetch_snapshot(task_id)
+        self.assertEqual(parent_snapshot["planner_status"], "todo")
+        self.assertEqual(parent_snapshot["metadata"].get("rework_count"), 2)
+        log_text = dispatcher.paths.log_path.read_text(encoding="utf-8")
+        self.assertIn("rework_count=2", log_text)
 
     def test_auto_reconcile_failure_is_logged_and_surfaced(self) -> None:
         task_id = "CENTRAL-OPS-9332"
