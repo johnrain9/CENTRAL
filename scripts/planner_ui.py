@@ -262,6 +262,14 @@ def api_data():
     return jsonify(payload)
 
 
+@app.route("/api/tasks")
+def api_tasks():
+    data, err = _db("task-list", "--json")
+    if err:
+        return jsonify({"error": err}), 500
+    return jsonify(data)
+
+
 @app.route("/api/task/<task_id>")
 def api_task(task_id: str):
     data, err = _db("task-show", "--task-id", task_id, "--json")
@@ -943,11 +951,14 @@ async function fetchData() {
 
 async function fetchTaskList() {
   try {
-    const resp = await fetch('/api/data'); // we already have it in DATA
-    // reuse DATA for recent_changes tasks; for full list we'd need another endpoint
-    // For now, populate from what we have: actionable + attention + awaiting_audit + recent_changes
-    buildTaskExplorer(DATA);
-  } catch(e) {}
+    const resp = await fetch('/api/tasks');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const tasks = await resp.json();
+    buildTaskExplorer(DATA, tasks);
+  } catch(e) {
+    // fallback: populate from partial data already in DATA
+    buildTaskExplorer(DATA, null);
+  }
 }
 
 function scheduleRefresh() {
@@ -1181,32 +1192,40 @@ function renderChanges(changes) {
 }
 
 // ─── Task Explorer ────────────────────────────────────────────────────────────
-function buildTaskExplorer(d) {
-  // Build a deduplicated flat list from all sections
-  const seen = new Set();
-  const tasks = [];
+function buildTaskExplorer(d, allTasksFromApi) {
+  let tasks;
 
-  const addTask = (t) => {
-    if (!t || !t.task_id || seen.has(t.task_id)) return;
-    seen.add(t.task_id);
-    tasks.push(t);
-  };
-
-  (d.workers.active || []).forEach(w => addTask({
-    task_id: w.task_id,
-    title: w.title,
-    repo: '',
-    task_type: '',
-    priority: '',
-    planner_status: 'todo',
-    runtime_status: w.runtime_status || 'running',
-    audit_verdict: '',
-  }));
-
-  [...(d.actionable.implementation || []), ...(d.actionable.audit || [])].forEach(addTask);
-  (d.needs_attention || []).forEach(addTask);
-  (d.awaiting_audit || []).forEach(t => addTask({...t, planner_status: 'awaiting_audit'}));
-  (d.recent_changes || []).forEach(addTask);
+  if (allTasksFromApi && allTasksFromApi.length) {
+    // Full list from /api/tasks — use directly
+    tasks = allTasksFromApi.map(t => ({
+      task_id: t.task_id,
+      title: t.title,
+      repo: t.repo || '',
+      task_type: t.task_id && t.task_id.endsWith('-AUDIT') ? 'audit' : 'implementation',
+      priority: t.priority || '',
+      planner_status: t.planner_status || '',
+      runtime_status: t.runtime_status || '',
+      initiative: t.initiative || '',
+      audit_verdict: '',
+    }));
+  } else {
+    // Fallback: build from partial DATA sections
+    const seen = new Set();
+    tasks = [];
+    const addTask = (t) => {
+      if (!t || !t.task_id || seen.has(t.task_id)) return;
+      seen.add(t.task_id);
+      tasks.push(t);
+    };
+    (d.workers.active || []).forEach(w => addTask({
+      task_id: w.task_id, title: w.title, repo: '', task_type: '',
+      priority: '', planner_status: 'todo', runtime_status: w.runtime_status || 'running', audit_verdict: '',
+    }));
+    [...(d.actionable.implementation || []), ...(d.actionable.audit || [])].forEach(addTask);
+    (d.needs_attention || []).forEach(addTask);
+    (d.awaiting_audit || []).forEach(t => addTask({...t, planner_status: 'awaiting_audit'}));
+    (d.recent_changes || []).forEach(addTask);
+  }
 
   ALL_TASKS = tasks;
 
