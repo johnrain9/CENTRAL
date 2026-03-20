@@ -1420,6 +1420,7 @@ class CentralDispatcher:
                 f"eligible={snapshot['eligible_count']} "
                 f"next={snapshot['next_eligible_task_id'] or '-'} "
                 f"leases={snapshot['active_leases']} "
+                f"parked={snapshot['runtime_counts'].get('parked', 0)} "
                 f"review={snapshot['runtime_counts'].get('pending_review', 0)} "
                 f"failed={snapshot['runtime_counts'].get('failed', 0)} "
                 f"mismatch={snapshot['mismatch_count']}"
