@@ -267,6 +267,14 @@ def api_task(task_id: str):
     data, err = _db("task-show", "--task-id", task_id, "--json")
     if err:
         return jsonify({"error": err}), 500
+    meta = data.get("metadata") or {}
+    data["audit"] = {
+        "relationship_kind": meta.get("relationship_kind"),
+        "parent_task_id": meta.get("parent_task_id"),
+        "child_audit_task_id": meta.get("child_audit_task_id"),
+        "audit_verdict": meta.get("audit_verdict"),
+        "audit_required": meta.get("audit_required"),
+    }
     return jsonify(data)
 
 

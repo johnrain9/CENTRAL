@@ -2223,6 +2223,10 @@ def worker_status_payload(
             "log": {
                 **log_info,
                 "growth": log_growth,
+                "signal": {
+                    "state": "growing" if isinstance(log_growth.get("bytes_since_last_inspection"), int) and log_growth["bytes_since_last_inspection"] > 0 else "flat",
+                    "stale": isinstance(log_info.get("age_seconds"), (int, float)) and log_info["age_seconds"] > 120,
+                },
             },
             "prompt": file_metadata(run_paths["prompt"], now=now),
             "result": file_metadata(run_paths["result"], now=now),
