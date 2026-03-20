@@ -14,7 +14,7 @@ update_payload="$tmpdir/update.json"
 restored_task_json="$tmpdir/restored-task.json"
 snapshot_list_json="$tmpdir/snapshot-list.json"
 
-cat >"$task_payload" <<'JSON'
+cat >"$task_payload" <<JSON
 {
   "task_id": "CENTRAL-OPS-9000",
   "title": "Durability smoke task",
@@ -34,10 +34,11 @@ cat >"$task_payload" <<'JSON'
   "planner_owner": "planner/coordinator",
   "worker_owner": null,
   "target_repo_id": "CENTRAL",
-  "target_repo_root": "/home/cobra/CENTRAL",
+  "target_repo_root": "$repo_root",
   "approval_required": false,
   "metadata": {
-    "test_case": "durability"
+    "test_case": "durability",
+    "audit_required": false
   },
   "execution": {
     "task_kind": "mutating",
@@ -62,7 +63,7 @@ cat >"$update_payload" <<'JSON'
 JSON
 
 python3 "$cli" init --db-path "$db_path" >/dev/null
-python3 "$cli" repo-upsert --db-path "$db_path" --repo-id CENTRAL --repo-root /home/cobra/CENTRAL --display-name CENTRAL >/dev/null
+python3 "$cli" repo-upsert --db-path "$db_path" --repo-id CENTRAL --repo-root "$repo_root" --display-name CENTRAL >/dev/null
 python3 "$cli" task-create --db-path "$db_path" --input "$task_payload" >/dev/null
 python3 "$cli" snapshot-create --db-path "$db_path" --durability-dir "$durability_dir" --snapshot-id baseline --note "baseline snapshot" >/dev/null
 python3 "$cli" task-update --db-path "$db_path" --task-id CENTRAL-OPS-9000 --expected-version 1 --input "$update_payload" >/dev/null

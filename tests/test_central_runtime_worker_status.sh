@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runtime_cli="$repo_root/scripts/central_runtime.py"
 db_cli="$repo_root/scripts/central_task_db.py"
+dispatcher_cli="$repo_root/scripts/dispatcher_control.py"
 tmpdir="$(mktemp -d)"
 runner_pid=""
 trap 'if [[ -n "$runner_pid" ]] && kill -0 "$runner_pid" 2>/dev/null; then kill "$runner_pid" 2>/dev/null || true; fi; rm -rf "$tmpdir"' EXIT
@@ -12,12 +13,17 @@ db_path="$tmpdir/state/central_tasks.db"
 state_dir="$tmpdir/runtime_state"
 idle_json="$tmpdir/idle.json"
 active_json="$tmpdir/active.json"
+active_growth_json="$tmpdir/active-growth.json"
+active_text="$tmpdir/active.txt"
+dispatcher_active_json="$tmpdir/dispatcher-active.json"
 recent_json="$tmpdir/recent.json"
 stuck_json="$tmpdir/stuck.json"
+stuck_text="$tmpdir/stuck.txt"
+dispatcher_stuck_json="$tmpdir/dispatcher-stuck.json"
 active_task_payload="$tmpdir/active-task.json"
 stuck_task_payload="$tmpdir/stuck-task.json"
 
-cat >"$active_task_payload" <<'JSON'
+cat >"$active_task_payload" <<JSON
 {
   "task_id": "CENTRAL-OPS-9100",
   "title": "Worker status active smoke",
@@ -37,10 +43,11 @@ cat >"$active_task_payload" <<'JSON'
   "planner_owner": "planner/coordinator",
   "worker_owner": null,
   "target_repo_id": "CENTRAL",
-  "target_repo_root": "/home/cobra/CENTRAL",
+  "target_repo_root": "$repo_root",
   "approval_required": false,
   "metadata": {
-    "test_case": "worker-status-active"
+    "test_case": "worker-status-active",
+    "audit_required": false
   },
   "execution": {
     "task_kind": "read_only",
@@ -57,7 +64,7 @@ cat >"$active_task_payload" <<'JSON'
 }
 JSON
 
-cat >"$stuck_task_payload" <<'JSON'
+cat >"$stuck_task_payload" <<JSON
 {
   "task_id": "CENTRAL-OPS-9101",
   "title": "Worker status stuck smoke",
@@ -77,10 +84,11 @@ cat >"$stuck_task_payload" <<'JSON'
   "planner_owner": "planner/coordinator",
   "worker_owner": null,
   "target_repo_id": "CENTRAL",
-  "target_repo_root": "/home/cobra/CENTRAL",
+  "target_repo_root": "$repo_root",
   "approval_required": false,
   "metadata": {
-    "test_case": "worker-status-stuck"
+    "test_case": "worker-status-stuck",
+    "audit_required": false
   },
   "execution": {
     "task_kind": "read_only",
@@ -95,7 +103,7 @@ cat >"$stuck_task_payload" <<'JSON'
 JSON
 
 python3 "$db_cli" init --db-path "$db_path" >/dev/null
-python3 "$db_cli" repo-upsert --db-path "$db_path" --repo-id CENTRAL --repo-root /home/cobra/CENTRAL --display-name CENTRAL >/dev/null
+python3 "$db_cli" repo-upsert --db-path "$db_path" --repo-id CENTRAL --repo-root "$repo_root" --display-name CENTRAL >/dev/null
 python3 "$runtime_cli" worker-status --db-path "$db_path" --state-dir "$state_dir" --json >"$idle_json"
 
 python3 "$db_cli" task-create --db-path "$db_path" --input "$active_task_payload" >/dev/null
@@ -129,6 +137,51 @@ PY
   fi
   sleep 0.2
 done
+
+growth_seen=0
+for _ in $(seq 1 20); do
+  python3 "$runtime_cli" worker-status \
+    --db-path "$db_path" \
+    --state-dir "$state_dir" \
+    --task-id CENTRAL-OPS-9100 \
+    --json >"$active_growth_json"
+  if python3 - "$active_growth_json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+worker = payload["active_workers"][0]
+growth = worker["log"]["growth"]["bytes_since_last_inspection"]
+signal = worker["log"]["signal"]["state"]
+raise SystemExit(0 if isinstance(growth, int) and growth > 0 and signal == "growing" else 1)
+PY
+  then
+    growth_seen=1
+    break
+  fi
+  sleep 0.2
+done
+
+if [[ "$growth_seen" -ne 1 ]]; then
+  echo "worker-status never observed log growth for CENTRAL-OPS-9100" >&2
+  exit 1
+fi
+
+python3 "$runtime_cli" worker-status \
+  --db-path "$db_path" \
+  --state-dir "$state_dir" \
+  --task-id CENTRAL-OPS-9100 \
+  --json >"$active_json"
+
+python3 "$runtime_cli" worker-status \
+  --db-path "$db_path" \
+  --state-dir "$state_dir" \
+  --task-id CENTRAL-OPS-9100 \
+  >"$active_text"
+
+CENTRAL_TASK_DB_PATH="$db_path" CENTRAL_RUNTIME_STATE_DIR="$state_dir" \
+  python3 "$dispatcher_cli" status >"$dispatcher_active_json"
 
 wait "$runner_pid"
 runner_pid=""
@@ -197,7 +250,16 @@ python3 "$runtime_cli" worker-status \
   --task-id CENTRAL-OPS-9101 \
   --json >"$stuck_json"
 
-python3 - "$idle_json" "$active_json" "$recent_json" "$stuck_json" <<'PY'
+python3 "$runtime_cli" worker-status \
+  --db-path "$db_path" \
+  --state-dir "$state_dir" \
+  --task-id CENTRAL-OPS-9101 \
+  >"$stuck_text"
+
+CENTRAL_TASK_DB_PATH="$db_path" CENTRAL_RUNTIME_STATE_DIR="$state_dir" \
+  python3 "$dispatcher_cli" status >"$dispatcher_stuck_json"
+
+python3 - "$idle_json" "$active_json" "$active_growth_json" "$recent_json" "$stuck_json" "$active_text" "$stuck_text" "$dispatcher_active_json" "$dispatcher_stuck_json" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -207,9 +269,17 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 with open(sys.argv[2], encoding="utf-8") as handle:
     active = json.load(handle)
 with open(sys.argv[3], encoding="utf-8") as handle:
-    recent = json.load(handle)
+    active_growth = json.load(handle)
 with open(sys.argv[4], encoding="utf-8") as handle:
+    recent = json.load(handle)
+with open(sys.argv[5], encoding="utf-8") as handle:
     stuck = json.load(handle)
+active_text = open(sys.argv[6], encoding="utf-8").read()
+stuck_text = open(sys.argv[7], encoding="utf-8").read()
+with open(sys.argv[8], encoding="utf-8") as handle:
+    dispatcher_active = json.load(handle)
+with open(sys.argv[9], encoding="utf-8") as handle:
+    dispatcher_stuck = json.load(handle)
 
 assert idle["summary"]["overall_status"] == "idle", idle
 assert idle["summary"]["active_count"] == 0, idle
@@ -225,7 +295,20 @@ assert active_worker["heartbeat"]["age_seconds"] is not None, active_worker
 assert active_worker["prompt"]["exists"] is True, active_worker
 assert Path(active_worker["result"]["path"]).suffix == ".json", active_worker
 assert ".worker-results" in Path(active_worker["result"]["path"]).parts, active_worker
+assert active_worker["log"]["exists"] is True, active_worker
+assert isinstance(active_worker["log"]["size_bytes"], int) and active_worker["log"]["size_bytes"] > 0, active_worker
+assert active_worker["log"]["signal"]["state"] in {"growing", "flat"}, active_worker
 assert active_worker["observed_state"] in {"healthy", "low_activity"}, active_worker
+growth_worker = active_growth["active_workers"][0]
+assert growth_worker["log"]["signal"]["state"] == "growing", growth_worker
+assert isinstance(growth_worker["log"]["growth"]["bytes_since_last_inspection"], int) and growth_worker["log"]["growth"]["bytes_since_last_inspection"] > 0, growth_worker
+assert "log_size=" in active_text, active_text
+assert "log_delta=" in active_text, active_text
+assert "log_signal=" in active_text, active_text
+dispatcher_active_worker = dispatcher_active["worker_status"]["active_workers"][0]
+assert dispatcher_active_worker["task_id"] == "CENTRAL-OPS-9100", dispatcher_active_worker
+assert dispatcher_active_worker["log"]["signal"]["state"] in {"growing", "flat"}, dispatcher_active_worker
+assert isinstance(dispatcher_active_worker["log"]["size_bytes"], int) and dispatcher_active_worker["log"]["size_bytes"] > 0, dispatcher_active_worker
 
 recent_worker = next(worker for worker in recent["recent_workers"] if worker["task_id"] == "CENTRAL-OPS-9100")
 assert recent["summary"]["active_count"] == 0, recent
@@ -243,6 +326,14 @@ stuck_worker = stuck["active_workers"][0]
 assert stuck_worker["task_id"] == "CENTRAL-OPS-9101", stuck_worker
 assert stuck_worker["observed_state"] == "potentially_stuck", stuck_worker
 assert stuck_worker["heartbeat"]["seconds_until_lease_expiry"] is not None and stuck_worker["heartbeat"]["seconds_until_lease_expiry"] < 0, stuck_worker
+assert isinstance(stuck_worker["log"]["size_bytes"], int) and stuck_worker["log"]["size_bytes"] > 0, stuck_worker
+assert stuck_worker["log"]["signal"]["state"] == "stale", stuck_worker
+assert "log_signal=stale" in stuck_text, stuck_text
+assert "log_size=" in stuck_text, stuck_text
+dispatcher_stuck_worker = dispatcher_stuck["worker_status"]["active_workers"][0]
+assert dispatcher_stuck_worker["task_id"] == "CENTRAL-OPS-9101", dispatcher_stuck_worker
+assert dispatcher_stuck_worker["log"]["signal"]["state"] == "stale", dispatcher_stuck_worker
+assert isinstance(dispatcher_stuck_worker["log"]["size_bytes"], int) and dispatcher_stuck_worker["log"]["size_bytes"] > 0, dispatcher_stuck_worker
 PY
 
 test ! -e "$state_dir/.worker-reports"

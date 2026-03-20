@@ -1,0 +1,14 @@
+[package]
+name = "ecosystem-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agentic_loop = { path = "../agentic_loop" }
+context_manager = { path = "../context_manager" }
+inference = { path = "../inference" }
+persistence = { path = "../persistence" }
+tool_executor = { path = "../tool_executor" }
+web = { path = "../web" }
+tracing = { workspace = true }

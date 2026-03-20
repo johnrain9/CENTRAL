@@ -1,0 +1,18 @@
+[package]
+name = "agentic_loop"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+chrono = { workspace = true }
+context_manager = { path = "../context_manager" }
+inference = { path = "../inference" }
+indexmap = { workspace = true }
+persistence = { path = "../persistence" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tool_executor = { path = "../tool_executor" }
+tracing = { workspace = true }

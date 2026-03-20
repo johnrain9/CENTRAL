@@ -37,11 +37,12 @@ Workflow:
 
 1. Inspect or update the canonical task in CENTRAL DB with [`scripts/central_task_db.py`](/home/cobra/CENTRAL/scripts/central_task_db.py).
    For numbering, use `task-id-next` or `task-id-reserve` instead of repeated `task-show` existence probes.
-2. Draft the autonomy prompt body from canonical CENTRAL DB state only if a legacy autonomy queue still needs it.
-3. Create or update it in autonomy DB only for migration or compatibility work.
-4. Set dependencies before promotion.
-5. Promote only runnable tasks to `pending`.
-6. Reconcile execution outcome back into CENTRAL DB, then update generated or mirror surfaces.
+2. If implementation already landed before canonical task creation, use [`scripts/create_planner_task.py`](/home/cobra/CENTRAL/scripts/create_planner_task.py) with `--backfill` so the task starts in `awaiting_audit` with landed refs and an immediately eligible paired audit.
+3. Draft the autonomy prompt body from canonical CENTRAL DB state only if a legacy autonomy queue still needs it.
+4. Create or update it in autonomy DB only for migration or compatibility work.
+5. Set dependencies before promotion.
+6. Promote only runnable tasks to `pending`.
+7. Reconcile execution outcome back into CENTRAL DB, then update generated or mirror surfaces.
 
 Task reference rule:
 

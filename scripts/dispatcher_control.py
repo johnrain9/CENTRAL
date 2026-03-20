@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import central_runtime
 
-REPO_DIR = Path(os.environ.get("CENTRAL_DISPATCHER_REPO_DIR", "/home/cobra/CENTRAL")).expanduser().resolve()
+REPO_DIR = Path(os.environ.get("CENTRAL_DISPATCHER_REPO_DIR", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
 RUNTIME_SCRIPT = Path(os.environ.get("CENTRAL_DISPATCHER_RUNTIME_SCRIPT", str(REPO_DIR / "scripts" / "central_runtime.py")))
 DB_SCRIPT = Path(os.environ.get("CENTRAL_DISPATCHER_DB_SCRIPT", str(REPO_DIR / "scripts" / "central_task_db.py")))
 PYTHON_BIN = sys.executable or "/usr/bin/python3"
@@ -30,6 +31,7 @@ MAX_WORKERS_ENV = "CENTRAL_DISPATCHER_MAX_WORKERS"
 CODEX_MODEL_ENV = central_runtime.DEFAULT_CODEX_MODEL_ENV
 DEFAULT_CODEX_MODEL = central_runtime.DEFAULT_CODEX_MODEL
 WORKER_MODEL_ENV = central_runtime.DEFAULT_WORKER_MODEL_ENV
+LOG_LEVEL_RE = re.compile(r"^(?P<ts>\S+)\s+(?P<level>[A-Z]+)\s+\[(?P<component>[^\]]+)\]\s+(?P<message>.*)$")
 
 
 @dataclass(frozen=True)
@@ -93,12 +95,15 @@ def runtime_cmd(*args: str) -> list[str]:
     return command
 
 
-def db_init_cmd() -> list[str]:
-    command = [PYTHON_BIN, str(DB_SCRIPT), "init"]
+def db_cmd(*args: str) -> list[str]:
+    command = [PYTHON_BIN, str(DB_SCRIPT), *args]
     if DB_PATH:
         command.extend(["--db-path", DB_PATH])
-    command.extend(["--json"])
     return command
+
+
+def db_init_cmd() -> list[str]:
+    return db_cmd("init", "--json")
 
 
 def init_db() -> None:
@@ -139,6 +144,75 @@ def running_pid() -> int | None:
 
 def running_lock_payload() -> dict[str, object] | None:
     return read_lock_payload() if running_pid() else None
+
+
+def pid_alive(pid: int | None) -> bool:
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def process_start_token(pid: int | None) -> str | None:
+    if pid is None or pid <= 0:
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    end = raw.rfind(")")
+    if end < 0:
+        return None
+    fields = raw[end + 1 :].strip().split()
+    if len(fields) <= 19:
+        return None
+    return fields[19]
+
+
+def process_matches(pid: int | None, expected_start_token: str | None) -> bool:
+    if not pid_alive(pid):
+        return False
+    if not expected_start_token:
+        return True
+    current = process_start_token(pid)
+    return current == expected_start_token if current is not None else False
+
+
+def terminate_worker(kill_target: dict[str, object] | None) -> dict[str, object]:
+    if not isinstance(kill_target, dict):
+        return {"attempted": False, "terminated": False, "worker_present": False}
+    raw_pid = kill_target.get("worker_pid")
+    try:
+        pid = int(raw_pid) if raw_pid is not None else None
+    except (TypeError, ValueError):
+        pid = None
+    expected_token = str(kill_target.get("worker_process_start_token") or "") or None
+    if pid is None:
+        return {"attempted": False, "terminated": False, "worker_present": False}
+    if not process_matches(pid, expected_token):
+        return {"attempted": False, "terminated": False, "worker_present": False, "pid": pid}
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        return {"attempted": True, "terminated": False, "worker_present": False, "pid": pid}
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if not process_matches(pid, expected_token):
+            return {"attempted": True, "terminated": True, "worker_present": True, "pid": pid}
+        time.sleep(0.1)
+    try:
+        os.kill(pid, 9)
+    except OSError:
+        pass
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if not process_matches(pid, expected_token):
+            return {"attempted": True, "terminated": True, "worker_present": True, "pid": pid, "forced": True}
+        time.sleep(0.1)
+    return {"attempted": True, "terminated": False, "worker_present": True, "pid": pid, "forced": True}
 
 
 def load_saved_config() -> dict[str, object]:
@@ -424,13 +498,59 @@ def tail_file(path: Path, lines: int = 120) -> str:
     return "\n".join(data[-lines:])
 
 
+def should_colorize() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    term = os.environ.get("TERM", "")
+    if term.lower() == "dumb":
+        return False
+    return sys.stdout.isatty()
+
+
+def colorize_log_line(line: str) -> str:
+    if not should_colorize():
+        return line
+    match = LOG_LEVEL_RE.match(line)
+    if not match:
+        return line
+    return central_runtime.format_log_console_line(
+        match.group("ts"),
+        match.group("level"),
+        match.group("component"),
+        match.group("message"),
+        use_color=True,
+    )
+
+
+def stream_colored_logs(path: Path, *, lines: int = 120) -> int:
+    if not path.exists():
+        print(f"{path}: no log yet")
+        return 0
+    proc = subprocess.Popen(
+        ["tail", "-n", str(lines), "-f", str(path)],
+        cwd=str(REPO_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            print(colorize_log_line(line.rstrip("\n")))
+    except KeyboardInterrupt:
+        proc.terminate()
+        proc.wait(timeout=5)
+        return 130
+    return proc.wait()
+
+
 def show_logs(follow: bool = False) -> int:
     ensure_runtime()
     if follow:
-        os.execv(PYTHON_BIN, runtime_cmd("tail", "--follow"))
-    # Delegate static tail to runtime so colorization logic is shared.
-    os.execv(PYTHON_BIN, runtime_cmd("tail"))
-    return 0  # unreachable
+        return stream_colored_logs(LOG_PATH)
+    print("\n".join(colorize_log_line(line) for line in tail_file(LOG_PATH).splitlines()))
+    return 0
 
 
 def run_once() -> int:
@@ -495,6 +615,43 @@ def show_config(*, max_workers: int | None = None, codex_model: str | None = Non
     return 0
 
 
+def kill_task(*, task_id: str, reason: str, as_json: bool) -> int:
+    ensure_runtime()
+    init_db()
+    result = subprocess.run(
+        db_cmd("operator-fail-task", "--task-id", task_id, "--reason", reason, "--actor-id", "dispatcher.operator", "--json"),
+        cwd=str(REPO_DIR),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        die((result.stderr or result.stdout or "dispatcher kill-task failed").strip())
+    raw = (result.stdout or "{}").strip() or "{}"
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        die(f"dispatcher kill-task returned invalid JSON: {exc}")
+        raise exc
+    if not isinstance(payload, dict):
+        die("dispatcher kill-task returned a non-object payload")
+    payload["worker_termination"] = terminate_worker(payload.get("kill_target"))
+    snapshot = payload.get("snapshot") or {}
+    runtime = snapshot.get("runtime") or {}
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    print(f"Task {task_id} failed by operator kill-task")
+    print(f"Planner/runtime: {snapshot.get('planner_status')} / {runtime.get('runtime_status')}")
+    termination = payload.get("worker_termination") or {}
+    if termination.get("worker_present"):
+        state = "terminated" if termination.get("terminated") else "still_running"
+        print(f"Worker: {state} (pid {termination.get('pid')})")
+    else:
+        print("Worker: no active worker")
+    print(f"Reason: {payload.get('reason')}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CENTRAL dispatcher operator wrapper")
     subparsers = parser.add_subparsers(dest="command")
@@ -534,6 +691,11 @@ def build_parser() -> argparse.ArgumentParser:
     config_parser.add_argument("--codex-model", help="(deprecated, use --worker-model)")
     config_parser.add_argument("--worker-model")
     config_parser.add_argument("--worker-mode", choices=["codex", "claude", "stub"])
+
+    kill_parser = subparsers.add_parser("kill-task", help="Fail a task by operator request and terminate its worker if present")
+    kill_parser.add_argument("task_id")
+    kill_parser.add_argument("--reason", default="operator kill requested")
+    kill_parser.add_argument("--json", action="store_true")
 
     return parser
 
@@ -582,6 +744,8 @@ def main(argv: list[str]) -> int:
             worker_model=getattr(args, "worker_model", None),
             worker_mode=getattr(args, "worker_mode", None),
         )
+    if cmd == "kill-task":
+        return kill_task(task_id=args.task_id, reason=args.reason, as_json=getattr(args, "json", False))
     parser.print_help()
     return 1
 

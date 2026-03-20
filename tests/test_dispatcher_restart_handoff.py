@@ -46,7 +46,7 @@ def worker_task_payload() -> dict[str, object]:
         "target_repo_id": "CENTRAL",
         "target_repo_root": str(REPO_ROOT),
         "approval_required": False,
-        "metadata": {"smoke": True},
+        "metadata": {"smoke": True, "audit_required": False},
         "execution": {
             "task_kind": "read_only",
             "sandbox_mode": "workspace-write",
@@ -132,6 +132,34 @@ class DispatcherRestartHandoffTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def fetch_event_payloads(self, event_type: str) -> list[dict[str, object]]:
+        conn = task_db.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT payload_json FROM task_events WHERE task_id = ? AND event_type = ? ORDER BY event_id ASC",
+                (TASK_ID, event_type),
+            ).fetchall()
+        finally:
+            conn.close()
+        payloads: list[dict[str, object]] = []
+        for row in rows:
+            raw = row["payload_json"]
+            if not raw:
+                payloads.append({})
+                continue
+            try:
+                payloads.append(json.loads(str(raw)))
+            except Exception:
+                payloads.append({})
+        return payloads
+
+    def supervision_from_snapshot(self, snapshot: dict[str, object]) -> dict[str, object] | None:
+        metadata = ((snapshot.get("lease") or {}).get("metadata") or {})
+        supervision = metadata.get("supervision") if isinstance(metadata, dict) else None
+        if not isinstance(supervision, dict):
+            return None
+        return supervision
+
     def wait_for(self, predicate, *, timeout: float, interval: float = 0.2):
         deadline = time.time() + timeout
         last_error: Exception | None = None
@@ -172,6 +200,19 @@ class DispatcherRestartHandoffTest(unittest.TestCase):
         except OSError:
             return None
         return pid
+
+    def worker_result_path(self, task_id: str, run_id: str) -> Path:
+        return self.state_dir / ".worker-results" / task_id / f"{run_id}.json"
+
+    @staticmethod
+    def _pid_alive(pid: int | None) -> bool:
+        if pid is None:
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
 
     def test_restart_adopts_running_worker(self) -> None:
         self.run_dispatcher("start", "--max-workers", "1")
@@ -220,6 +261,136 @@ class DispatcherRestartHandoffTest(unittest.TestCase):
         self.assertIsNone(finished_snapshot.get("lease"))
         self.assertIn("runtime.dispatcher_handoff_requested", self.fetch_events())
         self.assertIn("runtime.worker_adopted", self.fetch_events())
+
+    def test_restart_adoption_preserves_run_and_terminal_state(self) -> None:
+        """Dispatcher restart should adopt the live worker without double running or misclassifying state."""
+        self.run_dispatcher("start", "--max-workers", "1")
+
+        def snapshot_with_supervision() -> dict[str, object] | None:
+            snapshot = self.fetch_snapshot()
+            return snapshot if self.supervision_from_snapshot(snapshot) else None
+
+        snapshot = self.wait_for(snapshot_with_supervision, timeout=10.0)
+        supervision = self.supervision_from_snapshot(snapshot)
+        self.assertIsNotNone(supervision)
+        run_id = str(supervision.get("run_id") or "")
+        self.assertTrue(run_id)
+        worker_pid = self.worker_pid_from_snapshot()
+        self.assertIsNotNone(worker_pid)
+        os.kill(worker_pid, 0)
+
+        initial_dispatcher_pid = self.wait_for(lambda: self.dispatcher_pid(), timeout=10.0)
+        self.run_dispatcher("restart", "--max-workers", "1", timeout=20.0)
+        os.kill(worker_pid, 0)
+
+        adopted_dispatcher_pid = self.wait_for(
+            lambda: pid if (pid := self.dispatcher_pid()) and pid != initial_dispatcher_pid else None,
+            timeout=10.0,
+        )
+        self.assertNotEqual(initial_dispatcher_pid, adopted_dispatcher_pid)
+
+        def one_handoff_payload() -> list[dict[str, object]] | None:
+            payloads = self.fetch_event_payloads("runtime.dispatcher_handoff_requested")
+            return payloads if len(payloads) == 1 else None
+
+        handoff_payloads = self.wait_for(one_handoff_payload, timeout=10.0)
+
+        def one_adoption_payload() -> list[dict[str, object]] | None:
+            payloads = self.fetch_event_payloads("runtime.worker_adopted")
+            return payloads if len(payloads) == 1 else None
+
+        adoption_payloads = self.wait_for(one_adoption_payload, timeout=10.0)
+
+        self.assertEqual(str(handoff_payloads[0].get("run_id")), run_id)
+        self.assertEqual(str(adoption_payloads[0].get("run_id")), run_id)
+        self.assertEqual(int(adoption_payloads[0].get("worker_pid")), worker_pid)
+
+        adopted_snapshot = self.fetch_snapshot()
+        adopted_supervision = self.supervision_from_snapshot(adopted_snapshot)
+        self.assertIsNotNone(adopted_supervision)
+        self.assertEqual(str(adopted_supervision.get("run_id")), run_id)
+        self.assertEqual(int(adopted_supervision.get("worker_pid")), worker_pid)
+
+        handoff_state = (((adopted_snapshot.get("lease") or {}).get("metadata") or {}).get("handoff") or {})
+        self.assertEqual(handoff_state.get("state"), "adopted")
+        self.assertNotIn("runtime.worker_interrupted", self.fetch_events())
+
+        def finished_snapshot() -> dict[str, object] | None:
+            current = self.fetch_snapshot()
+            runtime_status = str((current.get("runtime") or {}).get("runtime_status") or "")
+            return current if runtime_status == "done" else None
+
+        final_snapshot = self.wait_for(finished_snapshot, timeout=WORKER_SLEEP_SECONDS + 15.0)
+        self.assertIsNone(final_snapshot.get("lease"))
+        self.assertEqual(str((final_snapshot.get("runtime") or {}).get("runtime_status") or ""), "done")
+
+        status_payloads = self.fetch_event_payloads("runtime.status_transition")
+        failed_transitions = [payload for payload in status_payloads if str(payload.get("status") or "") == "failed"]
+        self.assertFalse(failed_transitions, f"Unexpected failure transitions present: {failed_transitions}")
+        done_transitions = [payload for payload in status_payloads if str(payload.get("status") or "") == "done"]
+        self.assertTrue(done_transitions, "Missing done transition after worker adoption restart")
+
+    def test_worker_result_recovered_after_dispatcher_downtime(self) -> None:
+        """Worker finishing while dispatcher is stopped should be reconciled without re-running."""
+        self.run_dispatcher("start", "--max-workers", "1")
+
+        def snapshot_with_supervision() -> dict[str, object] | None:
+            snapshot = self.fetch_snapshot()
+            return snapshot if self.supervision_from_snapshot(snapshot) else None
+
+        snapshot = self.wait_for(snapshot_with_supervision, timeout=10.0)
+        supervision = self.supervision_from_snapshot(snapshot)
+        self.assertIsNotNone(supervision)
+        run_id = str(supervision.get("run_id") or "")
+        self.assertTrue(run_id)
+        result_path = self.worker_result_path(TASK_ID, run_id)
+        self.assertFalse(result_path.exists())
+
+        worker_pid = self.worker_pid_from_snapshot()
+        self.assertIsNotNone(worker_pid)
+        self.assertTrue(self._pid_alive(worker_pid))
+
+        dispatcher_pid = self.wait_for(lambda: self.dispatcher_pid(), timeout=10.0)
+        self.assertIsNotNone(dispatcher_pid)
+
+        # Stop dispatcher while the worker continues running to simulate downtime.
+        self.run_dispatcher("stop", timeout=20.0)
+        self.wait_for(lambda: self.dispatcher_pid() is None, timeout=10.0)
+
+        # Worker should remain alive briefly, then finish and emit a result while dispatcher is down.
+        self.assertTrue(self._pid_alive(worker_pid))
+        self.wait_for(lambda: result_path.exists(), timeout=WORKER_SLEEP_SECONDS + 10.0)
+        self.wait_for(lambda: not self._pid_alive(worker_pid), timeout=10.0)
+
+        # Without a dispatcher, the task should still appear running with an active lease.
+        lingering_snapshot = self.fetch_snapshot()
+        runtime_status = str((lingering_snapshot.get("runtime") or {}).get("runtime_status") or "")
+        self.assertEqual(runtime_status, "running", lingering_snapshot)
+        self.assertIsNotNone(lingering_snapshot.get("lease"))
+
+        # Bring the dispatcher back up — it should reconcile the completed result and close the lease.
+        self.run_dispatcher("start", "--max-workers", "1")
+        self.wait_for(lambda: self.dispatcher_pid(), timeout=10.0)
+
+        def reconciled_snapshot() -> dict[str, object] | None:
+            current = self.fetch_snapshot()
+            runtime = current.get("runtime") or {}
+            return current if str(runtime.get("runtime_status") or "") == "done" else None
+
+        final_snapshot = self.wait_for(reconciled_snapshot, timeout=20.0)
+        runtime = final_snapshot.get("runtime") or {}
+        self.assertIsNone(final_snapshot.get("lease"))
+        self.assertEqual(str(final_snapshot.get("planner_status") or ""), "done")
+        self.assertEqual(str(runtime.get("runtime_status") or ""), "done")
+        self.assertEqual(int(runtime.get("retry_count") or 0), 0)
+        self.assertIsNone(final_snapshot.get("status_mismatch"))
+
+        closeout = ((final_snapshot.get("metadata") or {}).get("closeout") or {})
+        self.assertTrue(closeout, "Expected runtime closeout metadata")
+        self.assertEqual(closeout.get("outcome"), "done")
+        self.assertEqual(closeout.get("summary"), "stub worker completed")
+        runtime_notes = (runtime.get("metadata") or {}).get("notes")
+        self.assertEqual(runtime_notes, "stub worker completed")
 
 
 class InterruptClassificationTest(unittest.TestCase):

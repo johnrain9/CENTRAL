@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
-AUTONOMY_ROOT = Path("/home/cobra/photo_auto_tagging")
+AUTONOMY_ROOT = (Path(__file__).resolve().parents[2] / "Dispatcher")
 
 sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(AUTONOMY_ROOT))
@@ -39,12 +39,19 @@ class TestBuildClaudeCommandPayloadValidation(unittest.TestCase):
             "run_id": run_id,
             "status": "FAILED" if is_error else "COMPLETED",
             "summary": summary,
+            "verdict": "failed" if is_error else "accepted",
             "completed_items": [summary] if not is_error else [],
             "remaining_items": [],
             "decisions": [],
             "discoveries": [],
             "blockers": [],
             "validation": [],  # OPS-80: must be list, not {}
+            "requirements_assessment": [],
+            "system_fit_assessment": {
+                "verdict": "blocked" if is_error else "fit",
+                "notes": "test fixture",
+                "local_optimization_risk": "unknown",
+            },
             "artifacts": [],
             "claude_raw": {},
         }

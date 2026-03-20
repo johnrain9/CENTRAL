@@ -176,10 +176,11 @@ Minimum fairness rule:
 Suggested dispatch order:
 
 1. eligible tasks only
-2. sort by priority bucket
-3. apply repo fairness rotation within a priority bucket
-4. apply worker capability filters
-5. claim atomically
+2. prefer eligible audit tasks over ordinary implementation tasks at claim time
+3. sort by priority bucket within each dispatch class
+4. apply repo fairness rotation within a priority bucket
+5. apply worker capability filters
+6. claim atomically against fresh DB state
 
 ## Three Required Race Outcomes
 

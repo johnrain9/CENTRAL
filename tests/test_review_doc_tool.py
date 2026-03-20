@@ -65,6 +65,9 @@ class ReviewDocToolTest(unittest.TestCase):
         self.assertIn("adversarial review of a LLD document", prompt)
         self.assertIn("Context level: doc-only", prompt)
         self.assertIn("Review only the target document", prompt)
+        self.assertIn("important things the document does not say but should", prompt)
+        self.assertIn("Keep the critique at the low-level design layer", prompt)
+        self.assertIn("Do not drift into code-level implementation review", prompt)
         self.assertIn("schema, API, and state-machine correctness", prompt)
         self.assertIn("Be strict about migrations.", prompt)
         self.assertIn("- Context Used", prompt)
@@ -85,6 +88,8 @@ class ReviewDocToolTest(unittest.TestCase):
                 extra_instructions=[],
             )
         self.assertIn("Context level: targeted", prompt)
+        self.assertIn("Keep the critique at the high-level design layer", prompt)
+        self.assertIn("Do not drift into low-level schema, API, code-structure, or implementation details", prompt)
         self.assertIn("Do not inspect any other local repository files", prompt)
         self.assertIn(f"Context file: {context_path}", prompt)
         self.assertIn("   1 | def run():", prompt)

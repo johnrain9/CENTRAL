@@ -35,6 +35,7 @@ The generated surfaces should answer:
 5. Which workers or planners currently hold assignments or leases?
 6. Which tasks are aging in review, running too long, or drifting from expected progress?
 7. What is the canonical handoff card for a specific task?
+8. Which implementation tasks are waiting on audit, which audits are ready, and which failed audits spawned rework?
 
 ## Generated Surface Set
 
@@ -92,7 +93,7 @@ Purpose:
 Recommended contents:
 
 - only dependency-satisfied, dispatchable tasks
-- ordered by priority bucket, fairness policy, and repo rotation
+- ordered by claim-time policy: eligible audits first, then priority bucket, fairness policy, and repo rotation
 - capability or execution-policy filters when available
 - explicit reason when a near-top task is excluded
 
@@ -145,6 +146,26 @@ Recommended contents:
 - retryability hint
 - latest artifact or closeout reference
 - escalation notes when present
+
+### 6a. Audit Queue View
+
+Purpose:
+
+- make audit coupling operationally legible for planners
+
+Recommended contents:
+
+- implementation/audit task pairs
+- implementations currently awaiting audit
+- audits that are ready to run now
+- accepted vs failed audit verdicts
+- any follow-up rework tasks linked back to a failed audit
+
+Recommended output forms:
+
+- terminal table for planner triage
+- JSON export for automation
+- optional markdown export for human sharing
 
 ### 7. Task Detail Card Export
 
@@ -216,6 +237,7 @@ Optional export surfaces:
 
 - `tasks.md`: generated landing page if a markdown landing page remains useful
 - `generated/portfolio_summary.md`
+- `generated/audit_queue.md`
 - `generated/per_repo/<repo_id>.md`
 - `generated/blocked_tasks.md`
 - `generated/review_queue.md`

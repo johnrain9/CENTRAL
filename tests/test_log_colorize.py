@@ -32,8 +32,8 @@ def _make_log(tmp: Path) -> central_runtime.DaemonLog:
 
 
 PLAIN_LINES = [
-    "12:34:56 INF [central.dispatcher] heartbeat state=running workers=2 idle_slots=0 running_tasks=2 eligible=0 next=- leases=2 review=0 failed=0 mismatch=0",
-    "12:34:57 INF [central.dispatcher] worker_spawned task=FOO-1 run=r1 pid=1234 mode=claude",
+    "12:34:56 INF [central.dispatcher] heartbeat state=running workers=2/3 idle=1 active=FOO-1,BAR-2 | ready_now=4 next_ready=BAZ-3 leases=2 | parked_total=2 parked_reasons=dependency-blocked:2 parked_sample=WAIT-1,WAIT-2 | review_queue=1 failed_queue=1 mismatch=0",
+    "12:34:57 INF [central.dispatcher] worker_spawned task=FOO-1 run=r1 pid=1234 mode=claude model=gpt-5.4",
     "12:34:58 ERR [central.dispatcher] worker_spawn_error task=BAR-2 reason=timeout",
     "12:34:59 WRN [central.worker] some plain message",
     "not a valid log line",
@@ -68,6 +68,13 @@ class TestColorizeLogLine(unittest.TestCase):
         result = self.log.tail(lines=10, colorize=True)
         # Should have ANSI codes for the valid lines
         self.assertIn("\033[", result)
+
+    def test_heartbeat_uses_queue_bucket_labels(self):
+        result = self.log.colorize_log_line(PLAIN_LINES[0])
+        self.assertIn("QUEUE SNAPSHOT", result)
+        self.assertIn("review_queue=", result)
+        self.assertIn("failed_queue=", result)
+        self.assertNotIn(" failed=", result)
 
     def test_tail_colorize_false(self):
         log_path = self.log.path

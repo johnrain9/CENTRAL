@@ -122,6 +122,7 @@ dispatcher restart --codex-model gpt-5-codex
 dispatcher stop
 dispatcher status
 dispatcher workers
+dispatcher kill-task CENTRAL-OPS-20 --reason "operator stopped stuck worker"
 dispatcher config
 dispatcher config --max-workers 3
 dispatcher config --codex-model gpt-5-codex
@@ -139,6 +140,7 @@ Behavior:
 - `dispatcher start --codex-model <model>` applies an immediate dispatcher-wide default Codex model
 - `dispatcher workers` reports active and recent worker runs with heartbeat freshness, log recency, and stuck-suspect heuristics
 - `dispatcher workers --json` exposes `runtime_paths.worker_results_dir` plus per-run `result.path` metadata plus active-run Codex model metadata for the canonical structured output surface
+- `dispatcher kill-task <task-id>` is the operator stop path: it fails planner/runtime state in CENTRAL DB, terminates the worker if it is still running, and prevents immediate retry
 - `dispatcher config --max-workers <n>` saves the default worker limit to `/home/cobra/CENTRAL/state/central_runtime/dispatcher-config.json`
 - `dispatcher config --codex-model <model>` saves the default Codex model to `/home/cobra/CENTRAL/state/central_runtime/dispatcher-config.json`
 - `dispatcher restart` preserves the currently running worker limit unless a new `--max-workers` value, environment override, or saved config replaces it
@@ -278,11 +280,13 @@ Per-task inspection:
 python3 /home/cobra/CENTRAL/scripts/central_runtime.py worker-status --task-id CENTRAL-OPS-20 --json
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-show --task-id CENTRAL-OPS-20 --json
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-task-card --task-id CENTRAL-OPS-20 --json
+dispatcher kill-task CENTRAL-OPS-20 --reason "operator stopped stuck worker"
 python3 /home/cobra/CENTRAL/scripts/central_runtime.py tail
 ```
 
 Decision rules:
 
+- Use `dispatcher kill-task <task-id>` when the operator wants execution to stop now and the task must not immediately retry.
 - Reconcile `done` or `blocked` with `python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-reconcile ...` when planner review is complete.
 - Retry by returning runtime state to a claimable path through CENTRAL-native runtime and planner judgment.
 - Leave blocked when upstream dependencies or missing external inputs still prevent useful progress.

@@ -126,6 +126,31 @@ Preferred naming pattern:
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-create --input /path/to/task.json --json
 ```
 
+For AI-facing task creation, prefer the helper instead of hand-writing canonical JSON:
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/create_planner_task.py \
+  --preview-graph \
+  --preset implementation \
+  --task-id CENTRAL-OPS-35 \
+  --title "Improve AI-facing task creation ergonomics" \
+  --objective "Reduce repetitive planner boilerplate without weakening canonical detail." \
+  --context-item "The canonical schema remains the source of truth." \
+  --scope-item "Task creation tooling only." \
+  --deliverable "Improved helper UX" \
+  --deliverable "Focused task-creation smokes" \
+  --acceptance-item "AI can create rich canonical tasks with less repetitive input." \
+  --test "python3 -m unittest tests.test_create_planner_task"
+```
+
+Helper semantics:
+
+- core content remains explicit: objective, context, scope, deliverables, acceptance, testing
+- summary defaults to title unless `--summary` is set
+- dispatch, closeout, reconciliation, task type, and execution settings can default from `--preset`
+- use repeated `--context-item`, `--scope-item`, `--deliverable`, `--acceptance-item`, and `--test` flags to build canonical markdown sections without hand-formatting bullets
+- use `--audit-mode required|none` to make paired-audit intent explicit; `--preview-graph` shows the derived parent plus audit payloads before anything is written
+
 Expected JSON shape:
 
 ```json
@@ -180,6 +205,56 @@ python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-create --input /tmp/
 - fills required fields with sensible planner defaults
 - writes a schema-valid draft JSON payload
 - supports direct piping (`--json`) into `task-create --input -`
+
+### Backfill already-landed implementation work
+
+When code landed before canonical task creation, create a truthful implementation record in `awaiting_audit` instead of pretending implementation still needs dispatch.
+
+Recommended helper flow:
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/create_planner_task.py \
+  --db-path /home/cobra/CENTRAL/state/central_tasks.db \
+  --task-id CENTRAL-OPS-36 \
+  --title "Formalize backfill workflow" \
+  --objective "Capture already-landed work in the canonical task system." \
+  --context-item "The implementation already landed before the canonical task existed." \
+  --scope-item "Planner tooling and docs only." \
+  --deliverable "Backfilled implementation task in CENTRAL" \
+  --deliverable "Immediately eligible paired audit" \
+  --acceptance-item "The task history stays truthful and audit-ready." \
+  --test "bash tests/test_central_backfill_flow.sh" \
+  --backfill \
+  --landed-ref "commit:<sha>" \
+  --landed-ref "pr:<url>" \
+  --backfill-reason "Fast-path work landed before canonical task creation." \
+  --audit-focus "Verify the landed diff matches the stated scope." \
+  --json
+```
+
+Backfill rules:
+
+- the parent task is created as `planner_status=awaiting_audit`
+- the parent remains non-eligible for implementation dispatch
+- the paired audit task is created immediately and becomes eligible right away
+- record landed references in metadata so the audit can inspect the actual code that shipped
+- keep runtime truth honest: this path records already-landed work; it does not fabricate a CENTRAL runtime execution
+
+Direct JSON/API equivalent:
+
+- create an implementation task with `planner_status=awaiting_audit`
+- keep `metadata.audit_required=true`
+- include machine-readable landed references such as `metadata.workflow_kind=backfill` and `metadata.backfill_landed_refs=[...]`
+- let `task-create` auto-create the paired audit child
+
+Planner follow-through:
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-audits --section ready --json
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-show --task-id CENTRAL-OPS-36 --json
+```
+
+The audit should verify the landed change and the backfill metadata, not re-run a fake implementation workflow.
 
 ### Update a task with optimistic concurrency
 
@@ -277,11 +352,14 @@ Implemented DB-generated read models:
 
 ```bash
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-summary
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-planner-panel
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-eligible
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-blocked
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-repo --repo-id central
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-assignments
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-review
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-audits
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-audits --section ready
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-task-card --task-id CENTRAL-OPS-20
 ```
 
@@ -309,12 +387,36 @@ This command aggregates:
 
 The operator view reports `working_status`, `evidence_quality`, and explicit coverage semantics per repo. Contract and onboarding details are documented in `/home/cobra/CENTRAL/docs/repo_health.md`.
 
+`view-planner-panel` is the planner triage surface. It rolls up:
+
+- eligible work
+- parked work with reasons
+- stale or low-activity tasks
+- awaiting-audit tasks
+- ready audits and completed audit verdict flow
+- recent failures
+- changed-since deltas
+
+Useful options:
+
+```bash
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-planner-panel \
+  --changed-since-hours 24 \
+  --stale-hours 24 \
+  --limit 10
+
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py view-planner-panel \
+  --changed-since 2026-03-18T00:00:00+00:00 \
+  --json
+```
+
 ## Markdown Exports
 
 Optional exports remain derived outputs only:
 
 ```bash
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py export-summary-md
+python3 /home/cobra/CENTRAL/scripts/central_task_db.py export-audit-md
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py export-task-card-md --task-id CENTRAL-OPS-20
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py export-tasks-board-md
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py export-markdown-bundle
@@ -324,6 +426,7 @@ python3 /home/cobra/CENTRAL/scripts/central_task_db.py export-repo-md --repo-id 
 Default output locations:
 
 - `/home/cobra/CENTRAL/generated/portfolio_summary.md`
+- `/home/cobra/CENTRAL/generated/audit_queue.md`
 - `/home/cobra/CENTRAL/generated/task_cards/<task_id>.md`
 - `/home/cobra/CENTRAL/generated/tasks.md`
 
@@ -335,11 +438,14 @@ Every generated markdown artifact is marked as generated from the CENTRAL DB and
 
 - `generated/tasks.md`
 - `generated/portfolio_summary.md`
+- `generated/audit_queue.md`
 - `generated/blocked_tasks.md`
 - `generated/review_queue.md`
 - `generated/assignments.md`
 - `generated/per_repo/<repo_id>.md`
 - `generated/task_cards/<task_id>.md`
+
+`view-audits` and `export-audit-md` are the dedicated audit-coupling surfaces. They show implementation/audit pairs, audit-ready work, accepted vs failed audits, and any linked rework tasks without requiring raw metadata inspection.
 
 `export-repo-md --repo-id <repo_id>` writes one repo-specific markdown queue view to `generated/per_repo/<repo_id>.md`.
 
@@ -354,6 +460,7 @@ dispatcher config --max-workers 3
 dispatcher config --codex-model gpt-5-codex
 dispatcher status
 dispatcher workers
+dispatcher kill-task CENTRAL-OPS-20 --reason "operator stopped stuck worker"
 ```
 
 Launcher rules:
@@ -365,6 +472,7 @@ Launcher rules:
 - worker model precedence is: task `execution.metadata.codex_model`, then dispatcher default, then the built-in fallback `gpt-5-codex`
 - `dispatcher status` shows the active daemon limit plus the next-start default/source
 - `dispatcher workers --json` is the canonical worker inspection surface for operators and future skills, including active-run Codex model metadata
+- `dispatcher kill-task <task-id>` records explicit operator stop intent, terminates the worker PID if present, and leaves the task non-eligible as `planner_status=failed` / `runtime_status=failed`
 - `dispatcher stop` and `dispatcher restart` perform a fast handoff: active workers keep running, lease metadata preserves adoption state, and the next dispatcher adopts them on startup
 - graceful handoff extends active leases for a short restart window; if no dispatcher returns before that grace expires, stale-lease recovery can reclaim the task
 - `CENTRAL_DISPATCHER_MAX_WORKERS=<n>` overrides launcher defaults for the current shell session
@@ -377,6 +485,7 @@ Use the CENTRAL runtime worker inspector instead of scraping log files in routin
 ```bash
 dispatcher workers
 dispatcher workers --json
+dispatcher kill-task CENTRAL-OPS-20 --reason "operator stopped stuck worker"
 python3 /home/cobra/CENTRAL/scripts/central_runtime.py worker-status --json
 python3 /home/cobra/CENTRAL/scripts/central_runtime.py worker-status --task-id CENTRAL-OPS-20 --json
 ```
@@ -398,6 +507,19 @@ Routine guidance:
 - use `runtime_paths.worker_results_dir` and each worker entry's `result.path` when you need the structured JSON output for a run
 - tail raw logs only after the worker-status output identifies the task or run worth inspecting
 
+### Operator stop a task
+
+```bash
+dispatcher kill-task CENTRAL-OPS-20 --reason "operator stopped stuck worker"
+python3 /home/cobra/CENTRAL/scripts/dispatcher_control.py kill-task CENTRAL-OPS-20 --json
+```
+
+Behavior:
+
+- active task: planner/runtime state is failed in the canonical DB, the active lease is removed, and the supervised worker PID is terminated if it still matches the recorded process token
+- inactive task: planner/runtime state is failed even when no worker process or dispatcher daemon is active
+- retry behavior: dispatcher does not immediately reclaim the task because planner state is moved to `failed`
+
 Restart handoff guidance:
 
 1. Prefer `dispatcher restart` over waiting for long-running workers to drain.
@@ -418,6 +540,8 @@ python3 /home/cobra/CENTRAL/scripts/central_task_db.py runtime-claim \
   --queue-name default \
   --lease-seconds 900
 ```
+
+Unscoped claims re-read fresh eligibility at claim time. Eligible audit tasks are preferred over ordinary implementation work, and dispatcher status `next` hints are advisory rather than reserved slots.
 
 ### Renew heartbeats
 

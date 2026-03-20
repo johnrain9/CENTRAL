@@ -1,0 +1,15 @@
+[package]
+name = "context_manager"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+chrono = { workspace = true }
+inference = { path = "../inference" }
+persistence = { path = "../persistence" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

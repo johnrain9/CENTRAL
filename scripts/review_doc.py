@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+try:
+    import tomllib
+except ImportError:  # pragma: no cover
+    tomllib = None
 
 
 MODE_FOCUS = {
@@ -63,6 +68,30 @@ CONTEXT_LEVEL_GUIDANCE = {
     "repo": (
         "Review the target document first. Then inspect local repository files selectively when repository context would materially "
         "change or sharpen a finding. Do not perform a broad codebase tour without a concrete reason."
+    ),
+}
+
+MODE_BOUNDARY_GUIDANCE = {
+    "hld": (
+        "Keep the critique at the high-level design layer. Focus on architecture, ownership, contracts, system behavior, "
+        "rollout, and operational risk. Do not drift into low-level schema, API, code-structure, or implementation details "
+        "unless the document itself incorrectly depends on them."
+    ),
+    "lld": (
+        "Keep the critique at the low-level design layer. Focus on concrete contracts, schemas, APIs, state transitions, "
+        "concurrency, migrations, and testability. Do not drift into code-level implementation review or line-by-line "
+        "coding suggestions unless the document itself incorrectly depends on them."
+    ),
+    "requirements": (
+        "Keep the critique at the requirements layer. Focus on coverage, clarity, measurability, and contradictions. "
+        "Do not drift into architecture or implementation design unless the requirements improperly hardcode them."
+    ),
+    "investigation": (
+        "Keep the critique at the investigation layer. Focus on evidence quality, reasoning, alternatives, and decision readiness. "
+        "Do not drift into prescribing detailed design or implementation unless the investigation claims those details are already justified."
+    ),
+    "generic": (
+        "Match the critique depth to the document. Do not drift into lower-level design or implementation detail unless the document's claims require that level of scrutiny."
     ),
 }
 
@@ -203,6 +232,20 @@ def resolve_executable(name: str) -> str:
     raise SystemExit(f"required executable not found on PATH: {name}")
 
 
+def resolve_default_codex_model() -> str | None:
+    if tomllib is None:
+        return None
+    config_path = Path.home() / ".codex" / "config.toml"
+    if not config_path.is_file():
+        return None
+    try:
+        payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    model = payload.get("model")
+    return str(model).strip() if model else None
+
+
 def find_git_root(start: Path) -> Path | None:
     current = start.resolve()
     for candidate in (current, *current.parents):
@@ -286,7 +329,11 @@ def build_prompt(
         f"You are performing an adversarial review of a {mode.upper()} document.\n\n"
         "Your job is not to restate or summarize it. Your job is to find weaknesses, risks, contradictions, "
         "missing decisions, underspecified contracts, and ways the document could cause wasted work or bad outcomes.\n\n"
+        "Explicitly look for important things the document does not say but should. "
+        "Treat omissions, missing constraints, missing requirements, missing failure handling, and missing rollout or "
+        "operational details as first-class findings, not as side notes.\n\n"
         "Review it like a skeptical senior engineer.\n\n"
+        f"Mode boundary: {MODE_BOUNDARY_GUIDANCE[mode]}\n\n"
         f"Context level: {context_level}\n"
         f"Context guidance: {CONTEXT_LEVEL_GUIDANCE[context_level]}\n"
         f"{context_file_block}"
@@ -364,11 +411,17 @@ def validate_command_template(template: str) -> None:
 
 def run_codex(args: argparse.Namespace, prompt: str, *, cwd: Path, output_path: Path, skip_git_repo_check: bool) -> int:
     resolve_executable("codex")
+    model = args.model or resolve_default_codex_model()
+    if os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1":
+        raise SystemExit(
+            "review_doc codex backend cannot run from this sandboxed session because outbound network is disabled "
+            "(CODEX_SANDBOX_NETWORK_DISABLED=1). Run the script from a normal shell, or use --backend prompt-only."
+        )
     command = build_codex_command(
         cwd=cwd,
         output_path=output_path,
         profile=args.profile,
-        model=args.model,
+        model=model,
         sandbox=args.sandbox,
         skip_git_repo_check=skip_git_repo_check or args.skip_git_repo_check,
     )
