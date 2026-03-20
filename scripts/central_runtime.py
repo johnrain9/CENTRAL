@@ -675,7 +675,7 @@ def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: 
     script = (
         "import json, subprocess, sys\n"
         f"proc = subprocess.Popen(\n"
-        f"    ['claude', '-p', '--dangerously-skip-permissions', '--model', {model!r}, '--output-format', 'stream-json'],\n"
+        f"    ['claude', '-p', '--verbose', '--dangerously-skip-permissions', '--model', {model!r}, '--output-format', 'stream-json'],\n"
         "    stdin=sys.stdin, stdout=subprocess.PIPE, text=True\n"
         ")\n"
         "lines = []\n"
