@@ -120,8 +120,7 @@ No changes needed in the health adapter to support an external dispatcher repo.
 `central_runtime.py` is already portable:
 - Uses `REPO_ROOT = SCRIPT_PATH.parent.parent` (auto-resolved, not hardcoded)
 - Imports `central_task_db` from `sys.path` (sibling script, moves with it)
-- `AUTONOMY_ROOT = Path("/home/cobra/photo_auto_tagging")` — not dispatcher-specific,
-  unaffected by the extraction
+- `AUTONOMY_ROOT = Path(os.environ.get("CENTRAL_AUTONOMY_ROOT", str(REPO_ROOT.parent / "Dispatcher")))` — env-overridable, defaults to `../Dispatcher` relative to the CENTRAL repo root. **Do not hardcode a path here.**
 
 ---
 

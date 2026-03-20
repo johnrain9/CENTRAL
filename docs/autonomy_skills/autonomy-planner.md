@@ -8,7 +8,7 @@ Purpose:
 
 Bootstrap contract:
 
-- Activate `/home/cobra/photo_auto_tagging/.venv` before using `autonomy ...`
+- Activate the Dispatcher repo venv (`$CENTRAL_AUTONOMY_ROOT` or `../Dispatcher` relative to CENTRAL) before using `autonomy ...`
 - If the console script is missing, run `./.venv/bin/python -m pip install -e .`
 - Use `python -m autonomy.cli ...` only as a fallback
 - First-run profile bootstrap: `autonomy init --profile default`
