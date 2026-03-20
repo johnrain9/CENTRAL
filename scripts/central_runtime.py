@@ -434,6 +434,45 @@ class DaemonLog:
             return f"{prefix} {self._style('RECONCILE', self.BOLD, self.GREEN)} {message}"
         if message.startswith("worker_auto_reconcile_failed"):
             return f"{prefix} {self._style('RECONCILE', self.BOLD, self.RED)} {message}"
+        if message.startswith("worker_audit_pass "):
+            return (
+                f"{prefix} "
+                f"{self._style('AUDIT PASS', self.BOLD, self.GREEN)} "
+                f"task={self._style(fields.get('task', '-'), self.BOLD, self.GREEN)} "
+                f"parent={self._style(fields.get('parent', '-'), self.CYAN)} "
+                f"parent_status={self._style(fields.get('parent_status', '-'), self.BOLD)}"
+            )
+        if message.startswith("worker_audit_rework "):
+            return (
+                f"{prefix} "
+                f"{self._style('AUDIT REWORK', self.BOLD, self.YELLOW)} "
+                f"task={self._style(fields.get('task', '-'), self.BOLD, self.YELLOW)} "
+                f"parent={self._style(fields.get('parent', '-'), self.CYAN)} "
+                f"rework_count={self._style(fields.get('rework_count', '-'), self.BOLD)} "
+                f"parent_status={self._style(fields.get('parent_status', '-'), self.BOLD)}"
+            )
+        if message.startswith("worker_quota_hit "):
+            return (
+                f"{prefix} "
+                f"{self._style('QUOTA HIT', self.BOLD, self.RED)} "
+                f"task={self._style(fields.get('task', '-'), self.BOLD)} "
+                f"backend={self._style(fields.get('backend', '-'), self.YELLOW)} "
+                f"backoff_seconds={self._style(fields.get('backoff_seconds', '-'), self.CYAN)}"
+            )
+        if message.startswith("max_retries_exceeded "):
+            return (
+                f"{prefix} "
+                f"{self._style('FAILED', self.BOLD, self.RED)} "
+                f"task={self._style(fields.get('task', '-'), self.BOLD, self.RED)} "
+                f"retry_count={self._style(fields.get('retry_count', '-'), self.YELLOW)}"
+            )
+        if message.startswith("worker_auto_reconcile_skipped "):
+            return (
+                f"{prefix} "
+                f"{self._style('SKIP', self.BOLD, self.YELLOW)} "
+                f"task={self._style(fields.get('task', '-'), self.BOLD)} "
+                f"reason={self._style(fields.get('reason', '-'), self.DIM)}"
+            )
         return f"{prefix} {message}"
 
 
