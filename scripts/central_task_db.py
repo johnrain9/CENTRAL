@@ -2371,6 +2371,21 @@ def reconcile_task(
             expected_version,
         ),
     )
+    # When the planner closes a task as done, align runtime_status to avoid a
+    # persistent planner_done_runtime_<other> mismatch. Only update if a runtime
+    # state row exists and is in a terminal-but-not-done state.
+    if outcome == "done":
+        conn.execute(
+            """
+            UPDATE task_runtime_state
+            SET runtime_status = 'done',
+                last_transition_at = ?,
+                finished_at = COALESCE(finished_at, ?)
+            WHERE task_id = ?
+              AND runtime_status IN ('failed', 'timeout', 'canceled', 'pending_review')
+            """,
+            (updated_at, updated_at, task_id),
+        )
     for artifact in artifacts:
         insert_artifact(
             conn,
