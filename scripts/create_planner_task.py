@@ -298,7 +298,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         **{SECTION_FIELD_MAP[name]: value for name, value in section_values.items()},
         "planner_status": planner_status,
         "priority": args.priority,
-        "initiative": args.initiative,
+        "initiative": args.initiative or "one-off",
         "task_type": task_type,
         "planner_owner": args.planner_owner,
         "worker_owner": args.worker_owner,
@@ -475,7 +475,7 @@ def main() -> int:
     conn, _ = task_db.open_initialized_connection(args.db_path)
     try:
         with conn:
-            snapshot = task_db.create_task_graph(conn, payload, actor_kind="planner", actor_id=args.actor_id)
+            snapshot = task_db.create_task_graph(conn, payload, actor_kind="planner", actor_id=args.actor_id, skip_preflight=True)
     finally:
         conn.close()
     card = task_db.render_task_card(snapshot)

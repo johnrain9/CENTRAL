@@ -28,6 +28,7 @@ WORKER_SLEEP_SECONDS = 20.0
 def worker_task_payload(task_id: str) -> dict[str, object]:
     return {
         "task_id": task_id,
+        "initiative": "one-off",
         "title": f"Kill task coverage for {task_id}",
         "summary": "Validate operator kill-task behavior",
         "objective_md": "Verify operator stop intent prevents immediate retry.",
@@ -86,6 +87,22 @@ class DispatcherKillTaskTest(unittest.TestCase):
                 )
                 task_db.create_task(conn, worker_task_payload(ACTIVE_TASK_ID), actor_kind="test", actor_id="dispatcher.kill")
                 task_db.create_task(conn, worker_task_payload(INACTIVE_TASK_ID), actor_kind="test", actor_id="dispatcher.kill")
+            # Initialize runtime state for INACTIVE_TASK_ID (no active worker, just queued state)
+            claim = task_db.runtime_claim(
+                conn,
+                worker_id="setUp-worker",
+                queue_name="default",
+                lease_seconds=5,
+                task_id=INACTIVE_TASK_ID,
+                actor_id="dispatcher.kill.setup",
+            )
+            if claim is not None:
+                task_db.runtime_requeue_task(
+                    conn,
+                    task_id=INACTIVE_TASK_ID,
+                    actor_id="dispatcher.kill.setup",
+                    reason="setUp: initialize runtime state without active lease",
+                )
         finally:
             conn.close()
 

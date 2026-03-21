@@ -42,6 +42,7 @@ def task_payload(task_id: str, *, target_repo_id: str, target_repo_root: str) ->
         "target_repo_id": target_repo_id,
         "target_repo_root": target_repo_root,
         "approval_required": False,
+        "initiative": "one-off",
         "metadata": {"test_case": task_id},
         "execution": {
             "task_kind": "read_only",
@@ -176,6 +177,81 @@ class CentralTaskRepoRegistryTest(unittest.TestCase):
         self.assertIn("repo onboarding required before planner task creation/update.", message)
         self.assertIn("target repo is not registered", message)
         self.assertIn("repo-onboard --repo-id motoHelper --repo-root /tmp/motoHelper", message)
+
+    def test_repo_onboard_cli_accepts_max_concurrent_workers(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CLI),
+                "repo-onboard",
+                "--db-path",
+                str(self.db_path),
+                "--repo-id",
+                "CENTRAL",
+                "--repo-root",
+                str(REPO_ROOT),
+                "--max-concurrent-workers",
+                "2",
+                "--json",
+            ],
+            cwd=str(REPO_ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["repo_id"], "CENTRAL")
+        self.assertEqual(payload["metadata"]["max_concurrent_workers"], 2)
+
+    def test_repo_upsert_max_concurrent_workers_preserves_existing_metadata(self) -> None:
+        first = subprocess.run(
+            [
+                sys.executable,
+                str(CLI),
+                "repo-upsert",
+                "--db-path",
+                str(self.db_path),
+                "--repo-id",
+                "CENTRAL",
+                "--repo-root",
+                str(REPO_ROOT),
+                "--metadata-json",
+                '{"foo":"bar"}',
+            ],
+            cwd=str(REPO_ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(first.returncode, 0, msg=first.stderr or first.stdout)
+
+        second = subprocess.run(
+            [
+                sys.executable,
+                str(CLI),
+                "repo-upsert",
+                "--db-path",
+                str(self.db_path),
+                "--repo-id",
+                "CENTRAL",
+                "--repo-root",
+                str(REPO_ROOT),
+                "--max-concurrent-workers",
+                "2",
+                "--json",
+            ],
+            cwd=str(REPO_ROOT),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(second.returncode, 0, msg=second.stderr or second.stdout)
+
+        payload = json.loads(second.stdout)
+        self.assertEqual(payload["metadata"]["foo"], "bar")
+        self.assertEqual(payload["metadata"]["max_concurrent_workers"], 2)
 
 
 if __name__ == "__main__":

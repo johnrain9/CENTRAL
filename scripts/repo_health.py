@@ -30,6 +30,7 @@ from tools.repo_health.contract import (
 )
 
 DISPATCHER_DEFAULT_ROOT = REPO_ROOT
+ECO_ROOT = Path(os.environ.get("CENTRAL_ECO_ROOT", str(REPO_ROOT.parent / "ecosystem")))
 AIM_ROOT = Path("/home/cobra/aimSoloAnalysis")
 MOTO_ROOT = Path("/home/cobra/motoHelper")
 LEGACY_STATUS_MAP = {
@@ -415,7 +416,8 @@ def dispatcher_report(args: argparse.Namespace) -> dict[str, Any]:
         timeout_seconds=args.command_timeout,
     )
     test_result = run_command(
-        [sys.executable, "-m", "unittest", "tests.test_central_runtime_reconcile"],
+        [sys.executable, "-m", "pytest", "--cov=scripts", "--cov=tools",
+         "--cov-report=xml:coverage.xml", "-q", "--no-header"],
         cwd=cfg.repo_root,
         timeout_seconds=max(args.command_timeout, 120.0),
     )
@@ -492,7 +494,7 @@ def dispatcher_report(args: argparse.Namespace) -> dict[str, Any]:
         status=tests_status,
         summary=tests_summary,
         evidence_ids=["dispatcher-tests-command", "dispatcher-worker-smoke-command"],
-        command=f"{quote_command([sys.executable, '-m', 'unittest', 'tests.test_central_runtime_reconcile'])} && {quote_command(['bash', str(cfg.worker_status_smoke)])}",
+        command=f"{quote_command([sys.executable, '-m', 'pytest', '--cov=scripts', '--cov=tools', '--cov-report=xml:coverage.xml', '-q', '--no-header'])} && {quote_command(['bash', str(cfg.worker_status_smoke)])}",
     )
 
     runtime_status = "pass"
@@ -601,9 +603,10 @@ def external_legacy_payload(
     adapter_path: Path,
     timeout_seconds: float,
 ) -> tuple[dict[str, Any] | None, CommandResult]:
+    cwd = repo_root if repo_root.exists() else adapter_path.parent
     payload, result = run_json_command(
         [sys.executable, str(adapter_path), "snapshot", "--json"],
-        cwd=repo_root,
+        cwd=cwd,
         timeout_seconds=timeout_seconds,
     )
     if payload is None:
@@ -901,6 +904,127 @@ def motohelper_report(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def ecosystem_report(args: argparse.Namespace) -> dict[str, Any]:
+    profile = "library"
+    adapter_path = env_path("CENTRAL_REPO_HEALTH_ECO_ADAPTER", ECO_ROOT / "tools" / "repo_health_adapter.py")
+    payload, adapter_result = external_legacy_payload(
+        repo_root=ECO_ROOT,
+        adapter_path=adapter_path,
+        timeout_seconds=max(args.command_timeout, 300.0),
+    )
+    evidence = [
+        make_file_evidence_item("eco-cargo-toml", ECO_ROOT / "Cargo.toml", "Cargo.toml declares the ecosystem crate and its dependencies."),
+        make_command_evidence_item("eco-adapter", adapter_result, summary="ecosystem repo-local health adapter output."),
+    ]
+    if payload is None:
+        return build_unknown_report(
+            repo_id="ecosystem",
+            display_name="ecosystem",
+            repo_root=ECO_ROOT,
+            profile=profile,
+            adapter_name="central.ecosystem.health",
+            summary="ecosystem adapter could not produce a current test/build snapshot.",
+            evidence=evidence,
+            metadata={"adapter_path": str(adapter_path)},
+        )
+
+    tests_result = legacy_check(payload, "tests")
+    coverage_result = legacy_check(payload, "coverage")
+
+    if tests_result and tests_result.get("command"):
+        evidence.append(
+            make_evidence(
+                evidence_id="eco-tests-command",
+                kind="command",
+                source=quote_command(tests_result.get("command")) or "cargo test",
+                summary=str(tests_result.get("summary") or "ecosystem test result"),
+                observed_at=str(tests_result.get("observed_at") or utc_now()),
+            )
+        )
+
+    measured_percent: float | None = None
+    if coverage_result:
+        measured_percent = coverage_result.get("details", {}).get("measured_percent")
+
+    if measured_percent is not None:
+        coverage = make_coverage(
+            status="measured",
+            summary=str(coverage_result.get("summary", f"measured {measured_percent:.1f}%")),
+            measured_percent=measured_percent,
+            evidence_ids=["eco-adapter"],
+        )
+    else:
+        coverage = make_coverage(
+            status="coverage_unknown",
+            summary=str(coverage_result.get("summary") if coverage_result else "No coverage tool available."),
+            notes="Install cargo-llvm-cov or cargo-tarpaulin to enable measured coverage.",
+        )
+
+    cargo_toml_exists = (ECO_ROOT / "Cargo.toml").exists()
+    cargo_lock_exists = (ECO_ROOT / "Cargo.lock").exists()
+
+    checks = [
+        canonical_check(
+            profile=profile,
+            check_id="workspace",
+            status="pass" if cargo_toml_exists else "unknown",
+            summary="Cargo.toml exists and declares the ecosystem crate." if cargo_toml_exists else "Cargo.toml not found.",
+            evidence_ids=["eco-cargo-toml"] if cargo_toml_exists else [],
+        ),
+        canonical_check(
+            profile=profile,
+            check_id="dependencies",
+            status="pass" if cargo_lock_exists else "unknown",
+            summary="Cargo.lock ensures reproducible dependency resolution." if cargo_lock_exists else "Cargo.lock not found.",
+            evidence_ids=["eco-cargo-toml"] if cargo_lock_exists else [],
+        ),
+        canonical_check(
+            profile=profile,
+            check_id="tests",
+            status=legacy_status(tests_result.get("status") if tests_result else None),
+            summary=str(tests_result.get("summary") if tests_result else "ecosystem test status is unknown."),
+            evidence_ids=["eco-tests-command"] if tests_result and tests_result.get("command") else [],
+            command=quote_command(tests_result.get("command")) if tests_result else None,
+        ),
+        canonical_check(
+            profile=profile,
+            check_id="build",
+            status="pass" if cargo_toml_exists else "unknown",
+            summary="cargo build is assumed to work if cargo test runs; no separate build check wired yet.",
+            evidence_ids=["eco-cargo-toml"] if cargo_toml_exists else [],
+        ),
+        canonical_check(
+            profile=profile,
+            check_id="runtime",
+            status="unknown",
+            summary="No runtime health probe is wired for ecosystem yet.",
+            evidence_ids=[],
+            notes="ecosystem is a library crate with no long-running runtime process.",
+        ),
+    ]
+
+    report = build_report(
+        repo=make_repo(
+            repo_id="ecosystem",
+            display_name="ecosystem",
+            repo_root=ECO_ROOT,
+            adapter_name="central.ecosystem.health",
+            adapter_version="0.1.0",
+            profile=profile,
+        ),
+        checks=checks,
+        coverage=coverage,
+        evidence=evidence,
+        headline=summarize_text(
+            str(tests_result.get("summary") if tests_result else "tests unknown"),
+            coverage["summary"],
+            limit=200,
+        ),
+        metadata={"adapter_path": str(adapter_path)},
+    )
+    return report
+
+
 def build_registry(args: argparse.Namespace | None = None) -> dict[str, AdapterSpec]:
     dispatcher_root = resolve_dispatcher_root(args)
     return {
@@ -921,6 +1045,12 @@ def build_registry(args: argparse.Namespace | None = None) -> dict[str, AdapterS
             display_name="motoHelper",
             repo_root=MOTO_ROOT,
             runner=motohelper_report,
+        ),
+        "ecosystem": AdapterSpec(
+            repo_id="ecosystem",
+            display_name="ecosystem",
+            repo_root=ECO_ROOT,
+            runner=ecosystem_report,
         ),
     }
 
@@ -1180,7 +1310,7 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot_parser.add_argument(
         "--repo",
         action="append",
-        choices=["dispatcher", "aimSoloAnalysis", "motoHelper"],
+        choices=["dispatcher", "aimSoloAnalysis", "motoHelper", "ecosystem"],
         help="Restrict output to one or more registered repos.",
     )
     snapshot_parser.add_argument(
@@ -1198,7 +1328,7 @@ def build_parser() -> argparse.ArgumentParser:
     latest_parser = subparsers.add_parser("latest", help="Read the latest health snapshot instantly from CENTRAL DB (no live checks).")
     latest_parser.add_argument(
         "--repo",
-        choices=["dispatcher", "aimSoloAnalysis", "motoHelper"],
+        choices=["dispatcher", "aimSoloAnalysis", "motoHelper", "ecosystem"],
         default=None,
         help="Restrict to a single repo.",
     )

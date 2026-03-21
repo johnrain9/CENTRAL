@@ -38,6 +38,7 @@ TEMPLATES = {
     "feature": {
         "task_type": "feature",
         "priority": 50,
+        "audit_required": True,
         "objective": "Implement the described feature with clean, tested code.",
         "context": "Feature requested via CENTRAL task system. See title and scope for specifics.",
         "scope": "Implement the feature as described. Include unit tests. Document any new public interfaces.",
@@ -49,6 +50,7 @@ TEMPLATES = {
     "bugfix": {
         "task_type": "bugfix",
         "priority": 70,
+        "audit_required": True,
         "objective": "Diagnose and fix the described bug with a targeted, minimal change.",
         "context": "Bug reported via CENTRAL task system. See title for the symptom.",
         "scope": "Root-cause the bug, apply the minimal fix, and add a regression test.",
@@ -60,6 +62,7 @@ TEMPLATES = {
     "refactor": {
         "task_type": "refactor",
         "priority": 40,
+        "audit_required": True,
         "objective": "Improve the structure, readability, or performance of the targeted code without changing external behavior.",
         "context": "Refactor requested via CENTRAL task system. See title and scope for the target area.",
         "scope": "Refactor the described code. Preserve all existing behavior. Do not add features.",
@@ -71,6 +74,7 @@ TEMPLATES = {
     "infrastructure": {
         "task_type": "infrastructure",
         "priority": 60,
+        "audit_required": True,
         "objective": "Implement or improve the described infrastructure, tooling, or configuration.",
         "context": "Infrastructure task dispatched via CENTRAL. See title and scope for specifics.",
         "scope": "Implement the infrastructure change. Validate it works in the target environment.",
@@ -82,6 +86,7 @@ TEMPLATES = {
     "design": {
         "task_type": "design",
         "priority": 30,
+        "audit_required": False,
         "objective": "Produce a design brief or architecture decision that unblocks downstream implementation tasks.",
         "context": "Design task dispatched via CENTRAL. Output is a document or structured spec, not running code.",
         "scope": "Research options, evaluate trade-offs, and produce a written recommendation. Do not implement. Flag open questions explicitly.",
@@ -93,6 +98,7 @@ TEMPLATES = {
     "docs": {
         "task_type": "docs",
         "priority": 35,
+        "audit_required": False,
         "objective": "Create or update documentation so that the described system is clearly understood by AI and human readers.",
         "context": "Docs task dispatched via CENTRAL. See title and scope for the target artifact.",
         "scope": "Write or update the specified documentation. Do not change implementation code unless fixing a doc-code mismatch is explicitly in scope.",
@@ -104,6 +110,7 @@ TEMPLATES = {
     "repo-health": {
         "task_type": "repo-health",
         "priority": 55,
+        "audit_required": True,
         "objective": "Implement or update a repo health adapter so the repo reports status correctly to the CENTRAL health system.",
         "context": "Repo health task dispatched via CENTRAL. See docs/repo_health_adapter_contract.md for the contract.",
         "scope": "Implement the health adapter per the CENTRAL contract. Register the repo if not already registered. Validate the adapter returns correct status.",
@@ -115,6 +122,7 @@ TEMPLATES = {
     "validation": {
         "task_type": "validation",
         "priority": 65,
+        "audit_required": False,
         "objective": "Validate that the described system or feature meets its acceptance criteria in a real environment.",
         "context": "Validation task dispatched via CENTRAL. See title and scope for the target system.",
         "scope": "Run the specified validation steps end-to-end. Document results. Do not implement fixes — file follow-on tasks for any failures found.",
@@ -126,6 +134,7 @@ TEMPLATES = {
     "cleanup": {
         "task_type": "cleanup",
         "priority": 45,
+        "audit_required": False,
         "objective": "Remove dead code, deprecated layers, or unused artifacts that add confusion without value.",
         "context": "Cleanup task dispatched via CENTRAL. See title and scope for what to remove.",
         "scope": "Remove only what is explicitly in scope. Verify nothing currently in use is deleted. Do not refactor adjacent code.",
@@ -137,6 +146,7 @@ TEMPLATES = {
     "planner-ops": {
         "task_type": "planner-ops",
         "priority": 50,
+        "audit_required": True,
         "objective": "Implement or improve CENTRAL planner tooling, workflow scripts, or dispatch infrastructure.",
         "context": "Planner-ops task dispatched via CENTRAL. Target repo is CENTRAL unless otherwise specified.",
         "scope": "Implement the described planner tooling change. Preserve backward compatibility with existing planner workflows unless migration is explicitly in scope.",
@@ -186,11 +196,20 @@ def get_next_task_id(series: str, db_path: str | Path | None = None) -> str:
     return data["next_task_id"]
 
 
+# Repos where capability preflight is meaningful — ops/platform only.
+# Product repos skip capability search (empty repo_ids) so preflight is a
+# fast passthrough that just issues a valid token without redundancy checks.
+PLATFORM_REPOS = {"CENTRAL", "Dispatcher"}
+
+
 def run_preflight(scaffold: dict, db_path: str | Path | None = None) -> dict:
     """Run task-preflight and return the full response.
 
     Builds the intent from the scaffold using the same canonicalize function
     that task-create uses internally, so the token is always valid.
+
+    Only called for platform repos (CENTRAL, Dispatcher). Product repos skip
+    preflight entirely via --skip-preflight in task-create.
     """
     intent = canonicalize_task_intent(scaffold)
     repo_id = str(scaffold.get("target_repo_id") or "CENTRAL").strip() or "CENTRAL"
@@ -253,20 +272,20 @@ def attach_preflight(scaffold: dict, pf: dict, novelty_rationale: str) -> dict:
     }
 
     if blocking_bucket in ("strong_overlap", "weak_overlap") and override_kind != "none":
-        strong_ids = [
+        # Acknowledge ALL candidates (strong and weak) — task-create validates completeness.
+        all_ids = [
             c["candidate_id"] for c in pf.get("candidates", [])
-            if c.get("band") == "strong_overlap"
         ]
         scaffold["override"] = {
             "override_kind": override_kind,
             "override_reason": (
-                "Planner-reviewed: strong_overlap candidates are false positives — "
+                "Planner-reviewed: overlap candidates are false positives — "
                 "keyword matches on unrelated capabilities. Task addresses a distinct "
                 "problem not covered by existing work."
             ),
             "override_actor_id": "planner/coordinator",
             "override_authority": "planner",
-            "acknowledged_candidate_ids": strong_ids,
+            "acknowledged_candidate_ids": all_ids,
         }
 
     return scaffold
@@ -310,6 +329,8 @@ def print_planner_ops_smoke(
         print("  state:        preflight + task-create validated in smoke DB (no canonical DB write)")
     else:
         print("  state:        preflight validated, no canonical DB write")
+    if smoke_db:
+        print("  cleanup:      temp smoke DB removed after validation")
 
 
 def build_alpha(task_id: str, preflight_token: str) -> str:
@@ -386,13 +407,26 @@ def create_task(args: argparse.Namespace) -> None:
     try:
         scaffold = run(planner_new_cmd, db_path=db_path)
         task_id = scaffold.get("task_id", task_id)
-        pf = run_preflight(scaffold, db_path=db_path)
-        alpha = build_alpha(task_id, pf["preflight_token"])
-        novelty_rationale = (
-            args.novelty_rationale
-            or f"New {args.task_type or tpl['task_type']} task: {args.title}"
-        )
-        scaffold = attach_preflight(scaffold, pf, novelty_rationale)
+
+        # Wire audit_required into scaffold metadata — required, no defaults.
+        if "audit_required" not in tpl:
+            print(f"FATAL: template '{template_name}' is missing required 'audit_required' field", file=sys.stderr)
+            sys.exit(1)
+        scaffold_metadata = scaffold.get("metadata") or {}
+        scaffold_metadata["audit_required"] = tpl["audit_required"]
+        scaffold["metadata"] = scaffold_metadata
+        is_platform_repo = (args.repo in PLATFORM_REPOS)
+        if is_platform_repo:
+            pf = run_preflight(scaffold, db_path=db_path)
+            alpha = build_alpha(task_id, pf["preflight_token"])
+            novelty_rationale = (
+                args.novelty_rationale
+                or f"New {args.task_type or tpl['task_type']} task: {args.title}"
+            )
+            scaffold = attach_preflight(scaffold, pf, novelty_rationale)
+        else:
+            pf = {"blocking_bucket": "skipped", "preflight_token": "skipped"}
+            alpha = "n/a"
 
         if is_smoke:
             if args.planner_ops_smoke:
@@ -420,15 +454,19 @@ def create_task(args: argparse.Namespace) -> None:
             print(f"  repo:      {args.repo}")
             print(f"  series:    {series}")
             print(f"  priority:  {args.priority if args.priority is not None else tpl['priority']}")
-            print(f"  preflight: {pf['blocking_bucket']} (token: {pf['preflight_token'][:24]}...)")
+            preflight_display = "skipped (product repo)" if not is_platform_repo else f"{pf['blocking_bucket']} (token: {pf['preflight_token'][:24]}...)"
+            print(f"  preflight: {preflight_display}")
             print(f"  alpha:     {alpha}")
             if args.initiative:
                 print(f"  initiative: {args.initiative}")
             print("  state:     preflight validated, no write performed")
             return
 
+        task_create_cmd = [sys.executable, str(DB_SCRIPT), "task-create", "--input", "-", "--json"]
+        if not is_platform_repo:
+            task_create_cmd.append("--skip-preflight")
         created = run(
-            [sys.executable, str(DB_SCRIPT), "task-create", "--input", "-", "--json"],
+            task_create_cmd,
             stdin=json.dumps(scaffold),
             db_path=db_path,
         )

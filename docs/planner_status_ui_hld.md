@@ -201,6 +201,11 @@ Each repo grouping should show:
 
 Each repo section should be expandable into a task list.
 
+Repo cards should include initiative progress lanes and support:
+
+- sorting by initiative progress (`% done`) or initiative active count
+- a toggle to hide fully completed initiatives
+
 ### Recent Changes
 
 Show tasks or workers changed in the last N hours.

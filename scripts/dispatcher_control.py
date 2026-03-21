@@ -14,6 +14,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
 import central_runtime_v2 as central_runtime
 from central_runtime_v2.config import ALLOWED_CODEX_MODELS, ALLOWED_REASONING_EFFORTS
 
@@ -50,6 +54,10 @@ class ResolvedWorkerModel:
 
 # Backward-compatible alias
 ResolvedCodexModel = ResolvedWorkerModel
+
+
+class MenuExitRequested(Exception):
+    """Raised when operator aborts interactive menu input."""
 
 
 def utc_now() -> str:
@@ -332,7 +340,12 @@ def saved_notify() -> bool | None:
     return bool(value) if value is not None else None
 
 
-def save_config(*, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None, notify: bool | None = None) -> None:
+def saved_audit_model() -> str | None:
+    payload = load_saved_config()
+    return payload.get("audit_worker_model")
+
+
+def save_config(*, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None, notify: bool | None = None, audit_model: str | None = None) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     payload = load_saved_config()
     if max_workers is not None:
@@ -347,6 +360,8 @@ def save_config(*, max_workers: int | None = None, codex_model: str | None = Non
         payload["worker_mode"] = worker_mode
     if notify is not None:
         payload["notify"] = notify
+    if audit_model is not None:
+        payload["audit_worker_model"] = central_runtime.normalize_codex_model(audit_model, label="audit model")
     payload["updated_at"] = utc_now()
     CONFIG_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -480,6 +495,7 @@ def start_dispatcher(*, restart: bool = False, max_workers: int | None = None, c
     if current and restart:
         stop_dispatcher(quiet=True)
 
+    effective_audit_model = saved_audit_model()
     with LAUNCH_LOG_PATH.open("ab") as handle:
         daemon_args = [
             "daemon",
@@ -487,6 +503,8 @@ def start_dispatcher(*, restart: bool = False, max_workers: int | None = None, c
             "--default-worker-model", resolved_model.value,
             "--worker-mode", effective_mode,
         ]
+        if effective_audit_model:
+            daemon_args.extend(["--audit-worker-model", effective_audit_model])
         if effective_notify:
             daemon_args.append("--notify")
         proc = subprocess.Popen(
@@ -634,10 +652,10 @@ def show_workers(*, as_json: bool, task_id: str | None, limit: int, recent_hours
     return 0
 
 
-def show_config(*, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None, notify: bool | None = None) -> int:
+def show_config(*, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None, notify: bool | None = None, audit_model: str | None = None) -> int:
     ensure_runtime()
-    if max_workers is not None or codex_model is not None or worker_model is not None or worker_mode is not None or notify is not None:
-        save_config(max_workers=max_workers, codex_model=codex_model, worker_model=worker_model, worker_mode=worker_mode, notify=notify)
+    if max_workers is not None or codex_model is not None or worker_model is not None or worker_mode is not None or notify is not None or audit_model is not None:
+        save_config(max_workers=max_workers, codex_model=codex_model, worker_model=worker_model, worker_mode=worker_mode, notify=notify, audit_model=audit_model)
     payload = load_saved_config()
     effective_model = resolve_worker_model(None, restart=False)
     print(
@@ -647,6 +665,7 @@ def show_config(*, max_workers: int | None = None, codex_model: str | None = Non
                 "saved_max_workers": payload.get("max_workers"),
                 "saved_default_worker_model": payload.get("default_worker_model"),
                 "saved_default_codex_model": payload.get("default_codex_model"),
+                "saved_audit_worker_model": payload.get("audit_worker_model"),
                 "saved_worker_mode": payload.get("worker_mode"),
                 "saved_notify": payload.get("notify"),
                 "updated_at": payload.get("updated_at"),
@@ -754,7 +773,7 @@ def kill_task(*, task_id: str, reason: str, as_json: bool) -> int:
     if not isinstance(payload, dict):
         die("dispatcher kill-task returned a non-object payload")
     payload["worker_termination"] = terminate_worker(payload.get("kill_target"))
-    snapshot = payload.get("snapshot") or {}
+    snapshot = payload.get("snapshot") or payload  # structured response has snapshot key; flat fallback
     runtime = snapshot.get("runtime") or {}
     if as_json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -769,6 +788,202 @@ def kill_task(*, task_id: str, reason: str, as_json: bool) -> int:
         print("Worker: no active worker")
     print(f"Reason: {payload.get('reason')}")
     return 0
+
+
+def prompt_line(prompt: str) -> str:
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise MenuExitRequested from None
+
+
+def prompt_with_default(label: str, default: str) -> str:
+    raw = prompt_line(f"{label} [{default}]: ")
+    return default if raw == "" else raw
+
+
+def prompt_positive_int(label: str, default: int) -> int:
+    while True:
+        raw = prompt_with_default(label, str(default))
+        try:
+            return argparse_positive_int(raw)
+        except argparse.ArgumentTypeError as exc:
+            print(f"Invalid value: {exc}")
+
+
+def prompt_optional_text(label: str, default: str) -> str:
+    return prompt_with_default(label, default)
+
+
+def prompt_yes_no(label: str, default: bool) -> bool:
+    default_hint = "Y/n" if default else "y/N"
+    while True:
+        raw = prompt_line(f"{label} [{default_hint}]: ").lower()
+        if raw == "":
+            return default
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print("Please enter y or n.")
+
+
+def prompt_worker_mode(default: str) -> str:
+    options = {"1": "codex", "2": "claude", "3": "stub"}
+    reverse = {value: key for key, value in options.items()}
+    default_key = reverse.get(default, "1")
+    while True:
+        print("Worker provider/mode:")
+        print("  1. codex")
+        print("  2. claude")
+        print("  3. stub")
+        raw = prompt_line(f"Select mode [{default_key}]: ")
+        key = default_key if raw == "" else raw
+        selected = options.get(key)
+        if selected:
+            return selected
+        print("Invalid selection.")
+
+
+def print_menu_header() -> None:
+    running = running_pid()
+    restart_workers = resolve_max_workers(None, restart=True)
+    restart_model = resolve_worker_model(None, restart=True)
+    mode = saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
+    notify_enabled = saved_notify() or False
+    print()
+    print("=== Dispatcher Menu ===")
+    print(f"Repo: {REPO_DIR}")
+    print(f"State: {STATE_DIR}")
+    print(f"Running: {'yes (pid ' + str(running) + ')' if running else 'no'}")
+    print(
+        "Restart defaults: "
+        f"workers={restart_workers.value} model={restart_model.value} mode={mode} notify={notify_enabled}"
+    )
+    print()
+    print("  1. Start dispatcher")
+    print("  2. Stop dispatcher")
+    print("  3. Restart dispatcher")
+    print("  4. Update saved config")
+    print("  5. Show status")
+    print("  6. Show workers")
+    print("  7. Show logs")
+    print("  8. Follow logs")
+    print("  9. Run once")
+    print(" 10. Run check")
+    print(" 11. Kill task")
+    print("  0. Exit")
+    print()
+
+
+def run_start_or_restart(*, restart: bool) -> int:
+    workers_default = resolve_max_workers(None, restart=restart).value
+    model_default = resolve_worker_model(None, restart=restart).value
+    mode_default = saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
+    notify_default = saved_notify() or False
+
+    max_workers = prompt_positive_int("Max workers", workers_default)
+    worker_model = prompt_optional_text("Default worker model", model_default)
+    worker_mode = prompt_worker_mode(mode_default)
+    notify = prompt_yes_no("Enable notifications", notify_default)
+    return start_dispatcher(
+        restart=restart,
+        max_workers=max_workers,
+        worker_model=worker_model,
+        worker_mode=worker_mode,
+        notify=notify,
+    )
+
+
+def run_config_update() -> int:
+    workers_default = saved_max_workers() or resolve_max_workers(None, restart=False).value
+    model_default = saved_worker_model() or resolve_worker_model(None, restart=False).value
+    mode_default = saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
+    notify_default = saved_notify() or False
+
+    max_workers = prompt_positive_int("Saved max workers", workers_default)
+    worker_model = prompt_optional_text("Saved default worker model", model_default)
+    worker_mode = prompt_worker_mode(mode_default)
+    notify = prompt_yes_no("Saved notify default", notify_default)
+    return show_config(
+        max_workers=max_workers,
+        worker_model=worker_model,
+        worker_mode=worker_mode,
+        notify=notify,
+    )
+
+
+def run_workers_prompt() -> int:
+    as_json = prompt_yes_no("Output JSON", False)
+    task_id = prompt_line("Filter by task id (optional): ")
+    limit = prompt_positive_int("Rows limit", 5)
+    recent_hours_raw = prompt_with_default("Recent hours", "24")
+    try:
+        recent_hours = float(recent_hours_raw)
+    except ValueError:
+        print(f"Invalid recent hours: {recent_hours_raw!r}")
+        return 1
+    return show_workers(as_json=as_json, task_id=(task_id or None), limit=limit, recent_hours=recent_hours)
+
+
+def run_kill_task_prompt() -> int:
+    task_id = prompt_line("Task id: ")
+    if not task_id:
+        print("Task id is required.")
+        return 1
+    reason = prompt_with_default("Reason", "operator kill requested")
+    as_json = prompt_yes_no("Output JSON", False)
+    return kill_task(task_id=task_id, reason=reason, as_json=as_json)
+
+
+def run_menu() -> int:
+    ensure_runtime()
+    init_db()
+    try:
+        while True:
+            print_menu_header()
+            choice = prompt_line("Select action [0]: ") or "0"
+            if choice == "0":
+                print("Exiting dispatcher menu.")
+                return 0
+            if choice == "1":
+                run_start_or_restart(restart=False)
+                continue
+            if choice == "2":
+                stop_dispatcher()
+                continue
+            if choice == "3":
+                run_start_or_restart(restart=True)
+                continue
+            if choice == "4":
+                run_config_update()
+                continue
+            if choice == "5":
+                print_status()
+                continue
+            if choice == "6":
+                run_workers_prompt()
+                continue
+            if choice == "7":
+                show_logs(follow=False)
+                continue
+            if choice == "8":
+                show_logs(follow=True)
+                continue
+            if choice == "9":
+                run_once()
+                continue
+            if choice == "10":
+                run_check()
+                continue
+            if choice == "11":
+                run_kill_task_prompt()
+                continue
+            print(f"Invalid menu option: {choice!r}")
+    except MenuExitRequested:
+        print("Exiting dispatcher menu.")
+        return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -809,11 +1024,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("run-once", help="Run one dispatcher cycle")
     subparsers.add_parser("run_once", help="Run one dispatcher cycle")
     subparsers.add_parser("check", help="Validate config and run a stub self-check")
+    subparsers.add_parser("menu", help="Open interactive dispatcher menu")
 
     config_parser = subparsers.add_parser("config", help="Show or update persisted launcher defaults")
     config_parser.add_argument("--max-workers", type=argparse_positive_int)
     config_parser.add_argument("--codex-model", help="(deprecated, use --worker-model)")
     config_parser.add_argument("--worker-model")
+    config_parser.add_argument("--audit-model", help="Separate model for audit tasks (cross-model auditing)")
     config_parser.add_argument("--worker-mode", choices=["codex", "claude", "stub"])
     config_parser.add_argument("--notify", action="store_true", default=None)
     config_parser.add_argument("--no-notify", dest="notify", action="store_false")
@@ -867,6 +1084,8 @@ def main(argv: list[str]) -> int:
         return run_once()
     if cmd == "check":
         return run_check()
+    if cmd == "menu":
+        return run_menu()
     if cmd == "config":
         return show_config(
             max_workers=getattr(args, "max_workers", None),
@@ -874,6 +1093,7 @@ def main(argv: list[str]) -> int:
             worker_model=getattr(args, "worker_model", None),
             worker_mode=getattr(args, "worker_mode", None),
             notify=getattr(args, "notify", None),
+            audit_model=getattr(args, "audit_model", None),
         )
     if cmd == "kill-task":
         return kill_task(task_id=args.task_id, reason=args.reason, as_json=getattr(args, "json", False))

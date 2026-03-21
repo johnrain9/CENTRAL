@@ -18,6 +18,7 @@ DB_CLI = REPO_ROOT / "scripts" / "central_task_db.py"
 def make_task_payload(*, task_id: str, target_repo_id: str, target_repo_root: str) -> dict[str, object]:
     return {
         "task_id": task_id,
+        "initiative": "one-off",
         "title": f"{task_id} repo lookup smoke",
         "summary": "Validate repo lookup canonicalization.",
         "objective_md": "Ensure variant repo references resolve to canonical repo IDs.",
@@ -37,7 +38,7 @@ def make_task_payload(*, task_id: str, target_repo_id: str, target_repo_root: st
         "target_repo_id": target_repo_id,
         "target_repo_root": target_repo_root,
         "approval_required": False,
-        "metadata": {"smoke": True},
+        "metadata": {"smoke": True, "audit_required": False},
         "execution": {
             "task_kind": "read_only",
             "sandbox_mode": "workspace-write",
@@ -108,7 +109,7 @@ class RepoLookupCliTest(unittest.TestCase):
             ),
             "task-create.json",
         )
-        created = json.loads(self.run_cli("task-create", "--input", str(payload_path), "--json").stdout)
+        created = json.loads(self.run_cli("task-create", "--input", str(payload_path), "--skip-preflight", "--json").stdout)
         self.assertEqual(created["target_repo_id"], "MOTOHELPER")
         self.assertEqual(created["target_repo_root"], "/home/cobra/motoHelper")
 

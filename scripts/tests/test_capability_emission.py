@@ -19,7 +19,14 @@ if str(SCRIPTS_DIR) not in sys.path:
 import central_task_db as task_db  # type: ignore
 
 
-def task_payload(task_id: str) -> dict[str, object]:
+def task_payload(
+    task_id: str,
+    *,
+    target_repo_id: str = "CENTRAL",
+    target_repo_root: str | None = None,
+    audit_required: bool = True,
+) -> dict[str, object]:
+    repo_root = target_repo_root or str(REPO_ROOT)
     return {
         "task_id": task_id,
         "title": f"{task_id} capability emission test",
@@ -38,11 +45,11 @@ def task_payload(task_id: str) -> dict[str, object]:
         "task_type": "implementation",
         "planner_owner": "planner/coordinator",
         "worker_owner": None,
-        "target_repo_id": "CENTRAL",
-        "target_repo_root": str(REPO_ROOT),
+        "target_repo_id": target_repo_id,
+        "target_repo_root": repo_root,
         "approval_required": False,
         "initiative": "capability-emission",
-        "metadata": {"audit_required": True},
+        "metadata": {"audit_required": audit_required},
         "execution": {
             "task_kind": "mutating",
             "sandbox_mode": "workspace-write",
@@ -112,6 +119,7 @@ class CapabilityEmissionTest(unittest.TestCase):
         try:
             task_db.apply_migrations(conn, task_db.load_migrations(task_db.resolve_migrations_dir(None)))
             task_db.ensure_repo(conn, repo_id="CENTRAL", repo_root=str(REPO_ROOT), display_name="CENTRAL")
+            task_db.ensure_repo(conn, repo_id="WORKER", repo_root=str(REPO_ROOT / "generated" / "worker"), display_name="WORKER")
             conn.commit()
             task_db.create_task_graph(
                 conn,
@@ -156,6 +164,94 @@ class CapabilityEmissionTest(unittest.TestCase):
         )
         conn.commit()
 
+    def test_task_create_auto_registers_draft_capability(self) -> None:
+        conn = self._reopen_conn()
+        try:
+            capability = task_db.fetch_capability_payload(
+                conn,
+                task_db.derive_task_capability_id("CENTRAL-OPS-6701"),
+            )
+            self.assertIsNotNone(capability)
+            assert capability is not None
+            self.assertEqual(capability["status"], task_db.TASK_CAPABILITY_DRAFT_STATUS)
+            self.assertEqual(capability["verification_level"], "provisional")
+            self.assertEqual(capability["verified_by_task_id"], "CENTRAL-OPS-6701")
+            self.assertEqual(capability["owning_repo_id"], "CENTRAL")
+            self.assertEqual(capability["source_tasks"][0]["relationship_kind"], "created_by")
+            lifecycle = dict((capability.get("metadata") or {}).get("task_capability_lifecycle") or {})
+            self.assertEqual(lifecycle.get("stage"), "draft")
+        finally:
+            conn.close()
+
+    def test_done_reconcile_activates_task_capability_and_enriches_entrypoints(self) -> None:
+        conn = self._reopen_conn()
+        try:
+            task_id = "CENTRAL-OPS-6702"
+            task_db.create_task(
+                conn,
+                task_payload(task_id, audit_required=False),
+                actor_kind="test",
+                actor_id="capability.emission.tests",
+                auto_register_capability=True,
+            )
+            task_db.insert_artifact(
+                conn,
+                task_id=task_id,
+                artifact_kind="runtime_artifact",
+                path_or_uri="logs/runtime.log",
+                label="runtime.log",
+                metadata={"source": "unit-test"},
+            )
+            row = task_db.fetch_task_row(conn, task_id)
+            assert row is not None
+            task_db.reconcile_task(
+                conn,
+                task_id=task_id,
+                expected_version=int(row["version"]),
+                outcome="done",
+                summary="done",
+                notes=None,
+                tests=None,
+                artifacts=["artifacts/closeout.md"],
+                actor_kind="planner",
+                actor_id="capability.emission.tests",
+            )
+            capability = task_db.fetch_capability_payload(conn, task_db.derive_task_capability_id(task_id))
+            self.assertIsNotNone(capability)
+            assert capability is not None
+            self.assertEqual(capability["status"], "active")
+            self.assertEqual(capability["verification_level"], "planner_verified")
+            self.assertIn("logs/runtime.log", capability["entrypoints"])
+            self.assertIn("artifacts/closeout.md", capability["entrypoints"])
+            lifecycle = dict((capability.get("metadata") or {}).get("task_capability_lifecycle") or {})
+            self.assertEqual(lifecycle.get("stage"), "active")
+        finally:
+            conn.close()
+
+    def test_skip_preflight_product_repo_skips_capability_registration(self) -> None:
+        conn = self._reopen_conn()
+        try:
+            payload = task_payload(
+                "CENTRAL-OPS-6703",
+                target_repo_id="WORKER",
+                target_repo_root=str(REPO_ROOT / "generated" / "worker"),
+                audit_required=False,
+            )
+            task_db.create_task_graph(
+                conn,
+                payload,
+                actor_kind="test",
+                actor_id="capability.emission.tests",
+                skip_preflight=True,
+            )
+            capability = task_db.fetch_capability_payload(
+                conn,
+                task_db.derive_task_capability_id("CENTRAL-OPS-6703"),
+            )
+            self.assertIsNone(capability)
+        finally:
+            conn.close()
+
     def test_audit_pass_with_valid_capability_mutation_writes_registry(self) -> None:
         conn = self._reopen_conn()
         try:
@@ -187,6 +283,13 @@ class CapabilityEmissionTest(unittest.TestCase):
             parent_snap = task_db.fetch_task_snapshots(conn, task_id="CENTRAL-OPS-6701")[0]
             self.assertEqual(audit_snap["planner_status"], "done")
             self.assertEqual(parent_snap["planner_status"], "done")
+            task_capability = task_db.fetch_capability_payload(
+                conn,
+                task_db.derive_task_capability_id("CENTRAL-OPS-6701"),
+            )
+            self.assertIsNotNone(task_capability)
+            assert task_capability is not None
+            self.assertEqual(task_capability["status"], "active")
 
             application_rows = conn.execute(
                 "SELECT source_task_id, outcome FROM capability_mutation_applications"
@@ -222,9 +325,16 @@ class CapabilityEmissionTest(unittest.TestCase):
             parent_snap = task_db.fetch_task_snapshots(conn, task_id="CENTRAL-OPS-6701")[0]
             self.assertEqual(audit_snap["planner_status"], "todo")
             self.assertEqual(parent_snap["planner_status"], "awaiting_audit")
+            task_capability = task_db.fetch_capability_payload(
+                conn,
+                task_db.derive_task_capability_id("CENTRAL-OPS-6701"),
+            )
+            self.assertIsNotNone(task_capability)
+            assert task_capability is not None
+            self.assertEqual(task_capability["status"], task_db.TASK_CAPABILITY_DRAFT_STATUS)
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM capabilities").fetchone()[0],
-                0,
+                1,
             )
         finally:
             conn.close()

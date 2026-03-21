@@ -47,6 +47,8 @@ MAX_TASK_ID_RESERVATION_COUNT = 10
 TASK_FILE_NAME_RE = re.compile(r"^CENTRAL-OPS-[0-9]+\\.md$")
 TASK_ID_RE = re.compile(r"^(?P<series>[A-Z0-9]+(?:-[A-Z0-9]+)*)-(?P<number>[0-9]+)$")
 TASK_ID_SERIES_RE = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)*$")
+REPO_MAX_CONCURRENT_WORKERS_METADATA_KEY = "max_concurrent_workers"
+DEFAULT_REPO_MAX_CONCURRENT_WORKERS = 3
 REPO_LOOKUP_TOKEN_RE = re.compile(r"[^a-z0-9]+")
 SECTION_RE = re.compile(r"^## (.+)$", re.MULTILINE)
 KEY_VALUE_RE = re.compile(r"^- `([^`]+)`: (.+)$", re.MULTILINE)
@@ -82,6 +84,7 @@ CAPABILITY_SOURCE_RELATIONSHIP_KINDS = {
 }
 CAPABILITY_CLOSEOUT_TASK_TYPE_CATEGORIES = {"must_emit", "may_emit", "must_not_emit"}
 CAPABILITY_MUTATION_ACTIONS = {"create", "update", "deprecate", "supersede"}
+TASK_CAPABILITY_DRAFT_STATUS = "proposed"
 
 
 @dataclass(frozen=True)
@@ -342,6 +345,13 @@ def parse_int(value: Any, *, field: str) -> int:
         return int(value)
     except (TypeError, ValueError):
         die(f"invalid integer for {field}: {value!r}")
+
+
+def parse_positive_int(value: Any, *, field: str) -> int:
+    parsed = parse_int(value, field=field)
+    if parsed <= 0:
+        die(f"{field} must be >= 1")
+    return parsed
 
 
 def compact_json(value: Any) -> str:
@@ -1055,6 +1065,13 @@ def fetch_repo_registry(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     ]
 
 
+def resolve_repo_max_concurrent_workers(repo_metadata: dict[str, Any]) -> int:
+    raw_value = repo_metadata.get(REPO_MAX_CONCURRENT_WORKERS_METADATA_KEY)
+    if raw_value is None:
+        return DEFAULT_REPO_MAX_CONCURRENT_WORKERS
+    return parse_positive_int(raw_value, field=f"repo metadata `{REPO_MAX_CONCURRENT_WORKERS_METADATA_KEY}`")
+
+
 def iter_repo_lookup_candidates(repo: dict[str, Any]) -> Iterable[tuple[str, str]]:
     seen: set[tuple[str, str]] = set()
     raw_values = [
@@ -1708,6 +1725,172 @@ def upsert_capability(
         created_at=normalized["updated_at"],
     )
     return fetch_capability_payload(conn, normalized["capability_id"]) or {}
+
+
+def derive_task_capability_id(task_id: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", task_id.strip().lower()).strip("_")
+    return normalize_capability_id(f"task_{slug}")
+
+
+def task_scaffold_keywords(payload: dict[str, Any], *, limit: int = 12) -> list[str]:
+    text = " ".join(
+        [
+            str(payload.get("title") or ""),
+            str(payload.get("summary") or ""),
+            str(payload.get("objective_md") or ""),
+            str(payload.get("scope_md") or ""),
+        ]
+    )
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for token in lexical_tokens(text):
+        if token in seen:
+            continue
+        seen.add(token)
+        keywords.append(token)
+        if len(keywords) >= limit:
+            break
+    return keywords
+
+
+def task_scaffold_entrypoints(payload: dict[str, Any], *, limit: int = 12) -> list[str]:
+    source_text = "\n".join(
+        [
+            str(payload.get("scope_md") or ""),
+            str(payload.get("objective_md") or ""),
+            str(payload.get("deliverables_md") or ""),
+            str(payload.get("dispatch_md") or ""),
+        ]
+    )
+    matches = re.findall(r"`([^`]+)`", source_text)
+    entrypoints: list[str] = []
+    seen: set[str] = set()
+    for raw in matches:
+        cleaned = normalize_text_whitespace(raw)
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        entrypoints.append(cleaned)
+        if len(entrypoints) >= limit:
+            break
+    return entrypoints
+
+
+def register_task_draft_capability(
+    conn: sqlite3.Connection,
+    *,
+    task_payload: dict[str, Any],
+    actor_kind: str,
+    actor_id: str,
+) -> dict[str, Any]:
+    task_id = str(task_payload.get("task_id") or "")
+    if not task_id:
+        return {}
+    target_repo_id = str(task_payload.get("target_repo_id") or "").strip()
+    if not target_repo_id:
+        return {}
+    capability_id = derive_task_capability_id(task_id)
+    if fetch_capability_payload(conn, capability_id) is not None:
+        return {}
+    title = str(task_payload.get("title") or task_id).strip() or task_id
+    summary = str(task_payload.get("summary") or "").strip()
+    if not summary:
+        summary = markdown_summary(str(task_payload.get("objective_md") or ""), fallback=title)
+    scope_md = str(task_payload.get("scope_md") or "").strip()
+    create_capability(
+        conn,
+        {
+            "capability_id": capability_id,
+            "name": f"{title} (draft capability)",
+            "summary": summary,
+            "status": TASK_CAPABILITY_DRAFT_STATUS,
+            "kind": str(task_payload.get("task_type") or "workflow"),
+            "scope_kind": "workflow",
+            "owning_repo_id": target_repo_id,
+            "affected_repo_ids": [target_repo_id],
+            "when_to_use_md": scope_md or f"Use when implementing the scope tracked by {task_id}.",
+            "do_not_use_for_md": "Do not treat as active until task reconciliation outcome is done.",
+            "entrypoints": task_scaffold_entrypoints(task_payload),
+            "keywords": task_scaffold_keywords(task_payload),
+            "evidence_summary_md": f"Draft capability scaffolded from task creation intent for {task_id}.",
+            "verification_level": "provisional",
+            "verified_by_task_id": task_id,
+            "metadata": {
+                "task_capability_lifecycle": {
+                    "task_id": task_id,
+                    "stage": "draft",
+                    "created_from": "task-create",
+                }
+            },
+            "source_tasks": [{"task_id": task_id, "relationship_kind": "created_by"}],
+            "event_type": "capability.task_draft_registered",
+            "event_payload": {"task_id": task_id, "stage": "draft"},
+        },
+        actor_kind=actor_kind,
+        actor_id=actor_id,
+    )
+    return {"capability_id": capability_id}
+
+
+def activate_task_capability(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    actor_kind: str,
+    actor_id: str,
+    closeout_artifacts: list[str] | None = None,
+    source: str,
+) -> dict[str, Any]:
+    capability_id = derive_task_capability_id(task_id)
+    existing = fetch_capability_payload(conn, capability_id)
+    if existing is None:
+        return {}
+    artifacts = fetch_artifacts(conn, task_id)
+    runtime_artifacts = [
+        str(item["path_or_uri"])
+        for item in artifacts
+        if str(item.get("artifact_kind") or "") == "runtime_artifact" and str(item.get("path_or_uri") or "").strip()
+    ]
+    all_artifacts = sorted(
+        {
+            *(closeout_artifacts or []),
+            *runtime_artifacts,
+        }
+    )
+    metadata = dict(existing.get("metadata") or {})
+    lifecycle = dict(metadata.get("task_capability_lifecycle") or {})
+    lifecycle.update(
+        {
+            "task_id": task_id,
+            "stage": "active",
+            "activated_from": source,
+            "activated_at": now_iso(),
+        }
+    )
+    metadata["task_capability_lifecycle"] = lifecycle
+    entrypoints = list(existing.get("entrypoints") or [])
+    entrypoints.extend(all_artifacts)
+    updated = dict(existing)
+    updated["status"] = "active"
+    updated["verification_level"] = "planner_verified"
+    updated["verified_by_task_id"] = task_id
+    updated["entrypoints"] = sorted(set(entrypoints))
+    updated["updated_at"] = now_iso()
+    updated["metadata"] = metadata
+    updated["source_tasks"] = [{"task_id": task_id, "relationship_kind": "updated_by"}]
+    updated["event_type"] = "capability.task_draft_activated"
+    updated["event_payload"] = {
+        "task_id": task_id,
+        "source": source,
+        "closeout_artifact_count": len(closeout_artifacts or []),
+        "runtime_artifact_count": len(runtime_artifacts),
+    }
+    if all_artifacts:
+        updated["evidence_summary_md"] = (
+            f"Activated from task closeout for {task_id} with artifacts: "
+            + ", ".join(all_artifacts[:5])
+        )
+    return upsert_capability(conn, updated, actor_kind=actor_kind, actor_id=actor_id)
 
 
 def _require_mapping(value: Any, *, field: str) -> dict[str, Any]:
@@ -3804,7 +3987,14 @@ def merge_task_metadata(existing_raw: str, incoming: dict[str, Any] | None) -> d
     return current
 
 
-def create_task(conn: sqlite3.Connection, payload: dict[str, Any], *, actor_kind: str, actor_id: str) -> dict[str, Any]:
+def create_task(
+    conn: sqlite3.Connection,
+    payload: dict[str, Any],
+    *,
+    actor_kind: str,
+    actor_id: str,
+    auto_register_capability: bool = False,
+) -> dict[str, Any]:
     normalized = validate_task_payload(payload, for_update=False)
     resolve_task_repo_target(conn, normalized)
     task_series, _ = parse_task_id(normalized["task_id"])
@@ -3885,6 +4075,13 @@ def create_task(conn: sqlite3.Connection, payload: dict[str, Any], *, actor_kind
             "dependencies": normalized["dependencies"],
         },
     )
+    if auto_register_capability:
+        register_task_draft_capability(
+            conn,
+            task_payload=normalized,
+            actor_kind=actor_kind,
+            actor_id=actor_id,
+        )
     reconcile_task_id_reservations(conn, series=task_series, actor_id=actor_id)
     return fetch_task_snapshots(conn, task_id=normalized["task_id"])[0]
 
@@ -3894,10 +4091,19 @@ def task_requires_audit(*, task_type: str, source_kind: str, metadata: dict[str,
 
     Investigation tasks are exempt — auditing an investigation is low-value
     and wastes tokens. This is a hard constraint, not a default.
+
+    audit_required MUST be explicitly set in metadata. Missing values are a
+    fatal error — no silent defaults.
     """
     if task_type == "investigation":
         return False
-    return bool(metadata.get("audit_required"))
+    if "audit_required" not in metadata:
+        raise ValueError(
+            f"metadata.audit_required is missing for task_type={task_type!r}, "
+            f"source_kind={source_kind!r}. Every task must explicitly declare "
+            f"audit_required — there is no default. Fix the creation path."
+        )
+    return bool(metadata["audit_required"])
 
 
 def build_audit_task_payload(parent_payload: dict[str, Any], audit_override: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3966,13 +4172,56 @@ def create_task_graph(
     *,
     actor_kind: str,
     actor_id: str,
+    skip_preflight: bool = False,
 ) -> dict[str, Any]:
     """Create a task and, if audit is required, a paired audit task.
 
     Returns the parent task snapshot.
+
+    skip_preflight=True bypasses the preflight check entirely. Use only for
+    product repos (non-platform) where capability deduplication is not needed.
     """
     normalized_payload = validate_task_payload(payload, for_update=False)
     resolve_task_repo_target(conn, normalized_payload)
+    task_id = str(normalized_payload.get("task_id") or "")
+    metadata = dict(normalized_payload.get("metadata") or {})
+    task_type = str(normalized_payload.get("task_type") or "implementation")
+    source_kind = str(normalized_payload.get("source_kind") or "planner")
+
+    if skip_preflight:
+        # Product repo — skip capability deduplication entirely.
+        try:
+            begin_immediate(conn)
+            if task_requires_audit(task_type=task_type, source_kind=source_kind, metadata=metadata):
+                audit_task_id = f"{task_id}-AUDIT"
+                parent_metadata = dict(metadata)
+                parent_metadata["child_audit_task_id"] = audit_task_id
+                parent_metadata["audit_verdict"] = "pending"
+                parent_payload = dict(normalized_payload)
+                parent_payload["metadata"] = parent_metadata
+                parent_snapshot = create_task(
+                    conn,
+                    parent_payload,
+                    actor_kind=actor_kind,
+                    actor_id=actor_id,
+                    auto_register_capability=False,
+                )
+                audit_payload = build_audit_task_payload(parent_payload)
+                create_task(conn, audit_payload, actor_kind=actor_kind, actor_id=actor_id)
+            else:
+                parent_snapshot = create_task(
+                    conn,
+                    normalized_payload,
+                    actor_kind=actor_kind,
+                    actor_id=actor_id,
+                    auto_register_capability=False,
+                )
+            conn.commit()
+            return parent_snapshot
+        except BaseException:
+            conn.rollback()
+            raise
+
     preflight_block = payload.get("preflight")
     if not isinstance(preflight_block, dict):
         die_preflight(error_code="preflight_missing", message="task creation requires a preflight block")
@@ -4013,10 +4262,6 @@ def create_task_graph(
         related_task_ids=related_task_ids,
         related_capability_ids=related_capability_ids,
     )
-    task_id = str(normalized_payload.get("task_id") or "")
-    metadata = dict(normalized_payload.get("metadata") or {})
-    task_type = str(normalized_payload.get("task_type") or "implementation")
-    source_kind = str(normalized_payload.get("source_kind") or "planner")
     if override_kind != "none":
         metadata["preflight_override"] = {
             "kind": override_kind,
@@ -4047,11 +4292,23 @@ def create_task_graph(
             parent_metadata["audit_verdict"] = "pending"
             parent_payload = dict(normalized_payload)
             parent_payload["metadata"] = parent_metadata
-            parent_snapshot = create_task(conn, parent_payload, actor_kind=actor_kind, actor_id=actor_id)
+            parent_snapshot = create_task(
+                conn,
+                parent_payload,
+                actor_kind=actor_kind,
+                actor_id=actor_id,
+                auto_register_capability=True,
+            )
             audit_payload = build_audit_task_payload(parent_payload)
             create_task(conn, audit_payload, actor_kind=actor_kind, actor_id=actor_id)
         else:
-            parent_snapshot = create_task(conn, normalized_payload, actor_kind=actor_kind, actor_id=actor_id)
+            parent_snapshot = create_task(
+                conn,
+                normalized_payload,
+                actor_kind=actor_kind,
+                actor_id=actor_id,
+                auto_register_capability=True,
+            )
         persist_task_creation_preflight(
             conn,
             task_id=task_id,
@@ -4114,6 +4371,15 @@ def runtime_requeue_task(
         """,
         (retry_count, transition_at, task_id),
     )
+    # Reset planner status to 'todo' so the task is dispatch-eligible.
+    # A requeued task with planner_status='failed' silently blocks dispatch.
+    planner_row = conn.execute("SELECT planner_status FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+    old_planner_status = planner_row["planner_status"] if planner_row else None
+    if old_planner_status in ("failed", "in_progress", "awaiting_audit"):
+        conn.execute(
+            "UPDATE tasks SET planner_status = 'todo', updated_at = ? WHERE task_id = ?",
+            (transition_at, task_id),
+        )
     insert_event(
         conn,
         task_id=task_id,
@@ -4124,6 +4390,7 @@ def runtime_requeue_task(
             "summary": reason,
             "had_active_lease": had_active_lease,
             "reset_retry_count": reset_retry_count,
+            "planner_status_reset": old_planner_status if old_planner_status in ("failed", "in_progress", "awaiting_audit") else None,
         },
     )
     conn.commit()
@@ -4378,6 +4645,15 @@ def reconcile_task(
         actor_id=actor_id,
         payload={"outcome": outcome, "summary": summary, "tests": tests, "artifacts": artifacts},
     )
+    if outcome == "done":
+        activate_task_capability(
+            conn,
+            task_id=task_id,
+            actor_kind=actor_kind,
+            actor_id=actor_id,
+            closeout_artifacts=artifacts,
+            source="task-reconcile",
+        )
     return fetch_task_snapshots(conn, task_id=task_id)[0]
 
 
@@ -4486,6 +4762,15 @@ def auto_reconcile_runtime_success(
             "run_id": run_id,
         },
     )
+    if outcome == "done":
+        activate_task_capability(
+            conn,
+            task_id=task_id,
+            actor_kind="runtime",
+            actor_id=actor_id,
+            closeout_artifacts=artifacts,
+            source="runtime-auto-reconcile",
+        )
     conn.commit()
     return fetch_task_snapshots(conn, task_id=task_id)[0]
 
@@ -4807,6 +5092,14 @@ def reconcile_audit_pass(
         actor_kind="runtime",
         actor_id=actor_id,
         payload={"audit_task_id": audit_task_id, "summary": summary},
+    )
+    activate_task_capability(
+        conn,
+        task_id=parent_task_id,
+        actor_kind="runtime",
+        actor_id=actor_id,
+        closeout_artifacts=[],
+        source="audit-pass",
     )
 
     conn.commit()
@@ -5283,6 +5576,21 @@ def begin_immediate(conn: sqlite3.Connection) -> None:
     conn.execute("BEGIN IMMEDIATE")
 
 
+def active_repo_worker_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    rows = conn.execute(
+        """
+        SELECT t.target_repo_id AS repo_id, COUNT(*) AS active_count
+        FROM task_active_leases l
+        JOIN tasks t ON t.task_id = l.task_id
+        GROUP BY t.target_repo_id
+        """
+    ).fetchall()
+    return {
+        str(row["repo_id"]): int(row["active_count"])
+        for row in rows
+    }
+
+
 def runtime_claim(
     conn: sqlite3.Connection,
     *,
@@ -5298,6 +5606,13 @@ def runtime_claim(
     ordered = order_eligible_snapshots(snapshots)
     if task_id is not None:
         ordered = [snapshot for snapshot in ordered if snapshot["task_id"] == task_id]
+    active_counts = active_repo_worker_counts(conn)
+    ordered = [
+        snapshot
+        for snapshot in ordered
+        if active_counts.get(str(snapshot["target_repo_id"]), 0)
+        < resolve_repo_max_concurrent_workers(snapshot.get("repo_metadata") or {})
+    ]
     if not ordered:
         conn.rollback()
         if raise_on_empty:
@@ -6311,13 +6626,22 @@ def open_initialized_connection(db_path_arg: str | None) -> tuple[sqlite3.Connec
 def command_repo_upsert(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
+        metadata = None if args.metadata_json is None else parse_json_text(args.metadata_json, default={})
+        if args.max_concurrent_workers is not None:
+            if metadata is None:
+                existing = fetch_repo_payload(conn, args.repo_id)
+                metadata = dict(existing.get("metadata") or {}) if existing is not None else {}
+            metadata[REPO_MAX_CONCURRENT_WORKERS_METADATA_KEY] = parse_positive_int(
+                args.max_concurrent_workers,
+                field="--max-concurrent-workers",
+            )
         with conn:
             ensure_repo(
                 conn,
                 repo_id=args.repo_id,
                 repo_root=args.repo_root,
                 display_name=args.display_name or args.repo_id,
-                metadata=None if args.metadata_json is None else parse_json_text(args.metadata_json, default={}),
+                metadata=metadata,
             )
             if args.alias is not None:
                 replace_repo_aliases(conn, repo_id=args.repo_id, aliases=args.alias)
@@ -6703,7 +7027,7 @@ def command_task_create(args: argparse.Namespace) -> int:
     payload = load_json_document(args.input)
     conn, _ = open_initialized_connection(args.db_path)
     try:
-        snapshot = create_task_graph(conn, payload, actor_kind="planner", actor_id=args.actor_id)
+        snapshot = create_task_graph(conn, payload, actor_kind="planner", actor_id=args.actor_id, skip_preflight=getattr(args, "skip_preflight", False))
     finally:
         conn.close()
     return print_or_json(render_task_card(snapshot), as_json=args.json, formatter=json_dumps)
@@ -7531,6 +7855,11 @@ def operator_fail_task(
         conn.rollback()
         raise RuntimeError(f"runtime state missing for {task_id}; run runtime-transition first or use task-show to confirm the task exists")
     lease = fetch_active_lease(conn, task_id)
+    had_active_lease = lease is not None
+    lease_metadata = parse_json_text(str(lease["lease_metadata_json"]), default={}) if lease is not None else {}
+    supervision = lease_metadata.get("supervision") if isinstance(lease_metadata, dict) else None
+    worker_pid = (supervision or {}).get("worker_pid")
+    worker_process_start_token = (supervision or {}).get("worker_process_start_token")
     if lease is not None:
         close_active_assignments(conn, task_id=task_id, assignee_kind="worker", assignee_id=str(lease["lease_owner_id"]))
         conn.execute("DELETE FROM task_active_leases WHERE task_id = ?", (task_id,))
@@ -7549,36 +7878,64 @@ def operator_fail_task(
         """,
         (reason, transition_at, transition_at, retry_count, task_id),
     )
+    conn.execute(
+        "UPDATE tasks SET planner_status = 'failed', updated_at = ? WHERE task_id = ?",
+        (transition_at, task_id),
+    )
     insert_event(
         conn,
         task_id=task_id,
-        event_type="operator.fail",
+        event_type="runtime.operator_stop_requested",
         actor_kind="operator",
         actor_id=actor_id,
-        payload={"summary": reason},
+        payload={"summary": reason, "had_active_lease": had_active_lease},
+    )
+    insert_event(
+        conn,
+        task_id=task_id,
+        event_type="planner.operator_stop_reconciled",
+        actor_kind="operator",
+        actor_id=actor_id,
+        payload={"summary": reason, "planner_status": "failed"},
     )
     conn.commit()
-    return fetch_task_snapshots(conn, task_id=task_id)[0]
+    snapshot = fetch_task_snapshots(conn, task_id=task_id)[0]
+    return {
+        "task_id": task_id,
+        "reason": reason,
+        "snapshot": render_task_card(snapshot),
+        "kill_target": {
+            "had_active_lease": had_active_lease,
+            "worker_pid": worker_pid,
+            "worker_process_start_token": worker_process_start_token,
+        },
+    }
 
 
-def build_planner_panel(conn: sqlite3.Connection) -> dict[str, Any]:
+def build_planner_panel(
+    conn: sqlite3.Connection,
+    *,
+    stale_hours: int = 72,
+    changed_since_hours: int = 24,
+    limit: int = 20,
+    repo_id: str | None = None,
+) -> dict[str, Any]:
     """Aggregate the richest single planner view used by the UI."""
+    from datetime import datetime, timezone, timedelta
     snapshots = fetch_task_snapshots(conn)
+    if repo_id:
+        snapshots = [s for s in snapshots if s["target_repo_id"] == repo_id]
     generated_at = now_iso()
+
+    cutoff_dt = (datetime.now(timezone.utc) - timedelta(hours=changed_since_hours)).isoformat()
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(hours=stale_hours)).isoformat()
 
     eligible_work = []
     awaiting_audit = []
     recent_failures = []
     changed_since: list[dict[str, Any]] = []
-    changed_cutoff_hours = 24
-    from datetime import timedelta
-
-    cutoff_dt = None
-    try:
-        from datetime import datetime, timezone, timedelta
-        cutoff_dt = (datetime.now(timezone.utc) - timedelta(hours=changed_cutoff_hours)).isoformat()
-    except Exception:
-        pass
+    parked_rows: list[dict[str, Any]] = []
+    stale_rows: list[dict[str, Any]] = []
 
     for snapshot in snapshots:
         runtime = snapshot["runtime"]
@@ -7604,18 +7961,29 @@ def build_planner_panel(conn: sqlite3.Connection) -> dict[str, Any]:
         if planner_status == "awaiting_audit":
             awaiting_audit.append(base)
 
-        if runtime_status == "failed":
+        if runtime_status == "failed" and planner_status not in {"done", "cancelled"}:
             recent_failures.append({
                 **base,
                 "last_error": runtime.get("last_runtime_error") or "",
                 "retry_count": runtime.get("retry_count", 0),
             })
 
-        if cutoff_dt and snapshot.get("updated_at") and snapshot["updated_at"] >= cutoff_dt:
+        if snapshot.get("updated_at") and snapshot["updated_at"] >= cutoff_dt:
             changed_since.append({
                 **base,
                 "updated_at": snapshot["updated_at"],
             })
+
+        if snapshot["dependency_blocked"] and planner_status in {"todo", "in_progress"}:
+            parked_rows.append({**base, "parked_reason": "dependency-blocked"})
+
+        updated_at = snapshot.get("updated_at") or ""
+        if (
+            planner_status in {"todo", "in_progress"}
+            and not snapshot["dependency_blocked"]
+            and updated_at < stale_cutoff
+        ):
+            stale_rows.append({**base, "updated_at": updated_at})
 
     # ready_audits: audit-type tasks that are eligible
     ready_audits = [t for t in eligible_work if t.get("task_type") == "audit"]
@@ -7623,26 +7991,31 @@ def build_planner_panel(conn: sqlite3.Connection) -> dict[str, Any]:
     # Sort eligible by priority
     eligible_work.sort(key=lambda t: t["priority"])
     changed_since.sort(key=lambda t: t.get("updated_at", ""), reverse=True)
+    stale_rows.sort(key=lambda t: t.get("updated_at", ""))
+
+    parked_reason_counts: dict[str, int] = {}
+    for t in parked_rows:
+        r = str(t.get("parked_reason") or "unknown")
+        parked_reason_counts[r] = parked_reason_counts.get(r, 0) + 1
 
     summary = {
         "eligible_count": len(eligible_work),
         "awaiting_audit_count": len(awaiting_audit),
         "failed_audit_count": sum(1 for s in snapshots if s.get("task_type") == "audit" and s["planner_status"] == "failed"),
-        "stale_count": sum(
-            1 for s in snapshots
-            if s["runtime"] and s["runtime"]["runtime_status"] in {"timeout", "failed"}
-            and s["planner_status"] in {"todo", "in_progress"}
-        ),
+        "recent_failure_count": len(recent_failures),
+        "stale_count": len(stale_rows),
         "changed_since_count": len(changed_since),
     }
 
     return {
         "generated_at": generated_at,
-        "eligible_work": eligible_work,
-        "awaiting_audit": awaiting_audit,
-        "ready_audits": ready_audits,
-        "recent_failures": recent_failures,
-        "changed_since": changed_since[:20],
+        "eligible_work": eligible_work[:limit],
+        "awaiting_audit": awaiting_audit[:limit],
+        "ready_audits": ready_audits[:limit],
+        "recent_failures": recent_failures[:limit],
+        "changed_since": changed_since[:limit],
+        "parked_work": {"rows": parked_rows[:limit], "reason_counts": parked_reason_counts},
+        "stale_or_low_activity": stale_rows[:limit],
         "summary": summary,
     }
 
@@ -7710,13 +8083,42 @@ def command_migrate_bootstrap(args: argparse.Namespace) -> int:
     return print_or_json(payload, as_json=args.json, formatter=json_dumps)
 
 
+def render_planner_panel_text(panel: dict[str, Any]) -> str:
+    lines = ["Planner control panel", "=" * 40]
+    s = panel.get("summary") or {}
+    lines.append(f"Eligible: {s.get('eligible_count', 0)}  Parked: {s.get('stale_count', 0)}  Failures: {s.get('recent_failure_count', 0)}  Changed: {s.get('changed_since_count', 0)}")
+    lines.append("")
+
+    def _section(title: str, rows: list[dict[str, Any]]) -> None:
+        lines.append(f"{title}")
+        if not rows:
+            lines.append("  (none)")
+        for r in rows:
+            lines.append(f"  {r.get('task_id', '?')}  [{r.get('planner_status', '?')}]  {r.get('title', '')}")
+        lines.append("")
+
+    _section("Eligible work:", panel.get("eligible_work") or [])
+    _section("Parked work:", (panel.get("parked_work") or {}).get("rows") or [])
+    _section("Awaiting audit:", panel.get("awaiting_audit") or [])
+    _section("Stale or low activity:", panel.get("stale_or_low_activity") or [])
+    _section("Recent failures:", panel.get("recent_failures") or [])
+    _section("Changed since:", panel.get("changed_since") or [])
+    return "\n".join(lines)
+
+
 def command_view_planner_panel(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
-        panel = build_planner_panel(conn)
+        panel = build_planner_panel(
+            conn,
+            stale_hours=getattr(args, "stale_hours", 72),
+            changed_since_hours=getattr(args, "changed_since_hours", 24),
+            limit=getattr(args, "limit", 20),
+            repo_id=getattr(args, "repo_id", None) or None,
+        )
     finally:
         conn.close()
-    return print_or_json(panel, as_json=args.json, formatter=json_dumps)
+    return print_or_json(panel, as_json=args.json, formatter=render_planner_panel_text)
 
 
 def command_view_audits(args: argparse.Namespace) -> int:
@@ -7768,7 +8170,7 @@ def command_runtime_requeue_task(args: argparse.Namespace) -> int:
 def command_operator_fail_task(args: argparse.Namespace) -> int:
     conn, _ = open_initialized_connection(args.db_path)
     try:
-        snapshot = operator_fail_task(
+        result = operator_fail_task(
             conn,
             task_id=args.task_id,
             actor_id=args.actor_id,
@@ -7776,7 +8178,7 @@ def command_operator_fail_task(args: argparse.Namespace) -> int:
         )
     finally:
         conn.close()
-    return print_or_json(render_task_card(snapshot), as_json=args.json, formatter=json_dumps)
+    return print_or_json(result, as_json=args.json, formatter=json_dumps)
 
 
 def add_db_argument(parser: argparse.ArgumentParser) -> None:
@@ -7854,6 +8256,14 @@ def build_parser() -> argparse.ArgumentParser:
         repo_upsert_parser.add_argument("--display-name")
         repo_upsert_parser.add_argument("--alias", action="append", default=None, help="Repeatable repo alias list. Replaces existing aliases when provided.")
         repo_upsert_parser.add_argument("--metadata-json", help="JSON metadata object.")
+        repo_upsert_parser.add_argument(
+            "--max-concurrent-workers",
+            type=int,
+            help=(
+                "Per-repo runtime claim cap. Stored in repo metadata as "
+                f"`{REPO_MAX_CONCURRENT_WORKERS_METADATA_KEY}`."
+            ),
+        )
         add_json_argument(repo_upsert_parser)
         repo_upsert_parser.set_defaults(func=command_repo_upsert)
 
@@ -7913,6 +8323,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_create_parser.add_argument("--input", help="Path to JSON payload, or - for stdin.")
     task_create_parser.add_argument("--template", action="store_true", help="Print a skeleton JSON with all required fields and exit 0.")
     task_create_parser.add_argument("--actor-id", default="planner/coordinator")
+    task_create_parser.add_argument("--skip-preflight", action="store_true", help="Skip capability preflight check. Use for product repos (non-platform) where capability deduplication is not needed.")
     add_json_argument(task_create_parser)
     task_create_parser.set_defaults(func=command_task_create)
 
@@ -8279,6 +8690,10 @@ def build_parser() -> argparse.ArgumentParser:
     view_planner_panel_parser = subparsers.add_parser("view-planner-panel", help="Show richest single planner view: eligible work, audits, recent failures, and recent changes.")
     add_db_argument(view_planner_panel_parser)
     add_json_argument(view_planner_panel_parser)
+    view_planner_panel_parser.add_argument("--stale-hours", type=int, default=72, dest="stale_hours", help="Hours before a task is considered stale (default 72).")
+    view_planner_panel_parser.add_argument("--changed-since-hours", type=int, default=24, dest="changed_since_hours", help="Hours window for changed-since section (default 24).")
+    view_planner_panel_parser.add_argument("--limit", type=int, default=20, help="Max rows per section (default 20).")
+    view_planner_panel_parser.add_argument("--repo-id", dest="repo_id", help="Filter to a specific repo.")
     view_planner_panel_parser.set_defaults(func=command_view_planner_panel)
 
     view_audits_parser = subparsers.add_parser("view-audits", help="Show audit-related tasks (audit-type tasks and tasks awaiting audit).")

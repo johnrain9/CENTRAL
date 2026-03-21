@@ -19,7 +19,8 @@ python3 /home/cobra/CENTRAL/scripts/central_task_db.py repo-onboard \
   --repo-id PHOTO_AUTO_TAGGING \
   --repo-root /home/cobra/photo_auto_tagging \
   --display-name PHOTO_AUTO_TAGGING \
-  --alias photo-auto-tagging
+  --alias photo-auto-tagging \
+  --max-concurrent-workers 2
 ```
 
 `repo-upsert` remains available as the lower-level equivalent:
@@ -27,8 +28,11 @@ python3 /home/cobra/CENTRAL/scripts/central_task_db.py repo-onboard \
 ```bash
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py repo-upsert \
   --repo-id PHOTO_AUTO_TAGGING \
-  --repo-root /home/cobra/photo_auto_tagging
+  --repo-root /home/cobra/photo_auto_tagging \
+  --max-concurrent-workers 2
 ```
+
+`--max-concurrent-workers` sets the per-repo dispatcher claim cap and persists it as `metadata.max_concurrent_workers`. If omitted, runtime claim defaults to `3` active workers per repo.
 
 ## Verify Identity
 

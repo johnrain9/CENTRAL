@@ -42,6 +42,7 @@ def task_payload(
         "dispatch_md": f"Dispatch for {task_id}",
         "closeout_md": f"Closeout for {task_id}",
         "reconciliation_md": f"Reconciliation for {task_id}",
+        "initiative": "one-off",
         "planner_status": planner_status,
         "priority": priority,
         "task_type": "implementation",
@@ -77,50 +78,55 @@ class PlannerPanelTest(unittest.TestCase):
                     repo_root=str(REPO_ROOT),
                     display_name="CENTRAL",
                 )
-                task_db.create_task_graph(
-                    conn,
-                    task_payload("CENTRAL-ELIGIBLE", title="Eligible task", priority=1),
-                    actor_kind="test",
-                    actor_id="planner.panel",
-                )
-                task_db.create_task_graph(
-                    conn,
-                    task_payload("CENTRAL-BLOCKER", title="Blocking parent", priority=2),
-                    actor_kind="test",
-                    actor_id="planner.panel",
-                )
-                task_db.create_task_graph(
-                    conn,
-                    task_payload(
-                        "CENTRAL-PARKED",
-                        title="Dependency parked task",
-                        priority=3,
-                        dependencies=["CENTRAL-BLOCKER"],
-                    ),
-                    actor_kind="test",
-                    actor_id="planner.panel",
-                )
-                task_db.create_task_graph(
-                    conn,
-                    task_payload("CENTRAL-STALE", title="Stale task", priority=4),
-                    actor_kind="test",
-                    actor_id="planner.panel",
-                )
-
-                parent = task_db.create_task_graph(
-                    conn,
-                    task_payload(
-                        "CENTRAL-AWAIT",
-                        title="Awaiting audit parent",
-                        priority=5,
-                        metadata={"audit_required": True},
-                    ),
-                    actor_kind="test",
-                    actor_id="planner.panel",
-                )
+            task_db.create_task_graph(
+                conn,
+                task_payload("PP-1", title="Eligible task", priority=1),
+                actor_kind="test",
+                actor_id="planner.panel",
+                skip_preflight=True,
+            )
+            task_db.create_task_graph(
+                conn,
+                task_payload("PP-2", title="Blocking parent", priority=2),
+                actor_kind="test",
+                actor_id="planner.panel",
+                skip_preflight=True,
+            )
+            task_db.create_task_graph(
+                conn,
+                task_payload(
+                    "PP-3",
+                    title="Dependency parked task",
+                    priority=3,
+                    dependencies=["PP-2"],
+                ),
+                actor_kind="test",
+                actor_id="planner.panel",
+                skip_preflight=True,
+            )
+            task_db.create_task_graph(
+                conn,
+                task_payload("PP-4", title="Stale task", priority=4),
+                actor_kind="test",
+                actor_id="planner.panel",
+                skip_preflight=True,
+            )
+            parent = task_db.create_task_graph(
+                conn,
+                task_payload(
+                    "PP-5",
+                    title="Awaiting audit parent",
+                    priority=5,
+                    metadata={"audit_required": True},
+                ),
+                actor_kind="test",
+                actor_id="planner.panel",
+                skip_preflight=True,
+            )
+            with conn:
                 task_db.reconcile_task(
                     conn,
-                    task_id="CENTRAL-AWAIT",
+                    task_id="PP-5",
                     expected_version=int(parent["version"]),
                     outcome="awaiting_audit",
                     summary="Implementation finished and ready for audit",
@@ -130,24 +136,24 @@ class PlannerPanelTest(unittest.TestCase):
                     actor_kind="test",
                     actor_id="planner.panel",
                 )
-            with conn:
-                task_db.create_task_graph(
-                    conn,
-                    task_payload("CENTRAL-FAIL", title="Failing task", priority=6),
-                    actor_kind="test",
-                    actor_id="planner.panel",
-                )
+            task_db.create_task_graph(
+                conn,
+                task_payload("PP-6", title="Failing task", priority=6),
+                actor_kind="test",
+                actor_id="planner.panel",
+                skip_preflight=True,
+            )
             task_db.runtime_claim(
                 conn,
                 worker_id="worker-fail",
                 queue_name="default",
                 lease_seconds=900,
-                task_id="CENTRAL-FAIL",
+                task_id="PP-6",
                 actor_id="planner.panel",
             )
             task_db.runtime_transition(
                 conn,
-                task_id="CENTRAL-FAIL",
+                task_id="PP-6",
                 status="failed",
                 worker_id="worker-fail",
                 error_text="unit test failure",
@@ -155,7 +161,7 @@ class PlannerPanelTest(unittest.TestCase):
                 artifacts=[],
                 actor_id="planner.panel",
             )
-            self.make_task_stale("CENTRAL-STALE", hours=72)
+            self.make_task_stale("PP-4", hours=72)
         finally:
             conn.close()
 
@@ -199,14 +205,14 @@ class PlannerPanelTest(unittest.TestCase):
         payload = json.loads(json_result.stdout)
 
         self.assertEqual(payload["summary"]["eligible_count"], 5)
-        self.assertIn("CENTRAL-ELIGIBLE", [row["task_id"] for row in payload["eligible_work"]])
-        self.assertIn("CENTRAL-AWAIT-AUDIT", [row["task_id"] for row in payload["eligible_work"]])
+        self.assertIn("PP-1", [row["task_id"] for row in payload["eligible_work"]])
+        self.assertIn("PP-5-AUDIT", [row["task_id"] for row in payload["eligible_work"]])
         self.assertEqual(payload["parked_work"]["reason_counts"], {"dependency-blocked": 1})
-        self.assertEqual(payload["parked_work"]["rows"][0]["task_id"], "CENTRAL-PARKED")
-        self.assertIn("CENTRAL-AWAIT", [row["task_id"] for row in payload["awaiting_audit"]])
-        self.assertIn("CENTRAL-STALE", [row["task_id"] for row in payload["stale_or_low_activity"]])
-        self.assertIn("CENTRAL-FAIL", [row["task_id"] for row in payload["recent_failures"]])
-        self.assertIn("CENTRAL-FAIL", [row["task_id"] for row in payload["changed_since"]])
+        self.assertEqual(payload["parked_work"]["rows"][0]["task_id"], "PP-3")
+        self.assertIn("PP-5", [row["task_id"] for row in payload["awaiting_audit"]])
+        self.assertIn("PP-4", [row["task_id"] for row in payload["stale_or_low_activity"]])
+        self.assertIn("PP-6", [row["task_id"] for row in payload["recent_failures"]])
+        self.assertIn("PP-6", [row["task_id"] for row in payload["changed_since"]])
 
         text_result = self.run_cli(
             "view-planner-panel",
@@ -240,32 +246,33 @@ class PlannerPanelTest(unittest.TestCase):
                     repo_root=str(other_root),
                     display_name="OTHER",
                 )
-                task_db.create_task_graph(
-                    conn,
-                    task_payload(
-                        "OTHER-FAIL",
-                        title="Other repo failure",
-                        priority=1,
-                        metadata={"audit_required": False},
-                    )
-                    | {
-                        "target_repo_id": "OTHER",
-                        "target_repo_root": str(other_root),
-                    },
-                    actor_kind="test",
-                    actor_id="planner.panel",
+            task_db.create_task_graph(
+                conn,
+                task_payload(
+                    "PP-7",
+                    title="Other repo failure",
+                    priority=1,
+                    metadata={"audit_required": False},
                 )
+                | {
+                    "target_repo_id": "OTHER",
+                    "target_repo_root": str(other_root),
+                },
+                actor_kind="test",
+                actor_id="planner.panel",
+                skip_preflight=True,
+            )
             task_db.runtime_claim(
                 conn,
                 worker_id="worker-other",
                 queue_name="default",
                 lease_seconds=900,
-                task_id="OTHER-FAIL",
+                task_id="PP-7",
                 actor_id="planner.panel",
             )
             task_db.runtime_transition(
                 conn,
-                task_id="OTHER-FAIL",
+                task_id="PP-7",
                 status="failed",
                 worker_id="worker-other",
                 error_text="other repo failure",
@@ -293,9 +300,9 @@ class PlannerPanelTest(unittest.TestCase):
         payload = json.loads(json_result.stdout)
 
         self.assertEqual(payload["summary"]["recent_failure_count"], 1)
-        self.assertEqual(payload["summary"]["changed_since_count"], 7)
-        self.assertEqual([row["task_id"] for row in payload["recent_failures"]], ["CENTRAL-FAIL"])
-        self.assertNotIn("OTHER-FAIL", [row["task_id"] for row in payload["changed_since"]])
+        self.assertEqual(payload["summary"]["changed_since_count"], 6)
+        self.assertEqual([row["task_id"] for row in payload["recent_failures"]], ["PP-6"])
+        self.assertNotIn("PP-7", [row["task_id"] for row in payload["changed_since"]])
 
 
 if __name__ == "__main__":

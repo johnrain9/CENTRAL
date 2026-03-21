@@ -119,6 +119,7 @@ class DispatcherConfig:
     default_worker_model: str
     max_retries: int = 5
     notify: bool = False
+    audit_worker_model: str | None = None
 
 
 @dataclass(frozen=True)

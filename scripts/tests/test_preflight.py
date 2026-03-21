@@ -47,7 +47,7 @@ def task_payload(task_id: str, *, repo_id: str, repo_root: Path, title: str, sum
         "target_repo_root": str(repo_root),
         "approval_required": False,
         "initiative": "capability-registry",
-        "metadata": {"test_case": task_id},
+        "metadata": {"test_case": task_id, "audit_required": True},
         "execution": {
             "task_kind": "read_only",
             "sandbox_mode": "workspace-write",

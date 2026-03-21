@@ -121,6 +121,7 @@ dispatcher restart --max-workers 3
 dispatcher restart --codex-model gpt-5-codex
 dispatcher stop
 dispatcher status
+dispatcher menu
 dispatcher workers
 dispatcher kill-task CENTRAL-OPS-20 --reason "operator stopped stuck worker"
 dispatcher config
@@ -134,6 +135,7 @@ dispatcher once
 Behavior:
 
 - `dispatcher` defaults to `start`
+- `dispatcher menu` opens an interactive numbered operator menu for start/stop/restart, config updates, status, workers, logs, checks, and kill-task
 - auto-runs CENTRAL DB init if needed
 - launches CENTRAL-native `daemon` in the background
 - `dispatcher start --max-workers <n>` launches the daemon with `<n>` workers
@@ -153,6 +155,13 @@ Behavior:
 - writes launcher output to CENTRAL runtime state
 - uses the CENTRAL runtime lock file as the source of truth for running state
 - `dispatcher status` shows both the active daemon worker limit/model and the next-start launcher defaults/sources
+
+Optional PATH launcher for the interactive menu:
+
+```bash
+ln -sf /home/cobra/CENTRAL/scripts/dispatcher_menu.py ~/bin/dispatcher-menu
+dispatcher-menu
+```
 
 ### Extracted Dispatcher Boundary
 

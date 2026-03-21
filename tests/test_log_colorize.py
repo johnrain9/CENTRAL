@@ -71,10 +71,10 @@ class TestColorizeLogLine(unittest.TestCase):
 
     def test_heartbeat_uses_queue_bucket_labels(self):
         result = self.log.colorize_log_line(PLAIN_LINES[0])
-        self.assertIn("QUEUE SNAPSHOT", result)
-        self.assertIn("review_queue=", result)
-        self.assertIn("failed_queue=", result)
-        self.assertNotIn(" failed=", result)
+        self.assertIn("HEARTBEAT", result)
+        self.assertIn("review=", result)
+        self.assertIn("failed=", result)
+        self.assertIn("mismatch=", result)
 
     def test_tail_colorize_false(self):
         log_path = self.log.path

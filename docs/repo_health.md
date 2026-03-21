@@ -31,6 +31,29 @@ Coverage is always explicit:
 - `coverage_unknown` when no trustworthy measurement exists yet
 - `not_applicable` only when coverage genuinely does not apply
 
+## CENTRAL Repo Coverage Collection
+
+`scripts/repo_health_check.py` now attempts pytest-based coverage in this order:
+
+1. `pytest` + `pytest-cov` (`coverage.xml` emitted directly).
+2. `pytest` under stdlib `trace` as an offline fallback (`coverage.xml` synthesized from traced executable lines).
+3. unittest discovery when pytest is unavailable.
+
+Use the repo virtualenv so the checker can discover test tooling:
+
+```bash
+.venv/bin/python -m pip install -e ".[test]"
+.venv/bin/python scripts/repo_health_check.py /home/cobra/CENTRAL --json
+```
+
+Optional coverage threshold enforcement:
+
+```bash
+REPO_HEALTH_MIN_COVERAGE=70 .venv/bin/python scripts/repo_health_check.py /home/cobra/CENTRAL --json
+# or:
+.venv/bin/python scripts/repo_health_check.py /home/cobra/CENTRAL --min-coverage 70 --json
+```
+
 ## Bundle Shape
 
 The aggregate command emits a bundle with:

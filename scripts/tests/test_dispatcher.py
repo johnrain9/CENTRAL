@@ -485,7 +485,7 @@ class FakePopen:
 
 class DispatcherIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp_path = Path(tempfile.mkdtemp(prefix="central-runtime-v2-dispatcher-test-"))
+        self._tmp_path = Path(tempfile.mkdtemp(prefix="central-runtime-v2-dispatcher-unit-"))
         self.db_path = self._tmp_path / "central_tasks.db"
         self.state_dir = self._tmp_path / "runtime_state"
         self.dispatcher: CentralDispatcher | None = None
@@ -552,6 +552,16 @@ class DispatcherIntegrationTest(unittest.TestCase):
     def _set_runtime_done(self, task_id: str, notes: str = "test runtime done") -> None:
         conn = task_db.connect(self.db_path)
         try:
+            now_iso = task_db.now_iso()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO task_runtime_state
+                    (task_id, runtime_status, last_transition_at, retry_count, runtime_metadata_json)
+                VALUES (?, 'queued', ?, 0, '{}')
+                """,
+                (task_id, now_iso),
+            )
+            conn.commit()
             task_db.runtime_transition(
                 conn,
                 task_id=task_id,
@@ -605,6 +615,7 @@ class DispatcherIntegrationTest(unittest.TestCase):
                 actor_kind="planner",
                 actor_id="dispatcher.tests",
             )
+            conn.commit()
         finally:
             conn.close()
         return task_id, audit_task_id
@@ -664,25 +675,27 @@ class DispatcherIntegrationTest(unittest.TestCase):
         self.assertEqual((parent_snapshot.get("metadata") or {}).get("audit_verdict"), "accepted")
 
     def test_reconcile_done_audit_pass_accepts_pass_and_done_aliases(self) -> None:
-        for verdict in ("pass", "done"):
-            with self.subTest(verdict=verdict):
-                parent_task_id, audit_task_id = self._setup_parent_and_audit(f"CENTRAL-OPS-59-{verdict}-v")
-                self._set_runtime_done(audit_task_id, notes="audit completed")
-                state = self._make_worker_state(audit_task_id)
+        parent_task_id, audit_task_id = self._setup_parent_and_audit("CENTRAL-OPS-5910")
+        self._set_runtime_done(audit_task_id, notes="audit completed")
+        state = self._make_worker_state(audit_task_id)
 
-                self.dispatcher._reconcile_done(
-                    state,
-                    result=SimpleNamespace(verdict=verdict),
-                    notes=f"audit {verdict}",
-                    tests=None,
-                    result_artifacts=[],
-                    raw_result_payload={"status": "COMPLETED", "verdict": verdict},
-                )
+        with mock.patch.object(dispatcher_module.task_db, "reconcile_audit_pass", wraps=task_db.reconcile_audit_pass) as pass_mock:
+            for verdict in ("pass", "done"):
+                with self.subTest(verdict=verdict):
+                    self.dispatcher._reconcile_done(
+                        state,
+                        result=SimpleNamespace(verdict=verdict),
+                        notes=f"audit {verdict}",
+                        tests=None,
+                        result_artifacts=[],
+                        raw_result_payload={"status": "COMPLETED", "verdict": verdict},
+                    )
 
-                audit_snapshot = self.fetch_snapshot(audit_task_id)
-                parent_snapshot = self.fetch_snapshot(parent_task_id)
-                self.assertEqual(audit_snapshot["planner_status"], "done")
-                self.assertEqual(parent_snapshot["planner_status"], "done")
+        self.assertEqual(pass_mock.call_count, 2)
+        audit_snapshot = self.fetch_snapshot(audit_task_id)
+        parent_snapshot = self.fetch_snapshot(parent_task_id)
+        self.assertEqual(audit_snapshot["planner_status"], "done")
+        self.assertEqual(parent_snapshot["planner_status"], "done")
 
     def test_reconcile_done_audit_rework_requeues_parent_and_audit(self) -> None:
         parent_task_id, audit_task_id = self._setup_parent_and_audit("CENTRAL-OPS-5906")
@@ -959,6 +972,47 @@ class RepoHealthCheckTest(unittest.TestCase):
         self.assertEqual(rows[0]["runner"], "python")
         self.assertEqual(rows[0]["test_summary"]["counts"]["passed"], 1)
         self.assertIn("report", rows[0])
+
+    def test_resolve_min_coverage_priority(self) -> None:
+        repo_root = self.tmp_path / "sample_python_repo"
+        repo_root.mkdir(parents=True)
+        (repo_root / "pyproject.toml").write_text(
+            "[project]\nname='sample-python-repo'\nversion='0.0.1'\n\n[tool.repo_health_check]\nmin_coverage = 71.5\n",
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"REPO_HEALTH_MIN_COVERAGE": "63.2"}, clear=False):
+            self.assertEqual(repo_health_check.resolve_min_coverage(repo_root, None), 63.2)
+        self.assertEqual(repo_health_check.resolve_min_coverage(repo_root, 88.0), 88.0)
+        with mock.patch.dict(os.environ, {"REPO_HEALTH_MIN_COVERAGE": ""}, clear=False):
+            self.assertEqual(repo_health_check.resolve_min_coverage(repo_root, None), 71.5)
+
+    def test_detect_runner_includes_cov_fail_under_when_available(self) -> None:
+        repo_root = self.tmp_path / "sample_python_repo"
+        repo_root.mkdir(parents=True)
+        (repo_root / "pyproject.toml").write_text("[project]\nname='sample-python-repo'\nversion='0.0.1'\n", encoding="utf-8")
+        with mock.patch.object(repo_health_check, "_python_candidates", return_value=["/tmp/python-under-test"]):
+            with mock.patch.object(repo_health_check, "_module_available", return_value=True):
+                runner, command = repo_health_check.detect_runner(repo_root, min_coverage=75.0)
+        self.assertEqual(runner, "python")
+        self.assertEqual(command[:3], ["/tmp/python-under-test", "-m", "pytest"])
+        self.assertIn("--cov=.", command)
+        self.assertIn("--cov-report=xml:coverage.xml", command)
+        self.assertIn("--cov-fail-under=75.0", command)
+
+    def test_detect_runner_uses_trace_when_pytest_cov_missing(self) -> None:
+        repo_root = self.tmp_path / "sample_python_repo"
+        repo_root.mkdir(parents=True)
+        (repo_root / "pyproject.toml").write_text("[project]\nname='sample-python-repo'\nversion='0.0.1'\n", encoding="utf-8")
+
+        def module_available(_python_exec: str, module_name: str) -> bool:
+            return module_name == "pytest"
+
+        with mock.patch.object(repo_health_check, "_python_candidates", return_value=["/tmp/python-under-test"]):
+            with mock.patch.object(repo_health_check, "_module_available", side_effect=module_available):
+                runner, command = repo_health_check.detect_runner(repo_root, min_coverage=75.0)
+        self.assertEqual(runner, "python")
+        self.assertEqual(command[:3], ["/tmp/python-under-test", "-m", "trace"])
+        self.assertIn(".repo_health_trace_counts.pkl", " ".join(command))
 
 
 if __name__ == "__main__":

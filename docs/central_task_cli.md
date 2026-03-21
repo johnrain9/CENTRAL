@@ -90,7 +90,8 @@ python3 /home/cobra/CENTRAL/scripts/central_task_db.py repo-upsert \
   --repo-id CENTRAL \
   --repo-root /home/cobra/CENTRAL \
   --display-name CENTRAL \
-  --alias central
+  --alias central \
+  --max-concurrent-workers 2
 ```
 
 Registry helpers:
@@ -105,6 +106,11 @@ python3 /home/cobra/CENTRAL/scripts/central_task_db.py repo-resolve --repo moto-
 `repo-list` is the canonical fast path for operators and planners that need the current tracked repo registry. It returns `repo_id`, `display_name`, `repo_root`, and active state; with `--json`, it also includes metadata, creation/update timestamps, aliases, and lookup context for debugging.
 
 `repo-show` returns the full canonical record for one repo reference, resolving aliases/display names/root variants via the same lookup rules as `repo-resolve`.
+
+Per-repo dispatcher caps:
+
+- set `--max-concurrent-workers <n>` on `repo-onboard` or `repo-upsert` to store `metadata.max_concurrent_workers`
+- runtime claim defaults to `3` active workers per repo when that metadata key is unset
 
 Lookup rules:
 

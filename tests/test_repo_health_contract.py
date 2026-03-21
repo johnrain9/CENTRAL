@@ -9,7 +9,7 @@ from pathlib import Path
 from tools.repo_health.contract import build_bundle, validate_bundle, validate_report
 from tools.repo_health.examples import aimsoloanalysis_adapter, central_adapter, motohelper_adapter
 
-REPO_ROOT = Path("/home/cobra/CENTRAL")
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class RepoHealthContractTest(unittest.TestCase):

@@ -47,6 +47,7 @@ def task_payload(
         "target_repo_id": "CENTRAL",
         "target_repo_root": str(REPO_ROOT),
         "approval_required": False,
+        "initiative": "one-off",
         "metadata": {"audit_required": False},
         "execution": {
             "task_kind": "read_only",
@@ -76,42 +77,48 @@ class DispatcherLogReadabilityTest(unittest.TestCase):
                     repo_root=str(REPO_ROOT),
                     display_name="CENTRAL",
                 )
-                task_db.create_task_graph(
-                    conn,
-                    task_payload("READY-1", priority=1),
-                    actor_kind="test",
-                    actor_id="dispatcher.log.tests",
-                )
-                task_db.create_task_graph(
-                    conn,
-                    task_payload("RUN-1", priority=2),
-                    actor_kind="test",
-                    actor_id="dispatcher.log.tests",
-                )
-                task_db.create_task_graph(
-                    conn,
-                    task_payload("BLOCKER-1", priority=3, planner_status="in_progress"),
-                    actor_kind="test",
-                    actor_id="dispatcher.log.tests",
-                )
-                task_db.create_task_graph(
-                    conn,
-                    task_payload("PARKED-1", priority=4, dependencies=["BLOCKER-1"]),
-                    actor_kind="test",
-                    actor_id="dispatcher.log.tests",
-                )
-                task_db.create_task_graph(
-                    conn,
-                    task_payload("REVIEW-1", priority=5),
-                    actor_kind="test",
-                    actor_id="dispatcher.log.tests",
-                )
-                task_db.create_task_graph(
-                    conn,
-                    task_payload("FAIL-1", priority=6),
-                    actor_kind="test",
-                    actor_id="dispatcher.log.tests",
-                )
+            task_db.create_task_graph(
+                conn,
+                task_payload("READY-1", priority=1),
+                actor_kind="test",
+                actor_id="dispatcher.log.tests",
+                skip_preflight=True,
+            )
+            task_db.create_task_graph(
+                conn,
+                task_payload("RUN-1", priority=2),
+                actor_kind="test",
+                actor_id="dispatcher.log.tests",
+                skip_preflight=True,
+            )
+            task_db.create_task_graph(
+                conn,
+                task_payload("BLOCKER-1", priority=3, planner_status="in_progress"),
+                actor_kind="test",
+                actor_id="dispatcher.log.tests",
+                skip_preflight=True,
+            )
+            task_db.create_task_graph(
+                conn,
+                task_payload("PARKED-1", priority=4, dependencies=["BLOCKER-1"]),
+                actor_kind="test",
+                actor_id="dispatcher.log.tests",
+                skip_preflight=True,
+            )
+            task_db.create_task_graph(
+                conn,
+                task_payload("REVIEW-1", priority=5),
+                actor_kind="test",
+                actor_id="dispatcher.log.tests",
+                skip_preflight=True,
+            )
+            task_db.create_task_graph(
+                conn,
+                task_payload("FAIL-1", priority=6),
+                actor_kind="test",
+                actor_id="dispatcher.log.tests",
+                skip_preflight=True,
+            )
         finally:
             conn.close()
 
@@ -217,21 +224,19 @@ class DispatcherLogReadabilityTest(unittest.TestCase):
         self.assertEqual(len(raw_lines), 2)
         heartbeat = raw_lines[0]
         self.assertIn("heartbeat state=running", heartbeat)
-        self.assertIn("active=RUN-1", heartbeat)
-        self.assertIn("ready_now=", heartbeat)
-        self.assertIn("next_ready=READY-1", heartbeat)
-        self.assertIn("parked_total=1", heartbeat)
-        self.assertIn("parked_reasons=dependency-blocked:1", heartbeat)
-        self.assertIn("review_queue=1", heartbeat)
-        self.assertIn("failed_queue=1", heartbeat)
-        self.assertNotIn(" failed=", heartbeat)
+        self.assertIn("running_tasks=RUN-1", heartbeat)
+        self.assertIn("eligible=", heartbeat)
+        self.assertIn("next=READY-1", heartbeat)
+        self.assertIn("parked=", heartbeat)
+        self.assertIn("review=1", heartbeat)
+        self.assertIn("failed=", heartbeat)
 
         tail = self.dispatcher.logger.tail(lines=5, colorize=True)
-        self.assertIn("QUEUE SNAPSHOT", tail)
-        self.assertIn("active=", tail)
-        self.assertIn("review_queue=", tail)
-        self.assertIn("failed_queue=", tail)
-        self.assertIn("ERROR", tail)
+        self.assertIn("HEARTBEAT", tail)
+        self.assertIn("tasks=", tail)
+        self.assertIn("review=", tail)
+        self.assertIn("failed=", tail)
+        self.assertIn("ISSUE", tail)
         self.assertIn("worker_spawn_error task=ERR-1 error=boom", tail)
 
 

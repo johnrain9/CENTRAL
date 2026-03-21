@@ -27,6 +27,7 @@ WORKER_SLEEP_SECONDS = 14.0
 def worker_task_payload() -> dict[str, object]:
     return {
         "task_id": TASK_ID,
+        "initiative": "one-off",
         "title": "Dispatcher restart handoff smoke task",
         "summary": "Validate dispatcher restart-safe worker adoption",
         "objective_md": "Keep a long-running stub worker alive across dispatcher restart.",
@@ -435,6 +436,7 @@ class InterruptClassificationTest(unittest.TestCase):
     def _task_payload(self, task_id: str) -> dict[str, object]:
         return {
             "task_id": task_id,
+            "initiative": "one-off",
             "title": "Interrupt classification smoke task",
             "summary": "Validate interrupted_by_restart classification",
             "objective_md": "Test explicit failure classification on interruption.",

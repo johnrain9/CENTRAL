@@ -403,6 +403,7 @@ def build_dispatcher_config(args: argparse.Namespace) -> DispatcherConfig:
         worker_mode=args.worker_mode,
         default_worker_model=resolve_default_worker_model(args.worker_mode, explicit_default_model),
         notify=getattr(args, "notify", False),
+        audit_worker_model=getattr(args, "audit_worker_model", None),
     )
 
 
@@ -433,6 +434,7 @@ def smoke_task_payload() -> dict[str, Any]:
         "dispatch_md": "Dispatch locally through central_runtime self-check.",
         "closeout_md": "Review synthetic smoke artifacts only.",
         "reconciliation_md": "CENTRAL DB remains canonical.",
+        "initiative": "one-off",
         "planner_status": "todo",
         "priority": 1,
         "task_type": "implementation",
@@ -441,7 +443,7 @@ def smoke_task_payload() -> dict[str, Any]:
         "target_repo_id": "CENTRAL",
         "target_repo_root": str(REPO_ROOT),
         "approval_required": False,
-        "metadata": {"smoke": True},
+        "metadata": {"smoke": True, "audit_required": False},
         "execution": {
             "task_kind": "read_only",
             "sandbox_mode": "workspace-write",
@@ -564,6 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sub.add_argument("--default-codex-model")
         sub.add_argument("--default-worker-model", "--worker-model")
+        sub.add_argument("--audit-worker-model", default=None, help="Separate model for audit tasks")
         sub.add_argument("--notify", action="store_true", default=False)
         sub.set_defaults(func=func)
 

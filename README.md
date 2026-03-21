@@ -214,10 +214,18 @@ Common commands:
 python3 /home/cobra/CENTRAL/scripts/dispatcher_control.py start
 python3 /home/cobra/CENTRAL/scripts/dispatcher_control.py start --max-workers 3
 python3 /home/cobra/CENTRAL/scripts/dispatcher_control.py restart
+python3 /home/cobra/CENTRAL/scripts/dispatcher_control.py menu
 python3 /home/cobra/CENTRAL/scripts/dispatcher_control.py status
 python3 /home/cobra/CENTRAL/scripts/dispatcher_control.py workers --json
 python3 /home/cobra/CENTRAL/scripts/dispatcher_control.py logs
 python3 /home/cobra/CENTRAL/scripts/dispatcher_control.py stop
+```
+
+Interactive menu command from any directory:
+
+```bash
+ln -sf /home/cobra/CENTRAL/scripts/dispatcher_menu.py ~/bin/dispatcher-menu
+dispatcher-menu
 ```
 
 Direct runtime entrypoint:
@@ -350,10 +358,14 @@ These assumptions appear repeatedly across the repo:
 Useful validation entrypoints in this repo:
 
 ```bash
+.venv/bin/python -m pip install -e ".[test]"
+.venv/bin/python -m pytest -q --cov=. --cov-report=xml:coverage.xml
 python3 /home/cobra/CENTRAL/scripts/central_task_db.py --help
 python3 /home/cobra/CENTRAL/scripts/central_runtime.py --help
 python3 /home/cobra/CENTRAL/scripts/dispatcher_control.py --help
 python3 /home/cobra/CENTRAL/scripts/repo_health.py --help
+.venv/bin/python /home/cobra/CENTRAL/scripts/repo_health_check.py /home/cobra/CENTRAL --json
+REPO_HEALTH_MIN_COVERAGE=70 .venv/bin/python /home/cobra/CENTRAL/scripts/repo_health_check.py /home/cobra/CENTRAL --json
 bash /home/cobra/CENTRAL/tests/test_central_db_durability.sh
 python3 -m unittest tests.test_dispatcher_restart_handoff
 python3 -m unittest tests.test_repo_health

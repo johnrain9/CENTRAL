@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import dis
 import json
+import os
+import pickle
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -66,6 +69,84 @@ def parse_coverage_xml(repo_root: Path) -> tuple[float | None, str | None, str |
     return None, str(coverage_xml), "coverage.xml does not expose coverage percentage fields"
 
 
+def _collect_executable_lines(code_obj: Any, bucket: set[int]) -> None:
+    for _, line in dis.findlinestarts(code_obj):
+        if line and line > 0:
+            bucket.add(line)
+    for constant in code_obj.co_consts:
+        if hasattr(constant, "co_consts") and hasattr(constant, "co_firstlineno"):
+            _collect_executable_lines(constant, bucket)
+
+
+def _iter_repo_python_files(repo_root: Path) -> list[Path]:
+    excluded_roots = {".git", ".venv", ".pytest_cache", "__pycache__", "state", "generated"}
+    files: list[Path] = []
+    for path in repo_root.rglob("*.py"):
+        rel_parts = path.relative_to(repo_root).parts
+        if any(part in excluded_roots for part in rel_parts):
+            continue
+        files.append(path)
+    return files
+
+
+def write_trace_coverage_xml(repo_root: Path, trace_counts_path: Path) -> float | None:
+    if not trace_counts_path.exists():
+        return None
+    try:
+        with trace_counts_path.open("rb") as handle:
+            loaded = pickle.load(handle)
+    except (OSError, pickle.UnpicklingError, EOFError):
+        return None
+    if not isinstance(loaded, tuple) or not loaded:
+        return None
+    counts = loaded[0]
+    if not isinstance(counts, dict):
+        return None
+
+    executable_by_file: dict[str, set[int]] = {}
+    total_valid = 0
+    total_covered = 0
+
+    for py_file in _iter_repo_python_files(repo_root):
+        filename = str(py_file.resolve())
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            code = compile(source, filename, "exec")
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        executable_lines: set[int] = set()
+        _collect_executable_lines(code, executable_lines)
+        if not executable_lines:
+            continue
+        executable_by_file[filename] = executable_lines
+        total_valid += len(executable_lines)
+
+    if total_valid == 0:
+        return None
+
+    for key, value in counts.items():
+        if not isinstance(key, tuple) or len(key) != 2:
+            continue
+        filename, line_no = key
+        if not isinstance(filename, str) or not isinstance(line_no, int):
+            continue
+        if value <= 0:
+            continue
+        exec_lines = executable_by_file.get(str(Path(filename).resolve()))
+        if not exec_lines or line_no not in exec_lines:
+            continue
+        total_covered += 1
+
+    line_rate = total_covered / total_valid if total_valid else 0.0
+    coverage_xml = repo_root / "coverage.xml"
+    payload = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<coverage line-rate="{line_rate:.6f}" lines-covered="{total_covered}" lines-valid="{total_valid}"/>\n'
+    )
+    coverage_xml.write_text(payload, encoding="utf-8")
+    return line_rate * 100.0
+
+
 def resolve_repo_identity(repo_root: Path, db_path: str | None = None) -> dict[str, str]:
     conn, _ = task_db.open_initialized_connection(db_path)
     try:
@@ -85,7 +166,70 @@ def resolve_repo_identity(repo_root: Path, db_path: str | None = None) -> dict[s
     }
 
 
-def detect_runner(repo_root: Path) -> tuple[str | None, list[str]]:
+def _module_available(python_executable: str, module_name: str) -> bool:
+    command = [
+        python_executable,
+        "-c",
+        (
+            "import importlib.util, sys; "
+            f"sys.exit(0 if importlib.util.find_spec('{module_name}') is not None else 1)"
+        ),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _python_candidates(repo_root: Path) -> list[str]:
+    candidates: list[str] = [sys.executable]
+    repo_venv_python = repo_root / ".venv" / "bin" / "python"
+    if repo_venv_python.exists():
+        repo_venv = str(repo_venv_python.resolve())
+        if repo_venv not in candidates:
+            candidates.append(repo_venv)
+    return candidates
+
+
+def _read_min_coverage_from_pyproject(repo_root: Path) -> float | None:
+    pyproject = repo_root / "pyproject.toml"
+    if not pyproject.exists():
+        return None
+    try:
+        import tomllib
+
+        payload = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (ImportError, OSError, ValueError):
+        return None
+    value = (((payload.get("tool") or {}).get("repo_health_check") or {}).get("min_coverage"))
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return 0.0
+    if parsed > 100:
+        return 100.0
+    return parsed
+
+
+def resolve_min_coverage(repo_root: Path, cli_min_coverage: float | None) -> float | None:
+    if cli_min_coverage is not None:
+        return max(0.0, min(100.0, float(cli_min_coverage)))
+    env_value = os.environ.get("REPO_HEALTH_MIN_COVERAGE")
+    if env_value:
+        try:
+            parsed = float(env_value)
+            return max(0.0, min(100.0, parsed))
+        except ValueError:
+            return None
+    return _read_min_coverage_from_pyproject(repo_root)
+
+
+def detect_runner(repo_root: Path, *, min_coverage: float | None = None) -> tuple[str | None, list[str]]:
     python_manifest = (
         (repo_root / "pyproject.toml").exists()
         or (repo_root / "setup.py").exists()
@@ -94,10 +238,28 @@ def detect_runner(repo_root: Path) -> tuple[str | None, list[str]]:
         or any(repo_root.glob("*.py"))
     )
     if (repo_root / "scripts" / "tests").is_dir() or python_manifest:
-        if importlib.util.find_spec("pytest") is not None:
-            command = [sys.executable, "-m", "pytest", "-x"]
-            if importlib.util.find_spec("pytest_cov") is not None:
+        for python_exec in _python_candidates(repo_root):
+            if not _module_available(python_exec, "pytest"):
+                continue
+            command = [python_exec, "-m", "pytest", "-x"]
+            if _module_available(python_exec, "pytest_cov"):
                 command.extend(["--cov=.", "--cov-report=xml:coverage.xml"])
+                if min_coverage is not None:
+                    command.append(f"--cov-fail-under={min_coverage:.1f}")
+            else:
+                command = [
+                    python_exec,
+                    "-m",
+                    "trace",
+                    "--count",
+                    "--file",
+                    str(repo_root / ".repo_health_trace_counts.pkl"),
+                    "--coverdir",
+                    str(repo_root / ".repo_health_trace_reports"),
+                    "--module",
+                    "pytest",
+                    "-x",
+                ]
             return "python", command
         discovery_root = repo_root / "scripts" / "tests"
         if not discovery_root.is_dir():
@@ -134,12 +296,13 @@ def parse_rust_counts(output: str) -> dict[str, int]:
 
 def parse_pytest_counts(output: str) -> dict[str, int]:
     counts = {"passed": 0, "failed": 0, "skipped": 0, "xpassed": 0, "xfailed": 0, "deselected": 0, "error": 0, "errors": 0}
+    summary_line = ""
     # Typical summary line:
     # "= 2 failed, 4 passed, 1 skipped in 0.12s ="
-    summary_line = ""
+    # Trace-wrapped pytest runs can include additional prefix text.
     for line in reversed(output.splitlines()):
-        text = line.strip()
-        if text.startswith("=") and " in " in text and any(tag in text for tag in (" passed", " failed", " skipped", " xpassed", " xfailed")):
+        text = line.strip().strip("=")
+        if " in " in text and any(tag in text for tag in (" passed", " failed", " skipped", " xpassed", " xfailed", " deselected", " error")):
             summary_line = text
             break
         if text.endswith(" passed.") and "in" not in text:
@@ -211,6 +374,9 @@ def run_tests(runner: str, command: list[str], repo_root: Path, *, timeout_secon
         counts = parse_unittest_counts(output)
     else:
         counts = parse_pytest_counts(output)
+    if "trace" in command and exit_code == 0 and (counts.get("failed", 0) > 0 or counts.get("error", 0) > 0):
+        # `python -m trace` can return 0 even when pytest fails; align status with parsed test result.
+        exit_code = 1
     return exit_code, output, counts
 
 
@@ -394,17 +560,49 @@ def write_snapshot(report: dict[str, Any], ttl_seconds: int, db_path: str | None
     return result.returncode == 0
 
 
-def run(repo_root: Path, ttl_seconds: int, db_path: str | None = None, timeout_seconds: int = 30) -> tuple[dict[str, Any], bool]:
-    runner, command = detect_runner(repo_root)
+def run(
+    repo_root: Path,
+    ttl_seconds: int,
+    db_path: str | None = None,
+    timeout_seconds: int = 30,
+    min_coverage: float | None = None,
+) -> tuple[dict[str, Any], bool]:
+    resolved_min_coverage = resolve_min_coverage(repo_root, min_coverage)
+    runner, command = detect_runner(repo_root, min_coverage=resolved_min_coverage)
     if runner is None:
         return {}, False
+    trace_counts_path = repo_root / ".repo_health_trace_counts.pkl"
+    trace_report_dir = repo_root / ".repo_health_trace_reports"
+    if "--file" in command and "trace" in command and trace_counts_path.exists():
+        trace_counts_path.unlink(missing_ok=True)
     exit_code, output, counts = run_tests(runner, command, repo_root, timeout_seconds=timeout_seconds)
+    if "--file" in command and "trace" in command:
+        write_trace_coverage_xml(repo_root, trace_counts_path)
+        trace_counts_path.unlink(missing_ok=True)
+        shutil.rmtree(trace_report_dir, ignore_errors=True)
     repo_identity = resolve_repo_identity(repo_root, db_path=db_path)
     report = build_health_report(repo_root, repo_identity, runner, exit_code, command, counts)
     coverage_percent, _, _ = parse_coverage_xml(repo_root)
+    if coverage_percent is not None and resolved_min_coverage is not None and coverage_percent < resolved_min_coverage and exit_code == 0:
+        exit_code = 2
+        report["headline"] = (
+            f"{report.get('headline', '')} Coverage {coverage_percent:.1f}% is below threshold {resolved_min_coverage:.1f}%."
+        ).strip()
+        for check in report.get("checks", []):
+            if check.get("check_id") == "tests":
+                check["status"] = "fail"
+                check["summary"] = (
+                    f"{check.get('summary', '')} Coverage {coverage_percent:.1f}% is below threshold {resolved_min_coverage:.1f}%."
+                ).strip()
+                notes = str(check.get("notes", ""))
+                check["notes"] = f"{notes}; coverage_threshold_failed=true".strip("; ")
+                break
     test_run = report.setdefault("metadata", {}).setdefault("test_run", {})
+    test_run["exit_code"] = exit_code
     if coverage_percent is not None:
         test_run["coverage_percent"] = round(float(coverage_percent), 2)
+    if resolved_min_coverage is not None:
+        test_run["coverage_threshold_percent"] = round(float(resolved_min_coverage), 2)
     return report, write_snapshot(report, ttl_seconds, db_path=db_path)
 
 
@@ -413,11 +611,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("repo_root", help="Repo root path.")
     parser.add_argument("--ttl-seconds", type=int, default=3600)
     parser.add_argument("--timeout-seconds", type=int, default=30, help="Per-runner timeout before recording a failed snapshot.")
+    parser.add_argument(
+        "--min-coverage",
+        type=float,
+        default=None,
+        help="Optional minimum line coverage percentage for pytest-cov (0-100). Can also be set via REPO_HEALTH_MIN_COVERAGE.",
+    )
     parser.add_argument("--db-path", default=None, help="Optional CENTRAL DB path override.")
     parser.add_argument("--json", action="store_true", help="Print generated report JSON.")
     args = parser.parse_args(argv)
     repo_root = Path(args.repo_root).expanduser().resolve()
-    report, wrote = run(repo_root, ttl_seconds=args.ttl_seconds, db_path=args.db_path, timeout_seconds=args.timeout_seconds)
+    report, wrote = run(
+        repo_root,
+        ttl_seconds=args.ttl_seconds,
+        db_path=args.db_path,
+        timeout_seconds=args.timeout_seconds,
+        min_coverage=args.min_coverage,
+    )
     if args.json and report:
         print(json.dumps(report, indent=2, sort_keys=True))
     if not report:

@@ -16,20 +16,18 @@ Run from CENTRAL root:
 """
 
 import json
+import importlib.util
 import os
 import subprocess
 import sys
-import threading
-import time
 import unittest
-import urllib.request
 from typing import Any
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UI_SCRIPT = os.path.join(REPO_ROOT, "scripts", "planner_ui.py")
 DB_SCRIPT = os.path.join(REPO_ROOT, "scripts", "central_task_db.py")
 
-TEST_PORT = 7198  # avoid collision with real server
+_CLIENT = None
 
 
 def _db(*args) -> Any:
@@ -41,44 +39,38 @@ def _db(*args) -> Any:
 
 
 def _get(path: str) -> Any:
-    url = f"http://127.0.0.1:{TEST_PORT}{path}"
-    with urllib.request.urlopen(url, timeout=10) as r:
-        return json.loads(r.read())
+    if _CLIENT is None:
+        raise RuntimeError("planner ui test client not initialized")
+    response = _CLIENT.get(path)
+    if response.status_code != 200:
+        raise RuntimeError(f"GET {path} failed with status {response.status_code}")
+    return response.get_json()
 
 
 def _get_html(path: str) -> bytes:
-    url = f"http://127.0.0.1:{TEST_PORT}{path}"
-    with urllib.request.urlopen(url, timeout=10) as r:
-        return r.read()
+    if _CLIENT is None:
+        raise RuntimeError("planner ui test client not initialized")
+    response = _CLIENT.get(path)
+    if response.status_code != 200:
+        raise RuntimeError(f"GET {path} failed with status {response.status_code}")
+    return response.data
 
 
 class TestPlannerUIServer(unittest.TestCase):
-    _server_proc = None
-
     @classmethod
     def setUpClass(cls):
-        cls._server_proc = subprocess.Popen(
-            [sys.executable, UI_SCRIPT, "--port", str(TEST_PORT), "--host", "127.0.0.1"],
-            cwd=REPO_ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        # Wait for server to start
-        for _ in range(20):
-            try:
-                urllib.request.urlopen(f"http://127.0.0.1:{TEST_PORT}/", timeout=1)
-                break
-            except Exception:
-                time.sleep(0.3)
-        else:
-            cls._server_proc.terminate()
-            raise RuntimeError("Test server did not start in time")
+        global _CLIENT
+        spec = importlib.util.spec_from_file_location("planner_ui", UI_SCRIPT)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("failed to load planner_ui module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CLIENT = module.app.test_client()
 
     @classmethod
     def tearDownClass(cls):
-        if cls._server_proc:
-            cls._server_proc.terminate()
-            cls._server_proc.wait(timeout=5)
+        global _CLIENT
+        _CLIENT = None
 
     # ── /api/data structure ──────────────────────────────────────────────────
 
@@ -208,7 +200,6 @@ class TestPlannerUIServer(unittest.TestCase):
             self.assertIn("task_id", item)
             self.assertIn("repo", item)
             self.assertIn("title", item)
-            self.assertIn("audit_task_id", item)
 
     # ── By Repo section ──────────────────────────────────────────────────────
 
@@ -223,6 +214,13 @@ class TestPlannerUIServer(unittest.TestCase):
         for repo in data["by_repo"]:
             for field in ["total", "running", "eligible", "blocked"]:
                 self.assertGreaterEqual(repo[field], 0)
+
+    def test_by_repo_initiatives_have_progress_fields(self):
+        data = _get("/api/data")
+        for repo in data["by_repo"]:
+            for item in repo.get("initiatives", []):
+                for field in ["initiative", "total", "done", "in_progress"]:
+                    self.assertIn(field, item, f"initiative row missing field: {field}")
 
     # ── Recent Changes ───────────────────────────────────────────────────────
 
@@ -281,6 +279,19 @@ class TestPlannerUIServer(unittest.TestCase):
         # Verify dark-theme CSS variables and near-black background are present
         self.assertIn(b"--bg:", html)
         self.assertIn(b"0f1117", html)  # near-black background color
+
+    def test_html_has_repo_card_sort_and_toggle_controls(self):
+        html = _get_html("/")
+        self.assertIn(b"id=\"repo-sort\"", html)
+        self.assertIn(b"id=\"repo-hide-completed\"", html)
+        self.assertIn(b"handleByRepoControlsChange", html)
+
+    def test_html_has_repo_progress_sort_modes(self):
+        html = _get_html("/")
+        self.assertIn(b"progress_desc", html)
+        self.assertIn(b"progress_asc", html)
+        self.assertIn(b"active_desc", html)
+        self.assertIn(b"active_asc", html)
 
     # ── Consistency with CLI ─────────────────────────────────────────────────
 

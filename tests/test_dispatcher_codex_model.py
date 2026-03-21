@@ -29,6 +29,7 @@ def task_payload(task_id: str, *, codex_model: str | None = None) -> dict[str, o
         metadata["codex_model"] = codex_model
     return {
         "task_id": task_id,
+        "initiative": "one-off",
         "title": f"{task_id} codex model test",
         "summary": "Exercise dispatcher Codex model selection.",
         "objective_md": "Capture the worker command that CENTRAL would spawn.",

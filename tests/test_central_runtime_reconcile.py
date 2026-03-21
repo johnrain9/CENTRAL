@@ -41,6 +41,7 @@ def task_payload(task_id: str, *, approval_required: bool = False, task_type: st
         "worker_owner": None,
         "target_repo_id": "CENTRAL",
         "target_repo_root": str(REPO_ROOT),
+        "initiative": "one-off",
         "approval_required": approval_required,
         "metadata": {"test_case": task_id, "audit_required": False},
         "execution": {
@@ -321,7 +322,7 @@ class CentralRuntimeReconcileTest(unittest.TestCase):
         conn = task_db.connect(self.db_path)
         try:
             with conn:
-                task_db.create_task_graph(conn, payload, actor_kind="test", actor_id="central.runtime.tests")
+                task_db.create_task_graph(conn, payload, actor_kind="test", actor_id="central.runtime.tests", skip_preflight=True)
         finally:
             conn.close()
         dispatcher = self.dispatcher()
@@ -347,7 +348,7 @@ class CentralRuntimeReconcileTest(unittest.TestCase):
         conn = task_db.connect(self.db_path)
         try:
             with conn:
-                task_db.create_task_graph(conn, payload, actor_kind="test", actor_id="central.runtime.tests")
+                task_db.create_task_graph(conn, payload, actor_kind="test", actor_id="central.runtime.tests", skip_preflight=True)
                 parent = task_db.fetch_task_snapshots(conn, task_id=task_id)[0]
                 task_db.reconcile_task(
                     conn,
@@ -873,8 +874,7 @@ class CentralRuntimeReconcileTest(unittest.TestCase):
         events = self.fetch_events(task_id)
         self.assertIn("runtime.requeued", events)
         log_text = dispatcher.paths.log_path.read_text(encoding="utf-8")
-        self.assertIn("worker_capacity_requeued", log_text)
-        self.assertIn("dispatcher_capacity_backoff", log_text)
+        self.assertIn("worker_quota_hit", log_text)
 
 
 if __name__ == "__main__":

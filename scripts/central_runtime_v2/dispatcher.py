@@ -433,11 +433,17 @@ class CentralDispatcher:
 
     def _spawn_worker(self, snapshot: dict[str, Any]) -> None:
         effective_backend = resolve_task_worker_backend(snapshot, self.config.worker_mode)
+        # Use audit-specific model when configured and task is an audit.
+        task_type = (snapshot.get("task_type") or "").strip().lower()
+        is_audit = task_type == "audit"
+        effective_model = self.config.default_worker_model
+        if is_audit and self.config.audit_worker_model:
+            effective_model = self.config.audit_worker_model
         worker_task = build_worker_task(
             snapshot,
-            self.config.default_worker_model,
+            effective_model,
             worker_mode=effective_backend,
-            dispatcher_default_worker_model=self.config.default_worker_model,
+            dispatcher_default_worker_model=effective_model,
         )
         run_id = (snapshot.get("lease") or {}).get("execution_run_id") or f"{snapshot['task_id']}-{int(time.time())}"
         prompts_dir = self.paths.worker_prompts_dir / snapshot["task_id"]
@@ -935,6 +941,7 @@ class CentralDispatcher:
         notes: str | None,
         tests: str | None,
         result_artifacts: list[str],
+        raw_result_payload: dict[str, Any] | None = None,
     ) -> None:
         """Handle audit-rework routing and auto-reconciliation for a task that reached 'done'."""
         task_id = state.task["task_id"]
@@ -1073,7 +1080,7 @@ class CentralDispatcher:
                     )
                 self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status=runtime_status, summary=notes or error_text)
                 if runtime_status == "done":
-                    self._reconcile_done(state, result=result, notes=notes, tests=tests, result_artifacts=result_artifacts)
+                    self._reconcile_done(state, result=result, notes=notes, tests=tests, result_artifacts=result_artifacts, raw_result_payload=raw_result_payload)
                     self._run_health_snapshot_in_background(
                         str(state.task.get("target_repo_root") or ""),
                         task_id=task_id,

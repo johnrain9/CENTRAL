@@ -345,6 +345,8 @@ def _shape_by_repo(summary: dict, tasks: list[dict], repos: list[dict], health_r
 
         repo_info = repo_meta.get(repo_id, {})
         repo_health = health_by_repo.get(repo_id, {})
+        test_summary = repo_health.get("test_summary") or {}
+        counts = test_summary.get("counts") or {}
         out.append({
             "repo": repo_id,
             "display_name": repo_info.get("display_name", repo_id),
@@ -352,6 +354,11 @@ def _shape_by_repo(summary: dict, tasks: list[dict], repos: list[dict], health_r
             "last_commit": _git_last_commit(repo_info.get("repo_root")),
             "test_health": repo_health.get("overall_status") or repo_health.get("working_status") or "unknown",
             "test_health_freshness": repo_health.get("freshness") or "unknown",
+            "test_passed": counts.get("passed"),
+            "test_total": counts.get("total"),
+            "test_failed": counts.get("failed", 0),
+            "coverage_pct": test_summary.get("coverage_percent"),
+            "coverage_status": test_summary.get("coverage_status") or "coverage_unknown",
             "total": summary_row.get("total", 0),
             "running": summary_row.get("running", 0),
             "eligible": summary_row.get("eligible", 0),
@@ -763,6 +770,32 @@ tr.selected td { background: #1a2540; }
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 8px;
 }
+.repo-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.repo-controls select {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 3px 6px;
+  border-radius: 4px;
+  font-family: var(--font);
+  font-size: 10px;
+}
+.repo-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+.repo-controls input[type="checkbox"] {
+  accent-color: var(--blue);
+}
 .repo-card {
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -1066,6 +1099,19 @@ tr.selected td { background: #1a2540; }
       <span class="collapse-arrow">▾</span>
     </div>
     <div class="section-body">
+      <div class="repo-controls">
+        <span class="filter-label">sort:</span>
+        <select id="repo-sort" onchange="handleByRepoControlsChange()">
+          <option value="progress_desc">% done (high→low)</option>
+          <option value="progress_asc">% done (low→high)</option>
+          <option value="active_desc">active count (high→low)</option>
+          <option value="active_asc">active count (low→high)</option>
+        </select>
+        <label for="repo-hide-completed">
+          <input id="repo-hide-completed" type="checkbox" onchange="handleByRepoControlsChange()">
+          hide completed initiatives
+        </label>
+      </div>
       <div class="repo-grid" id="repo-grid"></div>
     </div>
   </div>
@@ -1158,6 +1204,8 @@ let refreshTimer = null;
 let staleThreshold = 30; // seconds before showing stale warning
 let lastRefreshSucceeded = true;
 let sortStates = {}; // tableId → {col, asc}
+let byRepoSortMode = 'progress_desc';
+let byRepoHideCompleted = false;
 
 // ─── Fetch ───────────────────────────────────────────────────────────────────
 async function fetchData() {
@@ -1236,6 +1284,14 @@ function renderAll(d) {
   if (d.errors && d.errors.length) {
     showError('Data warnings: ' + d.errors.join(' | '));
   }
+}
+
+function handleByRepoControlsChange() {
+  const sortSelect = document.getElementById('repo-sort');
+  const hideToggle = document.getElementById('repo-hide-completed');
+  byRepoSortMode = sortSelect ? sortSelect.value : 'progress_desc';
+  byRepoHideCompleted = Boolean(hideToggle && hideToggle.checked);
+  renderByRepo((DATA && DATA.by_repo) || []);
 }
 
 // ─── Summary Bar ─────────────────────────────────────────────────────────────
@@ -1402,24 +1458,79 @@ function renderAudit(items) {
 
 // ─── By Repo ──────────────────────────────────────────────────────────────────
 function renderByRepo(repos) {
-  document.getElementById('cnt-repo').textContent = repos.length;
-  setSectionState('sec-repo', repos.length > 0);
+  const sortSelect = document.getElementById('repo-sort');
+  const hideToggle = document.getElementById('repo-hide-completed');
+  if (sortSelect) byRepoSortMode = sortSelect.value || byRepoSortMode;
+  if (hideToggle) byRepoHideCompleted = hideToggle.checked;
+
+  const visibleInitiatives = (list) =>
+    (list || []).filter(item => !byRepoHideCompleted || item.done < item.total);
+
+  const initiativeStats = (item) => {
+    const total = Number(item.total || 0);
+    const done = Number(item.done || 0);
+    const active = Math.max(0, total - done);
+    const pct = total > 0 ? (done / total) : 0;
+    return {total, done, active, pct};
+  };
+
+  const repoStats = (repo) => {
+    const initiatives = visibleInitiatives(repo.initiatives);
+    const stats = initiatives.map(initiativeStats);
+    const total = stats.reduce((sum, s) => sum + s.total, 0);
+    const done = stats.reduce((sum, s) => sum + s.done, 0);
+    const active = stats.reduce((sum, s) => sum + s.active, 0);
+    const pct = total > 0 ? (done / total) : 0;
+    return {total, done, active, pct};
+  };
+
+  const compareByMode = (aPct, aActive, bPct, bActive) => {
+    if (byRepoSortMode === 'progress_asc') return (aPct - bPct) || (aActive - bActive);
+    if (byRepoSortMode === 'active_desc') return (bActive - aActive) || (aPct - bPct);
+    if (byRepoSortMode === 'active_asc') return (aActive - bActive) || (bPct - aPct);
+    return (bPct - aPct) || (bActive - aActive);
+  };
+
+  const sortedRepos = [...repos].sort((a, b) => {
+    const aStats = repoStats(a);
+    const bStats = repoStats(b);
+    const delta = compareByMode(aStats.pct, aStats.active, bStats.pct, bStats.active);
+    if (delta !== 0) return delta;
+    return String(a.display_name || a.repo || '').localeCompare(String(b.display_name || b.repo || ''));
+  });
+
+  document.getElementById('cnt-repo').textContent = sortedRepos.length;
+  setSectionState('sec-repo', sortedRepos.length > 0);
   const grid = document.getElementById('repo-grid');
-  const healthLabel = (status) => {
-    const normalized = (status || '').toLowerCase();
-    if (!status || normalized === 'unknown') return badge('unknown', 'gray');
-    if (normalized.includes('pass') || normalized === 'healthy') return badge(status, 'green');
-    if (normalized.includes('warn') || normalized.includes('degrade')) return badge(status, 'yellow');
-    return badge(status, 'red');
+  const testBadge = (r) => {
+    const passed = r.test_passed, total = r.test_total, failed = r.test_failed || 0;
+    if (total == null || total === 0) {
+      const normalized = (r.test_health || '').toLowerCase();
+      if (!r.test_health || normalized === 'unknown') return badge('no data', 'gray');
+      if (normalized.includes('pass') || normalized === 'healthy') return badge('pass', 'green');
+      if (normalized.includes('warn') || normalized.includes('degrade')) return badge('warn', 'yellow');
+      return badge('fail', 'red');
+    }
+    const label = `${passed}/${total}`;
+    const color = failed > 0 ? 'red' : 'green';
+    return badge(label, color);
+  };
+
+  const coverageBadge = (r) => {
+    if (r.coverage_pct == null) return badge('cov: ?', 'gray');
+    const pct = Math.round(r.coverage_pct);
+    const color = pct >= 80 ? 'green' : pct >= 60 ? 'yellow' : 'red';
+    return badge(`cov: ${pct}%`, color);
   };
 
   const initiativeRows = (item) => {
-    const pct = item.total ? Math.max(0, Math.min(100, Math.round((item.done / item.total) * 100))) : 0;
+    const stats = initiativeStats(item);
+    const pct = stats.total ? Math.max(0, Math.min(100, Math.round((stats.done / stats.total) * 100))) : 0;
     const label = item.done >= item.total ? '✓' : `${pct}%`;
     return `<div class="initiative">
       <div class="initiative-head">
         <span class="initiative-name" title="${esc(item.initiative)}">${esc(item.initiative)}</span>
-        <span class="initiative-count">${item.done}/${item.total}</span>
+        <span class="initiative-count">${stats.done}/${stats.total} · ${stats.active} active</span>
       </div>
       <div class="progress-wrap">
         <div class="progress-track">
@@ -1430,20 +1541,26 @@ function renderByRepo(repos) {
     </div>`;
   };
 
-  if (!repos.length) {
+  if (!sortedRepos.length) {
     grid.innerHTML = '<div class="empty-state">No repository initiatives to display.</div>';
     return;
   }
 
-  grid.innerHTML = repos.map(r => {
-    const initiatives = (r.initiatives || []).map(initiativeRows).join('');
+  grid.innerHTML = sortedRepos.map(r => {
+    const initiatives = visibleInitiatives(r.initiatives).sort((a, b) => {
+      const aStats = initiativeStats(a);
+      const bStats = initiativeStats(b);
+      const delta = compareByMode(aStats.pct, aStats.active, bStats.pct, bStats.active);
+      if (delta !== 0) return delta;
+      return String(a.initiative || '').localeCompare(String(b.initiative || ''));
+    }).map(initiativeRows).join('');
     return `<div class="repo-card">
       <div class="repo-name">${esc(r.display_name || r.repo)}</div>
       <div class="repo-meta">
         <span class="kv"><span>commit:</span><span>${esc(r.last_commit || 'unknown')}</span></span>
-        <span class="kv"><span>tests:</span><span>${healthLabel(r.test_health)} ${r.test_health_freshness || ''}</span></span>
+        <span class="kv"><span>tests:</span><span>${testBadge(r)} ${coverageBadge(r)} ${r.test_health_freshness || ''}</span></span>
       </div>
-      <div class="repo-initiatives">${initiatives || '<div class="empty-state">No initiatives.</div>'}</div>
+      <div class="repo-initiatives">${initiatives || '<div class="empty-state">No visible initiatives.</div>'}</div>
     </div>`;
   }).join('');
 }
