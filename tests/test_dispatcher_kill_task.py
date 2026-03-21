@@ -106,10 +106,30 @@ class DispatcherKillTaskTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def _daemon_pid(self) -> int | None:
+        lock_path = self.state_dir / "dispatcher.lock"
+        if not lock_path.exists():
+            return None
+        try:
+            import json as _json
+            pid = int(_json.loads(lock_path.read_text(encoding="utf-8")).get("pid"))
+            os.kill(pid, 0)
+            return pid
+        except Exception:
+            return None
+
     def tearDown(self) -> None:
+        daemon_pid = self._daemon_pid()  # capture before stop (lock may be deleted by daemon)
         try:
             self.run_dispatcher("stop", check=False, timeout=20.0)
+        except Exception:
+            pass
         finally:
+            if daemon_pid is not None:
+                try:
+                    os.kill(-daemon_pid, 9)
+                except OSError:
+                    pass
             self.cleanup_workers()
             self.tmpdir.cleanup()
 

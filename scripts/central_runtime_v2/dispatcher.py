@@ -799,6 +799,8 @@ class CentralDispatcher:
     def _run_health_snapshot_in_background(self, repo_root: str | None, *, task_id: str, run_id: str) -> None:
         if not repo_root:
             return
+        if self.config.worker_mode == "stub":
+            return  # Never run health snapshots in stub/test mode — they spawn pytest recursively
 
         now = time.monotonic()
         last = self._health_snapshot_last_run.get(repo_root, 0.0)

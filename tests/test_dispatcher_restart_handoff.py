@@ -63,6 +63,16 @@ def worker_task_payload() -> dict[str, object]:
     }
 
 
+def _kill_group(pid: int | None) -> None:
+    """SIGKILL the process group — safety net called with the daemon PID captured before stop."""
+    if pid is None:
+        return
+    try:
+        os.kill(-pid, 9)  # SIGKILL entire process group (daemon + spawned workers)
+    except OSError:
+        pass
+
+
 class DispatcherRestartHandoffTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory(prefix="central_dispatcher_restart_")
@@ -89,13 +99,17 @@ class DispatcherRestartHandoffTest(unittest.TestCase):
             conn.close()
 
     def tearDown(self) -> None:
+        daemon_pid = self.dispatcher_pid()  # capture before stop (lock may be deleted by daemon)
         try:
             self.run_dispatcher("stop", check=False, timeout=20)
+        except Exception:
+            pass
         finally:
+            _kill_group(daemon_pid)
             worker_pid = self.worker_pid_from_snapshot()
             if worker_pid is not None:
                 try:
-                    os.kill(worker_pid, 15)
+                    os.kill(worker_pid, 9)
                 except OSError:
                     pass
             self.tmpdir.cleanup()
@@ -422,13 +436,17 @@ class InterruptClassificationTest(unittest.TestCase):
             conn.close()
 
     def tearDown(self) -> None:
+        daemon_pid = self.dispatcher_pid()  # capture before stop (lock may be deleted by daemon)
         try:
             self.run_dispatcher("stop", check=False, timeout=20)
+        except Exception:
+            pass
         finally:
+            _kill_group(daemon_pid)
             worker_pid = self._worker_pid_from_db("SMOKE-2")
             if worker_pid is not None:
                 try:
-                    os.kill(worker_pid, 15)
+                    os.kill(worker_pid, 9)
                 except OSError:
                     pass
             self.tmpdir.cleanup()
