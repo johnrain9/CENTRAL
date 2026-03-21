@@ -21,6 +21,7 @@ import sys
 import textwrap
 import tempfile
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -288,7 +289,7 @@ def print_planner_ops_smoke(
     weak_overlap = sum(1 for c in candidates if c.get("band") == "weak_overlap")
     alpha = build_alpha(task_id, pf["preflight_token"])
 
-    print("Planner-ops preflight smoke 2: pass")
+    print("Planner-ops preflight smoke: pass")
     print(f"  task_id:      {task_id}")
     print(f"  template:     {template}")
     print(f"  repo:         {repo}")

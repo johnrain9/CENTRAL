@@ -34,7 +34,7 @@ AUTONOMY_PROFILE: str | None = os.environ.get("AUTONOMY_PROFILE")
 # Model constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_CODEX_MODEL = "gpt-5-codex"
+DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
 DEFAULT_CODEX_MODEL_ENV = "CENTRAL_DISPATCHER_CODEX_MODEL"
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -60,6 +60,13 @@ MEDIUM_TIER_CODEX_MODEL: str = os.environ.get(
 
 # Task classes that trigger high-tier model selection.
 HIGH_TIER_TAGS: frozenset[str] = frozenset({"design", "architecture", "planning", "spec"})
+
+# Allowed codex worker models (operator-facing allowlist).
+ALLOWED_CODEX_MODELS: frozenset[str] = frozenset({"gpt-5.4", "gpt-5.3-codex", "gpt-5.3-codex-spark"})
+
+# Reasoning effort levels for the codex backend.
+ALLOWED_REASONING_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high"})
+DEFAULT_CODEX_EFFORT = "medium"
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -109,20 +116,9 @@ class DispatcherConfig:
     status_heartbeat_seconds: float
     stale_recovery_seconds: float
     worker_mode: str
-    default_worker_model: str | None = None
-    default_codex_model: str = DEFAULT_CODEX_MODEL
+    default_worker_model: str
     max_retries: int = 5
     notify: bool = False
-
-    def __post_init__(self) -> None:
-        # Unify: if only one is set, sync them
-        if self.default_worker_model and not self.default_codex_model:
-            object.__setattr__(self, "default_codex_model", self.default_worker_model)
-        elif self.default_codex_model and not self.default_worker_model:
-            object.__setattr__(self, "default_worker_model", self.default_codex_model)
-        elif not self.default_worker_model and not self.default_codex_model:
-            object.__setattr__(self, "default_worker_model", DEFAULT_CODEX_MODEL)
-            object.__setattr__(self, "default_codex_model", DEFAULT_CODEX_MODEL)
 
 
 @dataclass(frozen=True)

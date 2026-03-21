@@ -14,10 +14,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-import central_runtime
+import central_runtime_v2 as central_runtime
+from central_runtime_v2.config import ALLOWED_CODEX_MODELS, ALLOWED_REASONING_EFFORTS
 
 REPO_DIR = Path(os.environ.get("CENTRAL_DISPATCHER_REPO_DIR", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
-RUNTIME_SCRIPT = Path(os.environ.get("CENTRAL_DISPATCHER_RUNTIME_SCRIPT", str(REPO_DIR / "scripts" / "central_runtime.py")))
+RUNTIME_SCRIPT = Path(os.environ.get("CENTRAL_DISPATCHER_RUNTIME_SCRIPT", str(REPO_DIR / "scripts" / "central_runtime_v2" / "__main__.py")))
 DB_SCRIPT = Path(os.environ.get("CENTRAL_DISPATCHER_DB_SCRIPT", str(REPO_DIR / "scripts" / "central_task_db.py")))
 PYTHON_BIN = sys.executable or "/usr/bin/python3"
 DB_PATH = os.environ.get("CENTRAL_TASK_DB_PATH")
@@ -31,6 +32,7 @@ MAX_WORKERS_ENV = "CENTRAL_DISPATCHER_MAX_WORKERS"
 CODEX_MODEL_ENV = central_runtime.DEFAULT_CODEX_MODEL_ENV
 DEFAULT_CODEX_MODEL = central_runtime.DEFAULT_CODEX_MODEL
 WORKER_MODEL_ENV = central_runtime.DEFAULT_WORKER_MODEL_ENV
+CODEX_EFFORT_ENV = "CENTRAL_DISPATCHER_CODEX_EFFORT"
 LOG_LEVEL_RE = re.compile(r"^(?P<ts>\S+)\s+(?P<level>[A-Z]+)\s+\[(?P<component>[^\]]+)\]\s+(?P<message>.*)$")
 
 
@@ -59,6 +61,28 @@ def die(message: str, code: int = 1) -> "None":
     raise SystemExit(code)
 
 
+def validate_model_for_mode(model: str, mode: str) -> None:
+    if mode == "codex" and model not in ALLOWED_CODEX_MODELS:
+        die(
+            f"invalid codex model: {model!r}\n"
+            f"Allowed: {', '.join(sorted(ALLOWED_CODEX_MODELS))}"
+        )
+
+
+def validate_runtime_importable() -> None:
+    if not RUNTIME_SCRIPT.exists():
+        die(f"CENTRAL runtime script missing: {RUNTIME_SCRIPT}")
+    result = subprocess.run(
+        [PYTHON_BIN, str(RUNTIME_SCRIPT), "--help"],
+        cwd=str(REPO_DIR),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "CENTRAL runtime script import check failed").strip()
+        die(f"CENTRAL runtime script import check failed: {RUNTIME_SCRIPT}\n{message}")
+
+
 def ensure_runtime() -> None:
     if not RUNTIME_SCRIPT.exists():
         die(f"CENTRAL runtime script missing: {RUNTIME_SCRIPT}")
@@ -85,6 +109,20 @@ def argparse_positive_int(raw: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError("value must be >= 1")
     return value
+
+
+def resolve_effort() -> tuple[str, str]:
+    raw = os.environ.get(CODEX_EFFORT_ENV, central_runtime.DEFAULT_CODEX_EFFORT).strip().lower()
+    source = "env" if CODEX_EFFORT_ENV in os.environ else "default"
+    if not raw:
+        raw = central_runtime.DEFAULT_CODEX_EFFORT
+        source = "default"
+    if raw not in ALLOWED_REASONING_EFFORTS:
+        die(
+            f"invalid codex effort: {raw!r}\n"
+            f"Allowed: {', '.join(sorted(ALLOWED_REASONING_EFFORTS))}"
+        )
+    return raw, source
 
 
 def runtime_cmd(*args: str) -> list[str]:
@@ -227,12 +265,19 @@ def load_saved_config() -> dict[str, object]:
     max_workers = payload.get("max_workers")
     if max_workers is not None:
         payload["max_workers"] = parse_positive_int(str(max_workers), label=f"{CONFIG_PATH} max_workers")
-    default_codex_model = payload.get("default_codex_model")
-    if default_codex_model is not None:
-        payload["default_codex_model"] = central_runtime.normalize_codex_model(
-            default_codex_model,
-            label=f"{CONFIG_PATH} default_codex_model",
+    default_worker_model = payload.get("default_worker_model")
+    if default_worker_model is not None:
+        payload["default_worker_model"] = central_runtime.normalize_codex_model(
+            default_worker_model,
+            label=f"{CONFIG_PATH} default_worker_model",
         )
+    else:
+        default_codex_model = payload.get("default_codex_model")
+        if default_codex_model is not None:
+            payload["default_worker_model"] = central_runtime.normalize_codex_model(
+                default_codex_model,
+                label=f"{CONFIG_PATH} default_codex_model",
+            )
     return payload
 
 
@@ -244,13 +289,13 @@ def saved_max_workers() -> int | None:
 
 def saved_codex_model() -> str | None:
     payload = load_saved_config()
-    value = payload.get("default_codex_model")
+    value = payload.get("default_worker_model") or payload.get("default_codex_model")
     return str(value) if value is not None else None
 
 
 def saved_worker_model() -> str | None:
     payload = load_saved_config()
-    value = payload.get("default_worker_model") or payload.get("default_codex_model")
+    value = payload.get("default_worker_model")
     return str(value) if value is not None else None
 
 
@@ -281,7 +326,13 @@ def env_worker_model() -> str | None:
     return central_runtime.normalize_codex_model(raw, label=WORKER_MODEL_ENV)
 
 
-def save_config(*, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None) -> None:
+def saved_notify() -> bool | None:
+    payload = load_saved_config()
+    value = payload.get("notify")
+    return bool(value) if value is not None else None
+
+
+def save_config(*, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None, notify: bool | None = None) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     payload = load_saved_config()
     if max_workers is not None:
@@ -289,12 +340,13 @@ def save_config(*, max_workers: int | None = None, codex_model: str | None = Non
     if worker_model is not None:
         payload["default_worker_model"] = central_runtime.normalize_codex_model(worker_model, label="worker model")
     elif codex_model is not None:
-        payload["default_codex_model"] = central_runtime.normalize_codex_model(codex_model, label="codex model")
-        payload["default_worker_model"] = payload["default_codex_model"]
+        payload["default_worker_model"] = central_runtime.normalize_codex_model(codex_model, label="codex model")
     if worker_mode is not None:
         if worker_mode not in ("codex", "claude", "stub"):
             die(f"invalid worker mode: {worker_mode}")
         payload["worker_mode"] = worker_mode
+    if notify is not None:
+        payload["notify"] = notify
     payload["updated_at"] = utc_now()
     CONFIG_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -392,10 +444,16 @@ def launcher_status_payload() -> dict[str, object]:
             "next_start_source": next_start.source,
             "next_restart_max_workers": next_restart.value,
             "next_restart_source": next_restart.source,
+            "saved_default_worker_model": saved_worker_model() or saved_codex_model(),
             "saved_default_codex_model": saved_codex_model(),
+            "env_default_worker_model": env_worker_model() or env_codex_model(),
             "env_default_codex_model": env_codex_model(),
+            "next_start_default_worker_model": next_start_model.value,
+            "next_start_default_worker_model_source": next_start_model.source,
             "next_start_default_codex_model": next_start_model.value,
             "next_start_default_codex_model_source": next_start_model.source,
+            "next_restart_default_worker_model": next_restart_model.value,
+            "next_restart_default_worker_model_source": next_restart_model.source,
             "next_restart_default_codex_model": next_restart_model.value,
             "next_restart_default_codex_model_source": next_restart_model.source,
         }
@@ -403,13 +461,15 @@ def launcher_status_payload() -> dict[str, object]:
     return payload
 
 
-def start_dispatcher(*, restart: bool = False, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None) -> int:
+def start_dispatcher(*, restart: bool = False, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None, notify: bool | None = None) -> int:
     ensure_runtime()
     init_db()
     current = running_pid()
     resolved = resolve_max_workers(max_workers, restart=restart)
     resolved_model = resolve_worker_model(worker_model or codex_model, restart=restart)
     effective_mode = worker_mode or saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
+    effective_notify = notify if notify is not None else (saved_notify() or False)
+    validate_model_for_mode(resolved_model.value, effective_mode)
     if current and not restart:
         if max_workers is not None:
             print("Dispatcher already running; restart is required to apply a new max worker limit.")
@@ -421,16 +481,16 @@ def start_dispatcher(*, restart: bool = False, max_workers: int | None = None, c
         stop_dispatcher(quiet=True)
 
     with LAUNCH_LOG_PATH.open("ab") as handle:
+        daemon_args = [
+            "daemon",
+            "--max-workers", str(resolved.value),
+            "--default-worker-model", resolved_model.value,
+            "--worker-mode", effective_mode,
+        ]
+        if effective_notify:
+            daemon_args.append("--notify")
         proc = subprocess.Popen(
-            runtime_cmd(
-                "daemon",
-                "--max-workers",
-                str(resolved.value),
-                "--default-worker-model",
-                resolved_model.value,
-                "--worker-mode",
-                effective_mode,
-            ),
+            runtime_cmd(*daemon_args),
             cwd=str(REPO_DIR),
             stdout=handle,
             stderr=subprocess.STDOUT,
@@ -498,44 +558,20 @@ def tail_file(path: Path, lines: int = 120) -> str:
     return "\n".join(data[-lines:])
 
 
-def should_colorize() -> bool:
-    if os.environ.get("NO_COLOR"):
-        return False
-    term = os.environ.get("TERM", "")
-    if term.lower() == "dumb":
-        return False
-    return sys.stdout.isatty()
-
-
-_LEVEL_COLORS = {
-    "INF": "\033[32m",   # green
-    "WRN": "\033[33m",   # yellow
-    "ERR": "\033[31m",   # red
-    "DBG": "\033[36m",   # cyan
-}
-_RESET = "\033[0m"
-_DIM = "\033[2m"
-_BOLD = "\033[1m"
+def _make_daemon_log():
+    from central_runtime_v2.log import DaemonLog
+    return DaemonLog(LOG_PATH)
 
 
 def colorize_log_line(line: str) -> str:
-    if not should_colorize():
-        return line
-    match = LOG_LEVEL_RE.match(line)
-    if not match:
-        return line
-    ts = match.group("ts")
-    level = match.group("level")
-    component = match.group("component")
-    message = match.group("message")
-    color = _LEVEL_COLORS.get(level, "")
-    return f"{_DIM}{ts}{_RESET} {color}{_BOLD}{level}{_RESET} {_DIM}[{component}]{_RESET} {message}"
+    return _make_daemon_log().colorize_log_line(line)
 
 
 def stream_colored_logs(path: Path, *, lines: int = 120) -> int:
     if not path.exists():
         print(f"{path}: no log yet")
         return 0
+    daemon_log = _make_daemon_log()
     proc = subprocess.Popen(
         ["tail", "-n", str(lines), "-f", str(path)],
         cwd=str(REPO_DIR),
@@ -547,7 +583,7 @@ def stream_colored_logs(path: Path, *, lines: int = 120) -> int:
     assert proc.stdout is not None
     try:
         for line in proc.stdout:
-            print(colorize_log_line(line.rstrip("\n")))
+            print(daemon_log.colorize_log_line(line.rstrip("\n")))
     except KeyboardInterrupt:
         proc.terminate()
         proc.wait(timeout=5)
@@ -557,9 +593,10 @@ def stream_colored_logs(path: Path, *, lines: int = 120) -> int:
 
 def show_logs(follow: bool = False) -> int:
     ensure_runtime()
+    daemon_log = _make_daemon_log()
     if follow:
         return stream_colored_logs(LOG_PATH)
-    print("\n".join(colorize_log_line(line) for line in tail_file(LOG_PATH).splitlines()))
+    print("\n".join(daemon_log.colorize_log_line(line) for line in tail_file(LOG_PATH).splitlines()))
     return 0
 
 
@@ -597,10 +634,10 @@ def show_workers(*, as_json: bool, task_id: str | None, limit: int, recent_hours
     return 0
 
 
-def show_config(*, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None) -> int:
+def show_config(*, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None, notify: bool | None = None) -> int:
     ensure_runtime()
-    if max_workers is not None or codex_model is not None or worker_model is not None or worker_mode is not None:
-        save_config(max_workers=max_workers, codex_model=codex_model, worker_model=worker_model, worker_mode=worker_mode)
+    if max_workers is not None or codex_model is not None or worker_model is not None or worker_mode is not None or notify is not None:
+        save_config(max_workers=max_workers, codex_model=codex_model, worker_model=worker_model, worker_mode=worker_mode, notify=notify)
     payload = load_saved_config()
     effective_model = resolve_worker_model(None, restart=False)
     print(
@@ -608,20 +645,92 @@ def show_config(*, max_workers: int | None = None, codex_model: str | None = Non
             {
                 "config_path": str(CONFIG_PATH),
                 "saved_max_workers": payload.get("max_workers"),
-                "saved_default_worker_model": payload.get("default_worker_model") or payload.get("default_codex_model"),
+                "saved_default_worker_model": payload.get("default_worker_model"),
+                "saved_default_codex_model": payload.get("default_codex_model"),
                 "saved_worker_mode": payload.get("worker_mode"),
+                "saved_notify": payload.get("notify"),
                 "updated_at": payload.get("updated_at"),
                 "env_max_workers": env_max_workers(),
                 "env_default_worker_model": env_worker_model() or env_codex_model(),
+                "env_default_codex_model": env_codex_model(),
                 "effective_start_max_workers": resolve_max_workers(None, restart=False).value,
                 "effective_start_source": resolve_max_workers(None, restart=False).source,
                 "effective_start_default_worker_model": effective_model.value,
                 "effective_start_default_worker_model_source": effective_model.source,
+                "effective_start_default_codex_model": effective_model.value,
+                "effective_start_default_codex_model_source": effective_model.source,
             },
             indent=2,
             sort_keys=True,
         )
     )
+    return 0
+
+
+def _effective_db_path() -> str:
+    return DB_PATH or str(REPO_DIR / "state" / "central_tasks.db")
+
+
+def _run_self_check_stub() -> dict[str, object]:
+    result = subprocess.run(
+        [PYTHON_BIN, str(RUNTIME_SCRIPT), "self-check"],
+        cwd=str(REPO_DIR),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "CENTRAL runtime self-check failed").strip()
+        die(f"dispatcher self-check failed (exit {result.returncode}):\n{message}")
+    raw = (result.stdout or "").strip()
+    if not raw:
+        die("dispatcher self-check returned no output")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        die(f"dispatcher self-check returned invalid JSON: {exc}")
+        raise exc
+    if not isinstance(payload, dict):
+        die("dispatcher self-check returned a non-object payload")
+    if payload.get("planner_status") != "done":
+        die(
+            "dispatcher self-check did not complete successfully: "
+            f"planner_status={payload.get('planner_status')!r}"
+        )
+    runtime_status = payload.get("runtime_status")
+    if runtime_status not in {"done", "pending_review"}:
+        die(
+            "dispatcher self-check runtime status is not successful: "
+            f"runtime_status={runtime_status!r}"
+        )
+    last_runtime_error = payload.get("last_runtime_error")
+    if last_runtime_error:
+        die(f"dispatcher self-check reported runtime error: {last_runtime_error!r}")
+    return payload
+
+
+def run_check() -> int:
+    validate_runtime_importable()
+    effective_mode = saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
+    resolved_model = resolve_worker_model(None, restart=False)
+    validate_model_for_mode(resolved_model.value, effective_mode)
+    effort, effort_source = resolve_effort()
+    max_workers = resolve_max_workers(None, restart=False)
+    effective_config = {
+        "mode": effective_mode,
+        "model": resolved_model.value,
+        "effort": effort,
+        "effort_source": effort_source,
+        "max_workers": max_workers.value,
+        "db_path": _effective_db_path(),
+        "state_dir": str(STATE_DIR),
+    }
+    print("Effective configuration:")
+    print(json.dumps(effective_config, indent=2, sort_keys=True))
+
+    check_payload = _run_self_check_stub()
+    print("Self-check result:")
+    print(json.dumps(check_payload, indent=2, sort_keys=True))
+    print("Dispatcher check passed")
     return 0
 
 
@@ -671,12 +780,16 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--codex-model", help="(deprecated, use --worker-model)")
     start_parser.add_argument("--worker-model")
     start_parser.add_argument("--worker-mode", choices=["codex", "claude", "stub"])
+    start_parser.add_argument("--notify", action="store_true", default=None)
+    start_parser.add_argument("--no-notify", dest="notify", action="store_false")
 
     restart_parser = subparsers.add_parser("restart", help="Restart the dispatcher daemon")
     restart_parser.add_argument("--max-workers", type=argparse_positive_int)
     restart_parser.add_argument("--codex-model", help="(deprecated, use --worker-model)")
     restart_parser.add_argument("--worker-model")
     restart_parser.add_argument("--worker-mode", choices=["codex", "claude", "stub"])
+    restart_parser.add_argument("--notify", action="store_true", default=None)
+    restart_parser.add_argument("--no-notify", dest="notify", action="store_false")
 
     subparsers.add_parser("stop", help="Stop the dispatcher daemon")
     subparsers.add_parser("status", help="Show dispatcher status")
@@ -695,12 +808,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("once", help="Run one dispatcher cycle")
     subparsers.add_parser("run-once", help="Run one dispatcher cycle")
     subparsers.add_parser("run_once", help="Run one dispatcher cycle")
+    subparsers.add_parser("check", help="Validate config and run a stub self-check")
 
     config_parser = subparsers.add_parser("config", help="Show or update persisted launcher defaults")
     config_parser.add_argument("--max-workers", type=argparse_positive_int)
     config_parser.add_argument("--codex-model", help="(deprecated, use --worker-model)")
     config_parser.add_argument("--worker-model")
     config_parser.add_argument("--worker-mode", choices=["codex", "claude", "stub"])
+    config_parser.add_argument("--notify", action="store_true", default=None)
+    config_parser.add_argument("--no-notify", dest="notify", action="store_false")
 
     kill_parser = subparsers.add_parser("kill-task", help="Fail a task by operator request and terminate its worker if present")
     kill_parser.add_argument("task_id")
@@ -721,6 +837,7 @@ def main(argv: list[str]) -> int:
             codex_model=getattr(args, "codex_model", None),
             worker_model=getattr(args, "worker_model", None),
             worker_mode=getattr(args, "worker_mode", None),
+            notify=getattr(args, "notify", None),
         )
     if cmd == "restart":
         return start_dispatcher(
@@ -729,6 +846,7 @@ def main(argv: list[str]) -> int:
             codex_model=getattr(args, "codex_model", None),
             worker_model=getattr(args, "worker_model", None),
             worker_mode=getattr(args, "worker_mode", None),
+            notify=getattr(args, "notify", None),
         )
     if cmd == "stop":
         return stop_dispatcher()
@@ -747,12 +865,15 @@ def main(argv: list[str]) -> int:
         return show_logs(follow=True)
     if cmd in {"once", "run-once", "run_once"}:
         return run_once()
+    if cmd == "check":
+        return run_check()
     if cmd == "config":
         return show_config(
             max_workers=getattr(args, "max_workers", None),
             codex_model=getattr(args, "codex_model", None),
             worker_model=getattr(args, "worker_model", None),
             worker_mode=getattr(args, "worker_mode", None),
+            notify=getattr(args, "notify", None),
         )
     if cmd == "kill-task":
         return kill_task(task_id=args.task_id, reason=args.reason, as_json=getattr(args, "json", False))

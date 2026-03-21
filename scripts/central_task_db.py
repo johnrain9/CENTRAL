@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -20,7 +22,7 @@ except ImportError:
     _YAML_AVAILABLE = False
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -52,6 +54,34 @@ TASK_PACKET_RE = re.compile(r"^## Task (CENTRAL-OPS-[0-9]+): (.+)$", re.MULTILIN
 SNAPSHOT_DB_FILENAME = "central_tasks.db"
 SNAPSHOT_MANIFEST_FILENAME = "manifest.json"
 SNAPSHOT_POINTER_FILENAME = "latest.json"
+CAPABILITY_ID_RE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
+CAPABILITY_STATUSES = {"proposed", "active", "deprecated"}
+CAPABILITY_SCOPE_KINDS = {"local", "cross_repo_contract", "workflow"}
+CAPABILITY_VERIFICATION_LEVELS = {"provisional", "planner_verified", "audited"}
+PREFLIGHT_ALGORITHM_VERSION = "capability-preflight-v1"
+PREFLIGHT_TOKEN_VERSION = "capability-preflight-token-v1"
+PREFLIGHT_ISSUER = "CENTRAL"
+PREFLIGHT_REQUEST_CHANNELS = {"task-create", "task-update", "planner-review", "bootstrap"}
+PREFLIGHT_ERROR_CODES = {
+    "preflight_missing",
+    "preflight_untrusted",
+    "preflight_stale",
+    "preflight_classification_invalid",
+    "preflight_related_references_invalid",
+    "preflight_override_forbidden",
+    "preflight_override_invalid",
+    "preflight_duplicate_blocked",
+    "preflight_strong_overlap_blocked",
+}
+CAPABILITY_SOURCE_RELATIONSHIP_KINDS = {
+    "created_by",
+    "updated_by",
+    "deprecated_by",
+    "superseded_by",
+    "seeded_from",
+}
+CAPABILITY_CLOSEOUT_TASK_TYPE_CATEGORIES = {"must_emit", "may_emit", "must_not_emit"}
+CAPABILITY_MUTATION_ACTIONS = {"create", "update", "deprecate", "supersede"}
 
 
 @dataclass(frozen=True)
@@ -519,6 +549,224 @@ def file_sha256(path: Path) -> str:
 
 def stable_sha256(payload: Any) -> str:
     return hashlib.sha256(compact_json(payload).encode("utf-8")).hexdigest()
+
+
+def utc_rfc3339(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = str(value).strip()
+    if normalized.endswith("Z"):
+        return normalized
+    return normalized.replace("+00:00", "Z")
+
+
+def normalize_text_whitespace(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def markdown_to_plain_text(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"[#>*_\-\[\]\(\)]", " ", text)
+    return normalize_text_whitespace(text)
+
+
+def lexical_tokens(value: Any) -> list[str]:
+    text = markdown_to_plain_text(value).casefold()
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", text)
+        if not re.fullmatch(r"\d+", token)
+    ]
+
+
+def lexical_token_set(value: Any) -> set[str]:
+    return set(lexical_tokens(value))
+
+
+def jaccard_overlap(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def preflight_secret() -> bytes:
+    return os.environ.get("CENTRAL_PREFLIGHT_SECRET", "central-preflight-dev-secret").encode("utf-8")
+
+
+def current_utc_datetime() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    normalized = str(value).strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    return datetime.fromisoformat(normalized)
+
+
+def sorted_unique_strings(values: Any) -> list[str]:
+    if values is None:
+        return []
+    if not isinstance(values, list):
+        die("expected a JSON array of strings")
+    normalized = [normalize_text_whitespace(value) for value in values]
+    cleaned = [value for value in normalized if value]
+    return sorted(set(cleaned))
+
+
+def parse_preflight_json_object(value: Any, *, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        die(f"{field} must be a JSON object")
+    return value
+
+
+def canonicalize_task_intent(payload: dict[str, Any]) -> dict[str, Any]:
+    intent = {
+        "title": normalize_text_whitespace(payload.get("title")),
+        "summary": normalize_text_whitespace(payload.get("summary")),
+        "objective_md": normalize_text_whitespace(payload.get("objective_md")),
+        "scope_md": normalize_text_whitespace(payload.get("scope_md")),
+        "deliverables_md": normalize_text_whitespace(payload.get("deliverables_md")),
+        "acceptance_md": normalize_text_whitespace(payload.get("acceptance_md")),
+        "target_repo_id": normalize_text_whitespace(payload.get("target_repo_id")),
+        "task_type": normalize_text_whitespace(payload.get("task_type")),
+        "dependency_task_ids": sorted_unique_strings(payload.get("dependency_task_ids", payload.get("dependencies", []))),
+        "dependency_kinds": payload.get("dependency_kinds") if isinstance(payload.get("dependency_kinds"), dict) else {},
+        "parent_task_id": payload.get("parent_task_id"),
+        "initiative_key": payload.get("initiative_key", payload.get("initiative")),
+        "related_repo_ids": sorted_unique_strings(payload.get("related_repo_ids", [])),
+        "requested_capability_ids": sorted_unique_strings(payload.get("requested_capability_ids", [])),
+        "requested_task_ids": sorted_unique_strings(payload.get("requested_task_ids", [])),
+        "labels": sorted_unique_strings(payload.get("labels", [])),
+    }
+    return intent
+
+
+def intent_comparison_fields(intent: dict[str, Any]) -> dict[str, Any]:
+    objective_text = markdown_to_plain_text(intent.get("objective_md"))
+    scope_text = markdown_to_plain_text(intent.get("scope_md"))
+    deliverables_text = markdown_to_plain_text(intent.get("deliverables_md"))
+    acceptance_text = markdown_to_plain_text(intent.get("acceptance_md"))
+    summary_text = markdown_to_plain_text(intent.get("summary"))
+    title_text = markdown_to_plain_text(intent.get("title"))
+    intent_text = normalize_text_whitespace(
+        " ".join([title_text, summary_text, objective_text, scope_text, deliverables_text, acceptance_text])
+    )
+    repo_scope = sorted(
+        {
+            normalize_text_whitespace(intent.get("target_repo_id")),
+            *sorted_unique_strings(intent.get("related_repo_ids", [])),
+        }
+        - {""}
+    )
+    fingerprint_payload = {
+        "title": title_text.casefold(),
+        "summary": summary_text.casefold(),
+        "objective": objective_text.casefold(),
+        "scope": scope_text.casefold(),
+        "deliverables": deliverables_text.casefold(),
+        "acceptance": acceptance_text.casefold(),
+        "target_repo_id": normalize_text_whitespace(intent.get("target_repo_id")),
+        "task_type": normalize_text_whitespace(intent.get("task_type")),
+        "dependency_task_ids": sorted_unique_strings(intent.get("dependency_task_ids", [])),
+    }
+    return {
+        "title_text": title_text,
+        "summary_text": summary_text,
+        "objective_text": objective_text,
+        "scope_text": scope_text,
+        "deliverables_text": deliverables_text,
+        "acceptance_text": acceptance_text,
+        "intent_text": intent_text,
+        "intent_terms": sorted(lexical_token_set(intent_text)),
+        "intent_fingerprint": f"sha256:{stable_sha256(fingerprint_payload)}",
+        "repo_scope": repo_scope,
+        "deliverable_terms": sorted(
+            lexical_token_set(" ".join([deliverables_text, acceptance_text]))
+        ),
+    }
+
+
+def canonicalize_preflight_request(payload: dict[str, Any]) -> dict[str, Any]:
+    request = parse_preflight_json_object(payload, field="preflight request")
+    intent = canonicalize_task_intent(parse_preflight_json_object(request.get("normalized_task_intent"), field="normalized_task_intent"))
+    search_scope = dict(parse_preflight_json_object(request.get("search_scope") or {}, field="search_scope"))
+    repo_ids = sorted_unique_strings(search_scope.get("repo_ids") or [intent["target_repo_id"], *intent.get("related_repo_ids", [])])
+    if not repo_ids:
+        repo_ids = [intent["target_repo_id"]]
+    include_recent_done_days = int(search_scope.get("include_recent_done_days", 90))
+    if include_recent_done_days < 30 or include_recent_done_days > 180:
+        die("search_scope.include_recent_done_days must be in 30..180")
+    max_candidates_per_kind = int(search_scope.get("max_candidates_per_kind", 50))
+    if max_candidates_per_kind > 200:
+        die("search_scope.max_candidates_per_kind may not exceed 200")
+    request_context = parse_preflight_json_object(request.get("request_context") or {}, field="request_context")
+    requested_by = normalize_text_whitespace(request_context.get("requested_by"))
+    if not requested_by:
+        die("request_context.requested_by is required")
+    request_channel = normalize_text_whitespace(request_context.get("request_channel"))
+    if request_channel not in PREFLIGHT_REQUEST_CHANNELS:
+        die(f"invalid request_context.request_channel: {request_channel!r}")
+    canonical = {
+        "normalized_task_intent": intent,
+        "search_scope": {
+            "repo_ids": repo_ids,
+            "include_active_tasks": bool(search_scope.get("include_active_tasks", True)),
+            "include_recent_done_days": include_recent_done_days,
+            "include_capabilities": bool(search_scope.get("include_capabilities", True)),
+            "include_deprecated_capabilities": bool(search_scope.get("include_deprecated_capabilities", True)),
+            "max_candidates_per_kind": max_candidates_per_kind,
+        },
+        "request_context": {
+            "requested_by": requested_by,
+            "request_channel": request_channel,
+            "is_material_update": bool(request_context.get("is_material_update", False)),
+            "existing_task_id": request_context.get("existing_task_id"),
+            "existing_task_version": request_context.get("existing_task_version"),
+        },
+    }
+    if canonical["request_context"]["is_material_update"]:
+        if not canonical["request_context"]["existing_task_id"] or canonical["request_context"]["existing_task_version"] is None:
+            die("existing_task_id and existing_task_version are required for material-update preflight")
+    return canonical
+
+
+def preflight_error_payload(
+    *,
+    error_code: str,
+    message: str,
+    response: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if error_code not in PREFLIGHT_ERROR_CODES:
+        die(f"unknown preflight error code: {error_code}")
+    response = response or {}
+    return {
+        "error_code": error_code,
+        "message": message,
+        "preflight_bucket": response.get("blocking_bucket", "none"),
+        "matched_task_ids": list(response.get("matched_task_ids", [])),
+        "matched_capability_ids": list(response.get("matched_capability_ids", [])),
+        "rerun_required": error_code == "preflight_stale",
+    }
+
+
+def die_preflight(
+    *,
+    error_code: str,
+    message: str,
+    response: dict[str, Any] | None = None,
+) -> "None":
+    die(json_dumps(preflight_error_payload(error_code=error_code, message=message, response=response)))
+
+
+def canonical_preflight_response_body(response: dict[str, Any]) -> dict[str, Any]:
+    body = dict(response)
+    body.pop("preflight_token", None)
+    return body
 
 
 def snapshots_root(durability_dir: Path) -> Path:
@@ -1037,6 +1285,1633 @@ def render_repo_detail(row: dict[str, Any]) -> str:
             f"created_at: {row['created_at']}",
             f"updated_at: {row['updated_at']}",
         ]
+    )
+
+
+def normalize_capability_id(value: Any) -> str:
+    capability_id = str(value or "").strip()
+    if not capability_id:
+        die("capability_id is required")
+    if not CAPABILITY_ID_RE.match(capability_id):
+        die(
+            "invalid capability_id: "
+            f"{capability_id!r} (expected lowercase slug with underscores)"
+        )
+    return capability_id
+
+
+def normalize_string_list(value: Any, *, field: str, allow_empty: bool = True) -> list[str]:
+    if value is None:
+        items: list[Any] = []
+    elif isinstance(value, list):
+        items = value
+    else:
+        die(f"{field} must be a JSON array")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            die(f"{field} cannot contain blank values")
+        if text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+    if not allow_empty and not normalized:
+        die(f"{field} must contain at least one value")
+    return normalized
+
+
+def normalize_capability_source_tasks(value: Any, *, fallback_task_id: str | None) -> list[dict[str, str]]:
+    if value is None:
+        if fallback_task_id is None:
+            return []
+        return [{"task_id": fallback_task_id, "relationship_kind": "created_by"}]
+    if not isinstance(value, list):
+        die("source_tasks must be a JSON array")
+    normalized: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in value:
+        if not isinstance(entry, dict):
+            die("source_tasks entries must be objects")
+        task_id = str(entry.get("task_id") or "").strip()
+        if not task_id:
+            die("source_tasks entries require task_id")
+        relationship_kind = str(entry.get("relationship_kind") or "").strip()
+        if relationship_kind not in CAPABILITY_SOURCE_RELATIONSHIP_KINDS:
+            die(
+                "invalid source_tasks relationship_kind: "
+                f"{relationship_kind!r}; expected one of {sorted(CAPABILITY_SOURCE_RELATIONSHIP_KINDS)}"
+            )
+        key = (task_id, relationship_kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({"task_id": task_id, "relationship_kind": relationship_kind})
+    return normalized
+
+
+def validate_capability_lifecycle(
+    *,
+    capability_id: str,
+    status: str,
+    verification_level: str,
+    scope_kind: str,
+    owning_repo_id: str,
+    affected_repo_ids: list[str],
+    verified_by_task_id: str | None,
+    replaced_by_capability_id: str | None,
+    metadata: dict[str, Any],
+) -> None:
+    if status not in CAPABILITY_STATUSES:
+        die(f"invalid capability status: {status!r}")
+    if verification_level not in CAPABILITY_VERIFICATION_LEVELS:
+        die(f"invalid capability verification_level: {verification_level!r}")
+    if scope_kind not in CAPABILITY_SCOPE_KINDS:
+        die(f"invalid capability scope_kind: {scope_kind!r}")
+    if not verified_by_task_id:
+        die("verified_by_task_id is required for canonical capability provenance")
+    if replaced_by_capability_id is not None and replaced_by_capability_id == capability_id:
+        die("replaced_by_capability_id must refer to a different capability")
+
+    if status == "proposed" and verification_level == "audited":
+        die("status='proposed' cannot use verification_level='audited'")
+    if status == "active" and verification_level == "provisional" and not parse_bool(
+        metadata.get("bootstrap_mode", False),
+        field="metadata.bootstrap_mode",
+    ):
+        die("active provisional capabilities require metadata.bootstrap_mode=true")
+    if status == "deprecated" and verification_level == "provisional":
+        die("status='deprecated' cannot use verification_level='provisional'")
+
+    if scope_kind == "local":
+        if affected_repo_ids != [owning_repo_id]:
+            die("scope_kind='local' requires affected_repo_ids to contain exactly owning_repo_id")
+        return
+    if scope_kind == "cross_repo_contract":
+        if len(affected_repo_ids) < 2:
+            die("scope_kind='cross_repo_contract' requires at least two affected repos")
+        if owning_repo_id not in affected_repo_ids:
+            die("scope_kind='cross_repo_contract' requires owning_repo_id in affected_repo_ids")
+        return
+    if owning_repo_id not in affected_repo_ids:
+        die("scope_kind='workflow' requires owning_repo_id in affected_repo_ids")
+
+
+def canonicalize_capability_payload(
+    conn: sqlite3.Connection,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    capability_id = normalize_capability_id(payload.get("capability_id"))
+    name = str(payload.get("name") or "").strip()
+    summary = str(payload.get("summary") or "").strip()
+    kind = str(payload.get("kind") or "").strip()
+    when_to_use_md = str(payload.get("when_to_use_md") or "").strip()
+    if not name:
+        die("name is required")
+    if not summary:
+        die("summary is required")
+    if not kind:
+        die("kind is required")
+    if not when_to_use_md:
+        die("when_to_use_md is required")
+
+    owning_repo = resolve_repo_reference(conn, str(payload.get("owning_repo_id") or ""), field="owning_repo_id")
+    if owning_repo is None:
+        die(f"unknown owning_repo_id for capability {capability_id}")
+    affected_repo_ids = sorted(
+        {
+            str(resolve_repo_reference(conn, repo_id, field="affected_repo_id")["repo_id"])
+            for repo_id in normalize_string_list(payload.get("affected_repo_ids"), field="affected_repo_ids", allow_empty=False)
+        }
+    )
+    metadata = payload.get("metadata")
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        die("metadata must be a JSON object")
+
+    verified_by_task_id = str(payload.get("verified_by_task_id") or "").strip() or None
+    replaced_by_raw = str(payload.get("replaced_by_capability_id") or "").strip() or None
+    replaced_by_capability_id = normalize_capability_id(replaced_by_raw) if replaced_by_raw is not None else None
+
+    source_tasks = normalize_capability_source_tasks(
+        payload.get("source_tasks"),
+        fallback_task_id=verified_by_task_id,
+    )
+    validate_capability_lifecycle(
+        capability_id=capability_id,
+        status=str(payload.get("status") or "").strip(),
+        verification_level=str(payload.get("verification_level") or "").strip(),
+        scope_kind=str(payload.get("scope_kind") or "").strip(),
+        owning_repo_id=str(owning_repo["repo_id"]),
+        affected_repo_ids=affected_repo_ids,
+        verified_by_task_id=verified_by_task_id,
+        replaced_by_capability_id=replaced_by_capability_id,
+        metadata=metadata,
+    )
+
+    timestamp = now_iso()
+    return {
+        "capability_id": capability_id,
+        "name": name,
+        "summary": summary,
+        "status": str(payload["status"]).strip(),
+        "kind": kind,
+        "scope_kind": str(payload["scope_kind"]).strip(),
+        "owning_repo_id": str(owning_repo["repo_id"]),
+        "when_to_use_md": when_to_use_md,
+        "do_not_use_for_md": str(payload.get("do_not_use_for_md") or "").strip(),
+        "entrypoints": normalize_string_list(payload.get("entrypoints"), field="entrypoints"),
+        "keywords": normalize_string_list(payload.get("keywords"), field="keywords"),
+        "affected_repo_ids": affected_repo_ids,
+        "evidence_summary_md": str(payload.get("evidence_summary_md") or "").strip(),
+        "verification_level": str(payload["verification_level"]).strip(),
+        "verified_by_task_id": verified_by_task_id,
+        "replaced_by_capability_id": replaced_by_capability_id,
+        "created_at": str(payload.get("created_at") or timestamp),
+        "updated_at": str(payload.get("updated_at") or timestamp),
+        "archived_at": str(payload.get("archived_at") or "").strip() or None,
+        "metadata": metadata,
+        "source_tasks": source_tasks,
+        "event_type": str(payload.get("event_type") or "capability.created").strip(),
+        "event_payload": payload.get("event_payload") if isinstance(payload.get("event_payload"), dict) else {},
+    }
+
+
+def insert_capability_event(
+    conn: sqlite3.Connection,
+    *,
+    capability_id: str,
+    event_type: str,
+    actor_kind: str,
+    actor_id: str,
+    payload: dict[str, Any] | None = None,
+    created_at: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO capability_events (capability_id, event_type, actor_kind, actor_id, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            capability_id,
+            event_type,
+            actor_kind,
+            actor_id,
+            compact_json(payload or {}),
+            created_at or now_iso(),
+        ),
+    )
+
+
+def create_capability(
+    conn: sqlite3.Connection,
+    payload: dict[str, Any],
+    *,
+    actor_kind: str,
+    actor_id: str,
+) -> dict[str, Any]:
+    normalized = canonicalize_capability_payload(conn, payload)
+    existing = conn.execute(
+        "SELECT capability_id FROM capabilities WHERE capability_id = ?",
+        (normalized["capability_id"],),
+    ).fetchone()
+    if existing is not None:
+        die(f"capability already exists: {normalized['capability_id']}")
+
+    conn.execute(
+        """
+        INSERT INTO capabilities (
+            capability_id,
+            name,
+            summary,
+            status,
+            kind,
+            scope_kind,
+            owning_repo_id,
+            when_to_use_md,
+            do_not_use_for_md,
+            entrypoints_json,
+            keywords_json,
+            evidence_summary_md,
+            verification_level,
+            verified_by_task_id,
+            replaced_by_capability_id,
+            created_at,
+            updated_at,
+            archived_at,
+            metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            normalized["capability_id"],
+            normalized["name"],
+            normalized["summary"],
+            normalized["status"],
+            normalized["kind"],
+            normalized["scope_kind"],
+            normalized["owning_repo_id"],
+            normalized["when_to_use_md"],
+            normalized["do_not_use_for_md"],
+            compact_json(normalized["entrypoints"]),
+            compact_json(normalized["keywords"]),
+            normalized["evidence_summary_md"],
+            normalized["verification_level"],
+            normalized["verified_by_task_id"],
+            normalized["replaced_by_capability_id"],
+            normalized["created_at"],
+            normalized["updated_at"],
+            normalized["archived_at"],
+            compact_json(normalized["metadata"]),
+        ),
+    )
+    conn.executemany(
+        """
+        INSERT INTO capability_affected_repos (capability_id, repo_id, created_at)
+        VALUES (?, ?, ?)
+        """,
+        [
+            (normalized["capability_id"], repo_id, normalized["created_at"])
+            for repo_id in normalized["affected_repo_ids"]
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO capability_source_tasks (capability_id, task_id, relationship_kind, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (
+                normalized["capability_id"],
+                source["task_id"],
+                source["relationship_kind"],
+                normalized["created_at"],
+            )
+            for source in normalized["source_tasks"]
+        ],
+    )
+    insert_capability_event(
+        conn,
+        capability_id=normalized["capability_id"],
+        event_type=normalized["event_type"],
+        actor_kind=actor_kind,
+        actor_id=actor_id,
+        payload=normalized["event_payload"] or {
+            "status": normalized["status"],
+            "verification_level": normalized["verification_level"],
+            "source_task_ids": [source["task_id"] for source in normalized["source_tasks"]],
+        },
+        created_at=normalized["created_at"],
+    )
+    return fetch_capability_payload(conn, normalized["capability_id"]) or {}
+
+
+def upsert_capability(
+    conn: sqlite3.Connection,
+    payload: dict[str, Any],
+    *,
+    actor_kind: str,
+    actor_id: str,
+) -> dict[str, Any]:
+    normalized = canonicalize_capability_payload(conn, payload)
+    existing = conn.execute(
+        "SELECT capability_id FROM capabilities WHERE capability_id = ?",
+        (normalized["capability_id"],),
+    ).fetchone()
+    if existing is None:
+        return create_capability(conn, payload, actor_kind=actor_kind, actor_id=actor_id)
+
+    conn.execute(
+        """
+        UPDATE capabilities
+        SET name = ?,
+            summary = ?,
+            status = ?,
+            kind = ?,
+            scope_kind = ?,
+            owning_repo_id = ?,
+            when_to_use_md = ?,
+            do_not_use_for_md = ?,
+            entrypoints_json = ?,
+            keywords_json = ?,
+            evidence_summary_md = ?,
+            verification_level = ?,
+            verified_by_task_id = ?,
+            replaced_by_capability_id = ?,
+            updated_at = ?,
+            archived_at = ?,
+            metadata_json = ?
+        WHERE capability_id = ?
+        """,
+        (
+            normalized["name"],
+            normalized["summary"],
+            normalized["status"],
+            normalized["kind"],
+            normalized["scope_kind"],
+            normalized["owning_repo_id"],
+            normalized["when_to_use_md"],
+            normalized["do_not_use_for_md"],
+            compact_json(normalized["entrypoints"]),
+            compact_json(normalized["keywords"]),
+            normalized["evidence_summary_md"],
+            normalized["verification_level"],
+            normalized["verified_by_task_id"],
+            normalized["replaced_by_capability_id"],
+            normalized["updated_at"],
+            normalized["archived_at"],
+            compact_json(normalized["metadata"]),
+            normalized["capability_id"],
+        ),
+    )
+    conn.execute(
+        "DELETE FROM capability_affected_repos WHERE capability_id = ?",
+        (normalized["capability_id"],),
+    )
+    conn.executemany(
+        """
+        INSERT INTO capability_affected_repos (capability_id, repo_id, created_at)
+        VALUES (?, ?, ?)
+        """,
+        [
+            (normalized["capability_id"], repo_id, normalized["updated_at"])
+            for repo_id in normalized["affected_repo_ids"]
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO capability_source_tasks (capability_id, task_id, relationship_kind, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        [
+            (
+                normalized["capability_id"],
+                source["task_id"],
+                source["relationship_kind"],
+                normalized["updated_at"],
+            )
+            for source in normalized["source_tasks"]
+        ],
+    )
+    insert_capability_event(
+        conn,
+        capability_id=normalized["capability_id"],
+        event_type=normalized["event_type"],
+        actor_kind=actor_kind,
+        actor_id=actor_id,
+        payload=normalized["event_payload"] or {
+            "status": normalized["status"],
+            "verification_level": normalized["verification_level"],
+            "source_task_ids": [source["task_id"] for source in normalized["source_tasks"]],
+        },
+        created_at=normalized["updated_at"],
+    )
+    return fetch_capability_payload(conn, normalized["capability_id"]) or {}
+
+
+def _require_mapping(value: Any, *, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        die(f"{field} must be a JSON object")
+    return value
+
+
+def _normalize_capability_mutations_list(value: Any, *, field: str) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        die(f"{field} must be a JSON array")
+    normalized: list[dict[str, Any]] = []
+    for index, entry in enumerate(value):
+        if not isinstance(entry, dict):
+            die(f"{field}[{index}] must be an object")
+        normalized.append(dict(entry))
+    return normalized
+
+
+def parse_capability_closeout_payload(worker_result: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(worker_result, dict):
+        return {
+            "present": False,
+            "task_type_category": None,
+            "capability_emission_required": False,
+            "capability_emission_reason": "",
+            "capability_mutations": [],
+        }
+
+    closeout_raw = worker_result.get("capability_closeout")
+    legacy_mutation = worker_result.get("capability_mutation")
+    if closeout_raw is None and legacy_mutation is None:
+        return {
+            "present": False,
+            "task_type_category": None,
+            "capability_emission_required": False,
+            "capability_emission_reason": "",
+            "capability_mutations": [],
+        }
+
+    closeout = _require_mapping(closeout_raw, field="capability_closeout") if closeout_raw is not None else {}
+    task_type_category = str(closeout.get("task_type_category") or "").strip()
+    capability_emission_reason = str(closeout.get("capability_emission_reason") or "").strip()
+    if not capability_emission_reason and legacy_mutation is not None:
+        capability_emission_reason = "legacy capability_mutation field present"
+
+    if closeout_raw is not None:
+        for field in (
+            "task_type_category",
+            "capability_emission_required",
+            "capability_emission_reason",
+            "capability_mutations",
+        ):
+            if field not in closeout:
+                die(f"capability_closeout.{field} is required when capability_closeout is present")
+        if task_type_category not in CAPABILITY_CLOSEOUT_TASK_TYPE_CATEGORIES:
+            die(
+                "invalid capability_closeout.task_type_category: "
+                f"{task_type_category!r}; expected one of {sorted(CAPABILITY_CLOSEOUT_TASK_TYPE_CATEGORIES)}"
+            )
+        if not capability_emission_reason:
+            die("capability_closeout.capability_emission_reason must be non-empty")
+        capability_emission_required = parse_bool(
+            closeout.get("capability_emission_required"),
+            field="capability_closeout.capability_emission_required",
+        )
+    else:
+        capability_emission_required = legacy_mutation is not None
+
+    mutations = _normalize_capability_mutations_list(
+        closeout.get("capability_mutations"),
+        field="capability_closeout.capability_mutations",
+    )
+    if legacy_mutation is not None:
+        if mutations:
+            die("worker result may not provide both capability_closeout.capability_mutations and capability_mutation")
+        if isinstance(legacy_mutation, list):
+            mutations = _normalize_capability_mutations_list(legacy_mutation, field="capability_mutation")
+        elif isinstance(legacy_mutation, dict):
+            legacy_mapping = dict(legacy_mutation)
+            if isinstance(legacy_mapping.get("capability_mutations"), list):
+                mutations = _normalize_capability_mutations_list(
+                    legacy_mapping.get("capability_mutations"),
+                    field="capability_mutation.capability_mutations",
+                )
+            else:
+                mutations = [legacy_mapping]
+        else:
+            die("capability_mutation must be an object or array")
+
+    if capability_emission_required and not mutations:
+        die("capability mutation is required but no capability_mutations were provided")
+
+    return {
+        "present": True,
+        "task_type_category": task_type_category or None,
+        "capability_emission_required": capability_emission_required,
+        "capability_emission_reason": capability_emission_reason,
+        "capability_mutations": mutations,
+    }
+
+
+def _require_mutation_fields(mutation: dict[str, Any], *, fields: Iterable[str], field_prefix: str) -> None:
+    for field in fields:
+        value = mutation.get(field)
+        if value is None:
+            die(f"{field_prefix}.{field} is required")
+        if isinstance(value, str) and not value.strip():
+            die(f"{field_prefix}.{field} is required")
+
+
+def validate_capability_mutation_set(worker_result: dict[str, Any] | None) -> dict[str, Any]:
+    closeout = parse_capability_closeout_payload(worker_result)
+    mutations = list(closeout["capability_mutations"])
+    seen_targets: set[str] = set()
+    seen_prior: set[str] = set()
+
+    for index, mutation in enumerate(mutations):
+        field_prefix = f"capability_mutations[{index}]"
+        action = str(mutation.get("action") or "").strip()
+        if action not in CAPABILITY_MUTATION_ACTIONS:
+            die(f"{field_prefix}.action must be one of {sorted(CAPABILITY_MUTATION_ACTIONS)}; got {action!r}")
+        if action == "create":
+            _require_mutation_fields(
+                mutation,
+                fields=(
+                    "capability_id",
+                    "name",
+                    "summary",
+                    "kind",
+                    "scope_kind",
+                    "owning_repo_id",
+                    "affected_repo_ids",
+                    "entrypoints",
+                    "when_to_use_md",
+                    "do_not_use_for_md",
+                    "evidence_summary_md",
+                    "verification_level",
+                ),
+                field_prefix=field_prefix,
+            )
+            target_id = normalize_capability_id(mutation.get("capability_id"))
+            if target_id in seen_targets:
+                die(f"duplicate capability mutation target: {target_id}")
+            seen_targets.add(target_id)
+            continue
+        if action == "update":
+            _require_mutation_fields(mutation, fields=("capability_id",), field_prefix=field_prefix)
+            target_id = normalize_capability_id(mutation.get("capability_id"))
+            if target_id in seen_targets:
+                die(f"duplicate capability mutation target: {target_id}")
+            seen_targets.add(target_id)
+            scope_fields = {"scope_kind", "owning_repo_id", "affected_repo_ids"}
+            if scope_fields.intersection(mutation.keys()) and not scope_fields.issubset(mutation.keys()):
+                die(
+                    f"{field_prefix} must include scope_kind, owning_repo_id, and affected_repo_ids together "
+                    "when changing scope"
+                )
+            continue
+        if action == "deprecate":
+            _require_mutation_fields(mutation, fields=("capability_id",), field_prefix=field_prefix)
+            target_id = normalize_capability_id(mutation.get("capability_id"))
+            if target_id in seen_targets:
+                die(f"duplicate capability mutation target: {target_id}")
+            seen_targets.add(target_id)
+            continue
+
+        _require_mutation_fields(mutation, fields=("prior_capability_id", "replacement"), field_prefix=field_prefix)
+        prior_capability_id = normalize_capability_id(mutation.get("prior_capability_id"))
+        if prior_capability_id in seen_prior:
+            die(f"duplicate supersede prior_capability_id: {prior_capability_id}")
+        seen_prior.add(prior_capability_id)
+        replacement = _require_mapping(mutation.get("replacement"), field=f"{field_prefix}.replacement")
+        _require_mutation_fields(
+            replacement,
+            fields=(
+                "capability_id",
+                "name",
+                "summary",
+                "kind",
+                "scope_kind",
+                "owning_repo_id",
+                "affected_repo_ids",
+                "entrypoints",
+                "when_to_use_md",
+                "do_not_use_for_md",
+                "evidence_summary_md",
+                "verification_level",
+            ),
+            field_prefix=f"{field_prefix}.replacement",
+        )
+        replacement_id = normalize_capability_id(replacement.get("capability_id"))
+        if replacement_id == prior_capability_id:
+            die(f"{field_prefix}.replacement.capability_id must differ from prior_capability_id")
+        if replacement_id in seen_targets:
+            die(f"duplicate capability mutation target: {replacement_id}")
+        seen_targets.add(replacement_id)
+
+    return closeout
+
+
+def _record_capability_mutation_application(
+    conn: sqlite3.Connection,
+    *,
+    audit_task_id: str,
+    parent_version: int,
+    mutation_digest: str,
+    actor_id: str,
+    metadata: dict[str, Any],
+) -> bool:
+    application_key = hashlib.sha256(
+        f"{audit_task_id}:{parent_version}:{mutation_digest}".encode("utf-8")
+    ).hexdigest()
+    existing = conn.execute(
+        "SELECT application_key FROM capability_mutation_applications WHERE application_key = ?",
+        (application_key,),
+    ).fetchone()
+    if existing is not None:
+        return False
+    conn.execute(
+        """
+        INSERT INTO capability_mutation_applications (
+            application_key,
+            source_task_id,
+            source_task_version,
+            mutation_digest,
+            applied_at,
+            actor_id,
+            outcome,
+            metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, 'applied', ?)
+        """,
+        (
+            application_key,
+            audit_task_id,
+            parent_version,
+            mutation_digest,
+            now_iso(),
+            actor_id,
+            compact_json(metadata),
+        ),
+    )
+    return True
+
+
+def apply_audit_capability_mutations(
+    conn: sqlite3.Connection,
+    *,
+    audit_task_id: str,
+    parent_task_id: str | None,
+    parent_version: int | None,
+    actor_id: str,
+    worker_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    closeout = validate_capability_mutation_set(worker_result)
+    if closeout["task_type_category"] == "must_emit" and closeout["capability_emission_required"] and not closeout["capability_mutations"]:
+        die("audit acceptance blocked: required capability mutation payload is missing")
+
+    mutations = list(closeout["capability_mutations"])
+    if not mutations:
+        return closeout
+
+    mutation_digest = hashlib.sha256(compact_json(mutations).encode("utf-8")).hexdigest()
+    should_apply = _record_capability_mutation_application(
+        conn,
+        audit_task_id=audit_task_id,
+        parent_version=parent_version or 0,
+        mutation_digest=mutation_digest,
+        actor_id=actor_id,
+        metadata={
+            "parent_task_id": parent_task_id,
+            "task_type_category": closeout["task_type_category"],
+            "capability_emission_reason": closeout["capability_emission_reason"],
+            "mutation_count": len(mutations),
+        },
+    )
+    if not should_apply:
+        return closeout
+
+    event_timestamp = now_iso()
+    for mutation in mutations:
+        action = str(mutation["action"]).strip()
+        if action == "create":
+            payload = dict(mutation)
+            payload["status"] = "active"
+            payload["verification_level"] = "audited"
+            payload["verified_by_task_id"] = audit_task_id
+            payload["source_tasks"] = [{"task_id": audit_task_id, "relationship_kind": "created_by"}]
+            payload["created_at"] = event_timestamp
+            payload["updated_at"] = event_timestamp
+            payload["event_type"] = "capability.created"
+            payload["event_payload"] = {"audit_task_id": audit_task_id, "action": action}
+            create_capability(conn, payload, actor_kind="runtime", actor_id=actor_id)
+            continue
+
+        if action == "update":
+            capability_id = normalize_capability_id(mutation["capability_id"])
+            existing = fetch_capability_payload(conn, capability_id)
+            if existing is None:
+                die(f"cannot update missing capability: {capability_id}")
+            metadata_payload = dict(existing.get("metadata") or {})
+            if isinstance(mutation.get("metadata"), dict):
+                metadata_payload.update(dict(mutation["metadata"]))
+            payload = dict(existing)
+            payload.update({key: value for key, value in mutation.items() if key not in {"action", "metadata"}})
+            payload["metadata"] = metadata_payload
+            payload["verification_level"] = "audited"
+            payload["verified_by_task_id"] = audit_task_id
+            payload["updated_at"] = event_timestamp
+            payload["source_tasks"] = [{"task_id": audit_task_id, "relationship_kind": "updated_by"}]
+            payload["event_type"] = "capability.updated"
+            payload["event_payload"] = {"audit_task_id": audit_task_id, "action": action}
+            upsert_capability(conn, payload, actor_kind="runtime", actor_id=actor_id)
+            continue
+
+        if action == "deprecate":
+            capability_id = normalize_capability_id(mutation["capability_id"])
+            existing = fetch_capability_payload(conn, capability_id)
+            if existing is None:
+                die(f"cannot deprecate missing capability: {capability_id}")
+            metadata_payload = dict(existing.get("metadata") or {})
+            if isinstance(mutation.get("metadata"), dict):
+                metadata_payload.update(dict(mutation["metadata"]))
+            payload = dict(existing)
+            payload["status"] = "deprecated"
+            payload["metadata"] = metadata_payload
+            if mutation.get("evidence_summary_md") is not None:
+                payload["evidence_summary_md"] = str(mutation.get("evidence_summary_md") or "").strip()
+            payload["verification_level"] = "audited"
+            payload["verified_by_task_id"] = audit_task_id
+            payload["updated_at"] = event_timestamp
+            payload["source_tasks"] = [{"task_id": audit_task_id, "relationship_kind": "deprecated_by"}]
+            payload["event_type"] = "capability.deprecated"
+            payload["event_payload"] = {"audit_task_id": audit_task_id, "action": action}
+            upsert_capability(conn, payload, actor_kind="runtime", actor_id=actor_id)
+            continue
+
+        prior_capability_id = normalize_capability_id(mutation["prior_capability_id"])
+        existing = fetch_capability_payload(conn, prior_capability_id)
+        if existing is None:
+            die(f"cannot supersede missing capability: {prior_capability_id}")
+        replacement = _require_mapping(mutation.get("replacement"), field="capability_mutations.replacement")
+        replacement_payload = dict(replacement)
+        replacement_payload["status"] = "active"
+        replacement_payload["verification_level"] = "audited"
+        replacement_payload["verified_by_task_id"] = audit_task_id
+        replacement_payload["source_tasks"] = [{"task_id": audit_task_id, "relationship_kind": "created_by"}]
+        replacement_payload["created_at"] = event_timestamp
+        replacement_payload["updated_at"] = event_timestamp
+        replacement_payload["event_type"] = "capability.created"
+        replacement_payload["event_payload"] = {
+            "audit_task_id": audit_task_id,
+            "action": action,
+            "supersedes": prior_capability_id,
+        }
+        create_capability(conn, replacement_payload, actor_kind="runtime", actor_id=actor_id)
+
+        prior_payload = dict(existing)
+        prior_payload["status"] = "deprecated"
+        prior_payload["replaced_by_capability_id"] = replacement_payload["capability_id"]
+        prior_payload["verification_level"] = "audited"
+        prior_payload["verified_by_task_id"] = audit_task_id
+        prior_payload["updated_at"] = event_timestamp
+        prior_payload["source_tasks"] = [{"task_id": audit_task_id, "relationship_kind": "superseded_by"}]
+        prior_payload["event_type"] = "capability.superseded"
+        prior_payload["event_payload"] = {
+            "audit_task_id": audit_task_id,
+            "action": action,
+            "replacement_capability_id": replacement_payload["capability_id"],
+        }
+        upsert_capability(conn, prior_payload, actor_kind="runtime", actor_id=actor_id)
+
+    return closeout
+
+
+def build_capability_payload(
+    row: sqlite3.Row,
+    *,
+    affected_repo_ids: list[str] | None = None,
+    source_tasks: list[dict[str, Any]] | None = None,
+    events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "capability_id": str(row["capability_id"]),
+        "name": str(row["name"]),
+        "summary": str(row["summary"]),
+        "status": str(row["status"]),
+        "kind": str(row["kind"]),
+        "scope_kind": str(row["scope_kind"]),
+        "owning_repo_id": str(row["owning_repo_id"]),
+        "when_to_use_md": str(row["when_to_use_md"]),
+        "do_not_use_for_md": str(row["do_not_use_for_md"]),
+        "entrypoints": parse_json_text(row["entrypoints_json"], default=[]),
+        "keywords": parse_json_text(row["keywords_json"], default=[]),
+        "affected_repo_ids": affected_repo_ids or [],
+        "evidence_summary_md": str(row["evidence_summary_md"]),
+        "verification_level": str(row["verification_level"]),
+        "verified_by_task_id": row["verified_by_task_id"],
+        "replaced_by_capability_id": row["replaced_by_capability_id"],
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
+        "archived_at": row["archived_at"],
+        "metadata": parse_json_text(row["metadata_json"], default={}),
+        "source_tasks": source_tasks or [],
+    }
+    if events is not None:
+        payload["events"] = events
+    return payload
+
+
+def fetch_capability_payload(conn: sqlite3.Connection, capability_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM capabilities WHERE capability_id = ?",
+        (capability_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    affected_repo_rows = conn.execute(
+        """
+        SELECT repo_id
+        FROM capability_affected_repos
+        WHERE capability_id = ?
+        ORDER BY repo_id ASC
+        """,
+        (capability_id,),
+    ).fetchall()
+    source_task_rows = conn.execute(
+        """
+        SELECT task_id, relationship_kind, created_at
+        FROM capability_source_tasks
+        WHERE capability_id = ?
+        ORDER BY created_at ASC, task_id ASC, relationship_kind ASC
+        """,
+        (capability_id,),
+    ).fetchall()
+    event_rows = conn.execute(
+        """
+        SELECT event_id, event_type, actor_kind, actor_id, payload_json, created_at
+        FROM capability_events
+        WHERE capability_id = ?
+        ORDER BY created_at ASC, event_id ASC
+        """,
+        (capability_id,),
+    ).fetchall()
+    return build_capability_payload(
+        row,
+        affected_repo_ids=[str(repo_row["repo_id"]) for repo_row in affected_repo_rows],
+        source_tasks=[
+            {
+                "task_id": str(source_row["task_id"]),
+                "relationship_kind": str(source_row["relationship_kind"]),
+                "created_at": str(source_row["created_at"]),
+            }
+            for source_row in source_task_rows
+        ],
+        events=[
+            {
+                "event_id": int(event_row["event_id"]),
+                "event_type": str(event_row["event_type"]),
+                "actor_kind": str(event_row["actor_kind"]),
+                "actor_id": str(event_row["actor_id"]),
+                "payload": parse_json_text(event_row["payload_json"], default={}),
+                "created_at": str(event_row["created_at"]),
+            }
+            for event_row in event_rows
+        ],
+    )
+
+
+def fetch_capability_registry(
+    conn: sqlite3.Connection,
+    *,
+    repo_id: str | None = None,
+    status: str | None = None,
+    kind: str | None = None,
+    verification_level: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if repo_id is not None:
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM capability_affected_repos car
+                WHERE car.capability_id = capabilities.capability_id
+                  AND car.repo_id = ?
+            )
+            """
+        )
+        params.append(repo_id)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    if kind is not None:
+        clauses.append("kind = ?")
+        params.append(kind)
+    if verification_level is not None:
+        clauses.append("verification_level = ?")
+        params.append(verification_level)
+    query = "SELECT * FROM capabilities"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY updated_at DESC, capability_id ASC"
+    rows = conn.execute(query, tuple(params)).fetchall()
+    if not rows:
+        return []
+    capability_ids = [str(row["capability_id"]) for row in rows]
+    placeholders = ", ".join("?" for _ in capability_ids)
+    affected_map: dict[str, list[str]] = defaultdict(list)
+    affected_rows = conn.execute(
+        f"""
+        SELECT capability_id, repo_id
+        FROM capability_affected_repos
+        WHERE capability_id IN ({placeholders})
+        ORDER BY capability_id ASC, repo_id ASC
+        """,
+        tuple(capability_ids),
+    ).fetchall()
+    for affected_row in affected_rows:
+        affected_map[str(affected_row["capability_id"])].append(str(affected_row["repo_id"]))
+    return [
+        build_capability_payload(
+            row,
+            affected_repo_ids=affected_map.get(str(row["capability_id"]), []),
+        )
+        for row in rows
+    ]
+
+
+def render_capability_rows(rows: list[dict[str, Any]]) -> str:
+    return render_table(
+        [
+            {
+                "capability_id": row["capability_id"],
+                "status": row["status"],
+                "verification": row["verification_level"],
+                "owner": row["owning_repo_id"],
+                "scope": row["scope_kind"],
+                "kind": row["kind"],
+                "repos": ", ".join(row.get("affected_repo_ids", [])),
+                "name": row["name"],
+            }
+            for row in rows
+        ],
+        [
+            ("capability_id", "capability_id"),
+            ("status", "status"),
+            ("verification", "verification"),
+            ("owner", "owner"),
+            ("scope", "scope"),
+            ("kind", "kind"),
+            ("repos", "repos"),
+            ("name", "name"),
+        ],
+    )
+
+
+def render_capability_detail(row: dict[str, Any]) -> str:
+    metadata = row.get("metadata") or {}
+    metadata_text = json.dumps(metadata, indent=2, sort_keys=True) if metadata else "(none)"
+    source_task_text = (
+        "\n".join(
+            f"- {item['task_id']} ({item['relationship_kind']})"
+            for item in row.get("source_tasks", [])
+        )
+        or "(none)"
+    )
+    event_text = (
+        "\n".join(
+            f"- #{item['event_id']} {item['event_type']} by {item['actor_kind']}:{item['actor_id']}"
+            for item in row.get("events", [])
+        )
+        or "(none)"
+    )
+    return "\n".join(
+        [
+            f"capability_id: {row['capability_id']}",
+            f"name: {row['name']}",
+            f"status: {row['status']}",
+            f"verification_level: {row['verification_level']}",
+            f"kind: {row['kind']}",
+            f"scope_kind: {row['scope_kind']}",
+            f"owning_repo_id: {row['owning_repo_id']}",
+            f"affected_repo_ids: {', '.join(row.get('affected_repo_ids', []))}",
+            f"verified_by_task_id: {row['verified_by_task_id'] or '(none)'}",
+            f"replaced_by_capability_id: {row['replaced_by_capability_id'] or '(none)'}",
+            f"when_to_use_md: {row['when_to_use_md']}",
+            f"do_not_use_for_md: {row['do_not_use_for_md'] or '(none)'}",
+            f"entrypoints: {', '.join(row.get('entrypoints', [])) or '(none)'}",
+            f"keywords: {', '.join(row.get('keywords', [])) or '(none)'}",
+            "metadata:",
+            "\n  ".join(metadata_text.splitlines()),
+            "source_tasks:",
+            source_task_text,
+            "events:",
+            event_text,
+            f"created_at: {row['created_at']}",
+            f"updated_at: {row['updated_at']}",
+            f"archived_at: {row['archived_at'] or '(none)'}",
+        ]
+    )
+
+
+def candidate_band_rank(band: str) -> int:
+    return {
+        "exact_duplicate": 4,
+        "strong_overlap": 3,
+        "related_capability": 2,
+        "related_recent_work": 1,
+        "non_actionable": 0,
+    }.get(band, 0)
+
+
+def compute_scope_fingerprint(
+    *,
+    target_repo_id: str,
+    search_scope: dict[str, Any],
+    actionable_candidate_ids: list[str],
+) -> str:
+    payload = {
+        "target_repo_id": target_repo_id,
+        "repo_ids": sorted_unique_strings(search_scope.get("repo_ids", [])),
+        "include_recent_done_days": int(search_scope.get("include_recent_done_days", 90)),
+        "include_active_tasks": bool(search_scope.get("include_active_tasks", True)),
+        "include_capabilities": bool(search_scope.get("include_capabilities", True)),
+        "include_deprecated_capabilities": bool(search_scope.get("include_deprecated_capabilities", True)),
+        "candidate_ids": sorted(set(actionable_candidate_ids)),
+    }
+    return f"sha256:{stable_sha256(payload)}"
+
+
+def fetch_preflight_task_candidates(conn: sqlite3.Connection, request: dict[str, Any]) -> list[sqlite3.Row]:
+    scope = request["search_scope"]
+    repo_ids = scope["repo_ids"]
+    if not repo_ids:
+        return []
+    params: list[Any] = list(repo_ids)
+    clauses = [f"target_repo_id IN ({', '.join('?' for _ in repo_ids)})", "archived_at IS NULL"]
+    if request["request_context"]["is_material_update"] and request["request_context"]["existing_task_id"]:
+        clauses.append("task_id != ?")
+        params.append(request["request_context"]["existing_task_id"])
+    active_statuses = sorted(PLANNER_STATUSES - {"done"})
+    active_clause = f"planner_status IN ({', '.join('?' for _ in active_statuses)})"
+    params.extend(active_statuses)
+    recent_threshold = (current_utc_datetime() - timedelta(days=int(scope["include_recent_done_days"]))).isoformat()
+    clauses.append(f"(({active_clause}) OR (planner_status = 'done' AND COALESCE(closed_at, updated_at) >= ?))")
+    params.append(recent_threshold)
+    query = f"""
+        SELECT *
+        FROM tasks
+        WHERE {' AND '.join(clauses)}
+        ORDER BY updated_at DESC, task_id ASC
+        LIMIT ?
+    """
+    params.append(int(scope["max_candidates_per_kind"]))
+    return conn.execute(query, tuple(params)).fetchall()
+
+
+def fetch_preflight_capability_candidates(conn: sqlite3.Connection, request: dict[str, Any]) -> list[sqlite3.Row]:
+    scope = request["search_scope"]
+    if not scope["include_capabilities"]:
+        return []
+    repo_ids = scope["repo_ids"]
+    if not repo_ids:
+        return []
+    status_values = ["active"]
+    if scope.get("include_deprecated_capabilities", True):
+        status_values.append("deprecated")
+    params = list(repo_ids) + list(repo_ids) + status_values + [int(scope["max_candidates_per_kind"])]
+    query = f"""
+        SELECT DISTINCT c.*
+        FROM capabilities c
+        LEFT JOIN capability_affected_repos car ON car.capability_id = c.capability_id
+        WHERE (
+            c.owning_repo_id IN ({', '.join('?' for _ in repo_ids)})
+            OR car.repo_id IN ({', '.join('?' for _ in repo_ids)})
+        )
+        AND c.status IN ({', '.join('?' for _ in status_values)})
+        ORDER BY c.updated_at DESC, c.capability_id ASC
+        LIMIT ?
+    """
+    return conn.execute(query, tuple(params)).fetchall()
+
+
+def fetch_capability_scope_map(conn: sqlite3.Connection, capability_ids: list[str]) -> dict[str, list[str]]:
+    if not capability_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in capability_ids)
+    rows = conn.execute(
+        f"""
+        SELECT capability_id, repo_id
+        FROM capability_affected_repos
+        WHERE capability_id IN ({placeholders})
+        ORDER BY capability_id ASC, repo_id ASC
+        """,
+        tuple(capability_ids),
+    ).fetchall()
+    scope_map: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        scope_map[str(row["capability_id"])].append(str(row["repo_id"]))
+    return dict(scope_map)
+
+
+def load_latest_task_event_ids(conn: sqlite3.Connection, task_ids: list[str]) -> dict[str, int]:
+    if not task_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"""
+        SELECT task_id, MAX(event_id) AS max_event_id
+        FROM task_events
+        WHERE task_id IN ({placeholders})
+        GROUP BY task_id
+        """,
+        tuple(task_ids),
+    ).fetchall()
+    return {str(row["task_id"]): int(row["max_event_id"] or 0) for row in rows}
+
+
+def load_latest_capability_event_ids(conn: sqlite3.Connection, capability_ids: list[str]) -> dict[str, int]:
+    if not capability_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in capability_ids)
+    rows = conn.execute(
+        f"""
+        SELECT capability_id, MAX(event_id) AS max_event_id
+        FROM capability_events
+        WHERE capability_id IN ({placeholders})
+        GROUP BY capability_id
+        """,
+        tuple(capability_ids),
+    ).fetchall()
+    return {str(row["capability_id"]): int(row["max_event_id"] or 0) for row in rows}
+
+
+def task_candidate_fingerprint(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    dependencies = load_dependencies(conn, [str(row["task_id"])]).get(str(row["task_id"]), [])
+    payload = {
+        "title": markdown_to_plain_text(row["title"]).casefold(),
+        "summary": markdown_to_plain_text(row["summary"]).casefold(),
+        "objective": markdown_to_plain_text(row["objective_md"]).casefold(),
+        "scope": markdown_to_plain_text(row["scope_md"]).casefold(),
+        "deliverables": markdown_to_plain_text(row["deliverables_md"]).casefold(),
+        "acceptance": markdown_to_plain_text(row["acceptance_md"]).casefold(),
+        "target_repo_id": str(row["target_repo_id"]),
+        "task_type": str(row["task_type"]),
+        "dependency_task_ids": sorted(dep["depends_on_task_id"] for dep in dependencies),
+    }
+    return f"sha256:{stable_sha256(payload)}"
+
+
+def score_preflight_candidate(
+    *,
+    request: dict[str, Any],
+    request_fields: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    weights = {
+        "repo_scope_match": 10,
+        "same_target_repo": 10,
+        "dependency_reference_match": 10,
+        "title_exact_match": 25,
+        "summary_exact_match": 20,
+        "intent_fingerprint_match": 50,
+        "high_text_overlap": 25,
+        "moderate_text_overlap": 15,
+        "entrypoint_keyword_match": 10,
+        "deliverable_contract_match": 15,
+        "candidate_is_active_task": 20,
+        "candidate_is_recent_done_task": 12,
+        "candidate_is_active_capability": 20,
+        "candidate_is_deprecated_capability": 8,
+        "candidate_verified_high_trust": 8,
+        "candidate_completed_recently": 8,
+        "creator_marked_supersede_target": 12,
+        "creator_marked_extension_target": 12,
+        "same_capability_surface": 20,
+        "same_work_surface": 20,
+    }
+    requested_ids = (
+        set(request["normalized_task_intent"]["requested_task_ids"])
+        | set(request["normalized_task_intent"]["requested_capability_ids"])
+        | set(request["normalized_task_intent"]["dependency_task_ids"])
+    )
+    repo_scope_match = bool(set(request_fields["repo_scope"]) & set(candidate["repo_scope"]))
+    same_target_repo = candidate["target_repo_id"] == request["normalized_task_intent"]["target_repo_id"]
+    dependency_reference_match = candidate["candidate_id"] in requested_ids
+    title_exact_match = candidate["title_text"].casefold() == request_fields["title_text"].casefold()
+    summary_exact_match = candidate["summary_text"].casefold() == request_fields["summary_text"].casefold()
+    intent_fingerprint_match = candidate["intent_fingerprint"] == request_fields["intent_fingerprint"]
+    overlap = jaccard_overlap(set(request_fields["intent_terms"]), set(candidate["intent_terms"]))
+    high_text_overlap = overlap >= 0.65
+    moderate_text_overlap = 0.40 <= overlap < 0.65
+    entrypoint_keyword_match = len(set(request_fields["intent_terms"]) & set(candidate["entrypoint_terms"])) >= 2
+    deliverable_contract_match = bool(set(request_fields["deliverable_terms"]) & set(candidate["deliverable_terms"]))
+    candidate_is_active_task = candidate["candidate_kind"] == "task" and candidate["status"] != "done"
+    candidate_is_recent_done_task = candidate["candidate_kind"] == "task" and candidate["status"] == "done"
+    candidate_is_active_capability = candidate["candidate_kind"] == "capability" and candidate["status"] == "active"
+    candidate_is_deprecated_capability = candidate["candidate_kind"] == "capability" and candidate["status"] == "deprecated"
+    candidate_verified_high_trust = candidate.get("verification_level") in {"planner_verified", "audited"}
+    completed_at = parse_iso_datetime(candidate.get("completed_at"))
+    candidate_completed_recently = bool(completed_at and completed_at >= current_utc_datetime() - timedelta(days=30))
+    creator_marked_supersede_target = candidate["candidate_id"] in (
+        set(request["normalized_task_intent"]["requested_task_ids"]) | set(request["normalized_task_intent"]["requested_capability_ids"])
+    )
+    creator_marked_extension_target = candidate["candidate_id"] in set(request["normalized_task_intent"]["requested_capability_ids"])
+    shared_surface = len(set(request_fields["intent_terms"]) & set(candidate["intent_terms"])) >= 3
+    same_capability_surface = candidate["candidate_kind"] == "capability" and entrypoint_keyword_match and shared_surface
+    same_work_surface = candidate["candidate_kind"] == "task" and same_target_repo and overlap >= 0.50
+    flags = {
+        "repo_scope_match": repo_scope_match,
+        "same_target_repo": same_target_repo,
+        "dependency_reference_match": dependency_reference_match,
+        "title_exact_match": title_exact_match,
+        "summary_exact_match": summary_exact_match,
+        "intent_fingerprint_match": intent_fingerprint_match,
+        "high_text_overlap": high_text_overlap,
+        "moderate_text_overlap": moderate_text_overlap,
+        "entrypoint_keyword_match": entrypoint_keyword_match,
+        "deliverable_contract_match": deliverable_contract_match,
+        "candidate_is_active_task": candidate_is_active_task,
+        "candidate_is_recent_done_task": candidate_is_recent_done_task,
+        "candidate_is_active_capability": candidate_is_active_capability,
+        "candidate_is_deprecated_capability": candidate_is_deprecated_capability,
+        "candidate_verified_high_trust": candidate_verified_high_trust,
+        "candidate_completed_recently": candidate_completed_recently,
+        "creator_marked_supersede_target": creator_marked_supersede_target,
+        "creator_marked_extension_target": creator_marked_extension_target,
+        "same_capability_surface": same_capability_surface,
+        "same_work_surface": same_work_surface,
+    }
+    score = sum(weight for key, weight in weights.items() if flags.get(key))
+    if candidate_is_deprecated_capability and not same_capability_surface and not deliverable_contract_match:
+        score -= 20
+    score = max(0, min(100, score))
+    band = "non_actionable"
+    if intent_fingerprint_match or (title_exact_match and summary_exact_match and same_target_repo) or (
+        same_capability_surface and title_exact_match and candidate_is_active_capability and candidate_verified_high_trust
+    ):
+        band = "exact_duplicate"
+        score = 100
+    elif score >= 75 or (
+        candidate_is_active_capability and same_capability_surface and deliverable_contract_match
+    ) or (
+        candidate_is_active_task and same_work_surface and high_text_overlap
+    ) or (
+        candidate_is_recent_done_task and candidate_completed_recently and same_work_surface and deliverable_contract_match
+    ):
+        band = "strong_overlap"
+    elif candidate["candidate_kind"] == "capability" and score >= 40 and (
+        entrypoint_keyword_match or deliverable_contract_match or creator_marked_extension_target
+    ):
+        band = "related_capability"
+    elif candidate["candidate_kind"] == "task" and score >= 35 and (
+        moderate_text_overlap or dependency_reference_match or candidate_completed_recently
+    ):
+        band = "related_recent_work"
+    candidate["band"] = band
+    candidate["score"] = score
+    candidate["reason_codes"] = sorted(key for key, value in flags.items() if value)
+    return candidate
+
+
+def build_task_preflight_response(
+    conn: sqlite3.Connection,
+    request: dict[str, Any],
+    *,
+    issued_at: str | None = None,
+) -> dict[str, Any]:
+    request_fields = intent_comparison_fields(request["normalized_task_intent"])
+    task_rows = fetch_preflight_task_candidates(conn, request)
+    capability_rows = fetch_preflight_capability_candidates(conn, request)
+    capability_scope_map = fetch_capability_scope_map(conn, [str(row["capability_id"]) for row in capability_rows])
+    task_event_ids = load_latest_task_event_ids(conn, [str(row["task_id"]) for row in task_rows])
+    capability_event_ids = load_latest_capability_event_ids(conn, [str(row["capability_id"]) for row in capability_rows])
+    actionable_candidate_ids = [f"task:{row['task_id']}" for row in task_rows] + [f"capability:{row['capability_id']}" for row in capability_rows]
+    candidates: list[dict[str, Any]] = []
+    for row in task_rows:
+        task_payload = {
+            "candidate_kind": "task",
+            "candidate_id": str(row["task_id"]),
+            "target_repo_id": str(row["target_repo_id"]),
+            "repo_scope": [str(row["target_repo_id"])],
+            "title_text": markdown_to_plain_text(row["title"]),
+            "summary_text": markdown_to_plain_text(row["summary"]),
+            "intent_terms": sorted(
+                lexical_token_set(
+                    " ".join(
+                        [
+                            str(row["title"]),
+                            str(row["summary"]),
+                            str(row["objective_md"]),
+                            str(row["scope_md"]),
+                            str(row["deliverables_md"]),
+                            str(row["acceptance_md"]),
+                        ]
+                    )
+                )
+            ),
+            "entrypoint_terms": [],
+            "deliverable_terms": sorted(lexical_token_set(" ".join([str(row["deliverables_md"]), str(row["acceptance_md"])]))),
+            "intent_fingerprint": task_candidate_fingerprint(conn, row),
+            "status": str(row["planner_status"]),
+            "summary": str(row["summary"]),
+            "verification_level": None,
+            "completed_at": utc_rfc3339(str(row["closed_at"] or row["updated_at"] or "")) if row["planner_status"] == "done" else None,
+        }
+        candidates.append(score_preflight_candidate(request=request, request_fields=request_fields, candidate=task_payload))
+    for row in capability_rows:
+        capability_payload = {
+            "candidate_kind": "capability",
+            "candidate_id": str(row["capability_id"]),
+            "target_repo_id": str(row["owning_repo_id"]),
+            "repo_scope": sorted({str(row["owning_repo_id"]), *capability_scope_map.get(str(row["capability_id"]), [])}),
+            "title_text": markdown_to_plain_text(row["name"]),
+            "summary_text": markdown_to_plain_text(row["summary"]),
+            "intent_terms": sorted(
+                lexical_token_set(
+                    " ".join(
+                        [
+                            str(row["name"]),
+                            str(row["summary"]),
+                            str(row["when_to_use_md"]),
+                            " ".join(parse_json_text(row["entrypoints_json"], default=[])),
+                            " ".join(parse_json_text(row["keywords_json"], default=[])),
+                        ]
+                    )
+                )
+            ),
+            "entrypoint_terms": sorted(
+                lexical_token_set(
+                    " ".join(parse_json_text(row["entrypoints_json"], default=[]) + parse_json_text(row["keywords_json"], default=[]))
+                )
+            ),
+            "deliverable_terms": sorted(lexical_token_set(" ".join([str(row["summary"]), str(row["when_to_use_md"])]))),
+            "intent_fingerprint": "",
+            "status": str(row["status"]),
+            "summary": str(row["summary"]),
+            "verification_level": str(row["verification_level"]),
+            "completed_at": None,
+        }
+        candidates.append(score_preflight_candidate(request=request, request_fields=request_fields, candidate=capability_payload))
+    candidates = [candidate for candidate in candidates if candidate["band"] != "non_actionable"]
+    candidates.sort(key=lambda item: (-candidate_band_rank(item["band"]), -int(item["score"]), item["candidate_id"]))
+    duplicate_count = sum(1 for candidate in candidates if candidate["band"] == "exact_duplicate")
+    strong_overlap_count = sum(1 for candidate in candidates if candidate["band"] == "strong_overlap")
+    warning_count = sum(1 for candidate in candidates if candidate["band"] in {"related_capability", "related_recent_work"})
+    if duplicate_count:
+        blocking_bucket = "duplicate"
+        classification_options = ["duplicate_do_not_create"]
+        override_allowed = False
+        override_kind = "none"
+    elif strong_overlap_count:
+        blocking_bucket = "strong_overlap"
+        classification_options = ["follow_on", "extends_existing", "supersedes"]
+        override_allowed = True
+        override_kind = "strong_overlap_privileged"
+    elif warning_count:
+        blocking_bucket = "weak_overlap"
+        if any(candidate["band"] == "related_capability" for candidate in candidates):
+            classification_options = ["extends_existing", "follow_on", "supersedes", "new"]
+        else:
+            classification_options = ["follow_on", "new", "supersedes", "extends_existing"]
+        override_allowed = True
+        override_kind = "weak_overlap"
+    else:
+        blocking_bucket = "none"
+        classification_options = ["new", "follow_on", "extends_existing", "supersedes"]
+        override_allowed = False
+        override_kind = "none"
+    preflight_revision = {
+        "algorithm_version": PREFLIGHT_ALGORITHM_VERSION,
+        "scope_fingerprint": compute_scope_fingerprint(
+            target_repo_id=request["normalized_task_intent"]["target_repo_id"],
+            search_scope=request["search_scope"],
+            actionable_candidate_ids=actionable_candidate_ids,
+        ),
+        "task_domain": {
+            "max_updated_at": max((utc_rfc3339(str(row["updated_at"])) for row in task_rows), default=None),
+            "max_task_event_id": max(task_event_ids.values(), default=0),
+        },
+        "capability_domain": {
+            "max_updated_at": max((utc_rfc3339(str(row["updated_at"])) for row in capability_rows), default=None),
+            "max_capability_event_id": max(capability_event_ids.values(), default=0),
+        },
+    }
+    issued_at_value = utc_rfc3339(issued_at) or now_iso().replace("+00:00", "Z")
+    response = {
+        "preflight_revision": preflight_revision,
+        "issued_at": issued_at_value,
+        "issued_by": PREFLIGHT_ISSUER,
+        "classification_options": classification_options,
+        "blocking_bucket": blocking_bucket,
+        "override_allowed": override_allowed,
+        "override_kind": override_kind,
+        "strong_overlap_count": strong_overlap_count,
+        "duplicate_count": duplicate_count,
+        "warning_count": warning_count,
+        "candidates": [
+            {
+                "candidate_kind": candidate["candidate_kind"],
+                "candidate_id": candidate["candidate_id"],
+                "band": candidate["band"],
+                "score": candidate["score"],
+                "reason_codes": candidate["reason_codes"],
+                "status": candidate["status"],
+                "summary": candidate["summary"],
+            }
+            for candidate in candidates
+        ],
+        "matched_task_ids": [candidate["candidate_id"] for candidate in candidates if candidate["candidate_kind"] == "task"],
+        "matched_capability_ids": [candidate["candidate_id"] for candidate in candidates if candidate["candidate_kind"] == "capability"],
+        "related_task_ids_suggested": [candidate["candidate_id"] for candidate in candidates if candidate["candidate_kind"] == "task"][:3],
+        "related_capability_ids_suggested": [candidate["candidate_id"] for candidate in candidates if candidate["candidate_kind"] == "capability"][:3],
+        "novelty_rationale_template": (
+            "No material overlap detected."
+            if blocking_bucket == "none"
+            else "Explain how this work differs from the matched task/capability set and why a new task is still needed."
+        ),
+    }
+    response_body = canonical_preflight_response_body(response)
+    token_payload = {
+        "version": PREFLIGHT_TOKEN_VERSION,
+        "request_sha256": f"sha256:{stable_sha256(request)}",
+        "response_sha256": f"sha256:{stable_sha256(response_body)}",
+        "preflight_revision_sha256": f"sha256:{stable_sha256(preflight_revision)}",
+        "issued_at": issued_at_value,
+        "issuer": PREFLIGHT_ISSUER,
+    }
+    token_message = compact_json(token_payload).encode("utf-8")
+    signature = hmac.new(preflight_secret(), token_message, hashlib.sha256).hexdigest()
+    response["preflight_token"] = (
+        base64.urlsafe_b64encode(token_message).decode("ascii").rstrip("=") + "." + signature
+    )
+    return response
+
+
+def decode_preflight_token(token: str) -> dict[str, Any]:
+    try:
+        encoded, signature = token.split(".", 1)
+        padded = encoded + "=" * (-len(encoded) % 4)
+        token_message = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except Exception as exc:
+        die_preflight(error_code="preflight_untrusted", message=f"invalid preflight token format: {exc}")
+    expected_signature = hmac.new(preflight_secret(), token_message, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected_signature):
+        die_preflight(error_code="preflight_untrusted", message="preflight token signature verification failed")
+    token_payload = json.loads(token_message.decode("utf-8"))
+    if token_payload.get("issuer") != PREFLIGHT_ISSUER:
+        die_preflight(error_code="preflight_untrusted", message="preflight token issuer mismatch")
+    return token_payload
+
+
+def validate_preflight_binding(
+    *,
+    request: dict[str, Any],
+    response: dict[str, Any],
+    token: str,
+) -> None:
+    token_payload = decode_preflight_token(token)
+    request_sha = f"sha256:{stable_sha256(request)}"
+    response_sha = f"sha256:{stable_sha256(canonical_preflight_response_body(response))}"
+    revision_sha = f"sha256:{stable_sha256(response['preflight_revision'])}"
+    if (
+        token_payload.get("request_sha256") != request_sha
+        or token_payload.get("response_sha256") != response_sha
+        or token_payload.get("preflight_revision_sha256") != revision_sha
+    ):
+        die_preflight(error_code="preflight_untrusted", message="preflight token digest mismatch", response=response)
+
+
+def validate_override_payload(
+    *,
+    override: dict[str, Any] | None,
+    response: dict[str, Any],
+    classification: str,
+    actor_kind: str,
+    actor_id: str,
+    related_task_ids: list[str],
+    related_capability_ids: list[str],
+) -> tuple[str, str | None, dict[str, Any]]:
+    bucket = response["blocking_bucket"]
+    recommended = response["classification_options"][0]
+    override_exercised = bucket in {"strong_overlap", "duplicate"} or (bucket == "weak_overlap" and classification != recommended)
+    if not override_exercised:
+        return "none", None, {}
+    if not override:
+        if bucket == "strong_overlap":
+            die_preflight(error_code="preflight_strong_overlap_blocked", message="strong overlap requires privileged override", response=response)
+        if bucket == "duplicate":
+            die_preflight(error_code="preflight_duplicate_blocked", message="duplicate task creation is blocked", response=response)
+        die_preflight(error_code="preflight_override_invalid", message="override payload is required for this classification", response=response)
+    override_kind = normalize_text_whitespace(override.get("override_kind"))
+    override_reason = normalize_text_whitespace(override.get("override_reason"))
+    override_actor_id = normalize_text_whitespace(override.get("override_actor_id"))
+    override_authority = normalize_text_whitespace(override.get("override_authority"))
+    acknowledged_candidate_ids = sorted_unique_strings(override.get("acknowledged_candidate_ids", []))
+    selected_related_task_ids = sorted_unique_strings(override.get("selected_related_task_ids", related_task_ids))
+    selected_related_capability_ids = sorted_unique_strings(override.get("selected_related_capability_ids", related_capability_ids))
+    if not override_reason or not override_actor_id or not override_authority:
+        die_preflight(error_code="preflight_override_invalid", message="override_reason, override_actor_id, and override_authority are required", response=response)
+    if override_actor_id != actor_id:
+        die_preflight(error_code="preflight_override_invalid", message="override_actor_id must match the authenticated actor", response=response)
+    expected_kind = "weak_overlap" if bucket == "weak_overlap" else response["override_kind"]
+    if override_kind != expected_kind:
+        die_preflight(error_code="preflight_override_invalid", message=f"override_kind must equal {expected_kind}", response=response)
+    required_acknowledged = [
+        candidate["candidate_id"]
+        for candidate in response["candidates"]
+        if candidate["band"] in {"exact_duplicate", "strong_overlap"}
+    ]
+    if override_kind == "weak_overlap":
+        required_acknowledged.extend(
+            [
+                candidate["candidate_id"]
+                for candidate in response["candidates"]
+                if candidate["band"] in {"related_capability", "related_recent_work"}
+            ][:3]
+        )
+    if not set(required_acknowledged).issubset(set(acknowledged_candidate_ids)):
+        die_preflight(error_code="preflight_override_invalid", message="override acknowledged_candidate_ids is incomplete", response=response)
+    if bucket == "strong_overlap" and actor_kind not in {"planner", "admin"}:
+        die_preflight(error_code="preflight_override_forbidden", message="strong-overlap overrides require planner/admin authority", response=response)
+    if bucket == "duplicate":
+        die_preflight(error_code="preflight_duplicate_blocked", message="duplicate creation requires bootstrap/admin bypass outside the ordinary planner path", response=response)
+    return override_kind, override_reason, {
+        "override_actor_id": override_actor_id,
+        "override_authority": override_authority,
+        "acknowledged_candidate_ids": acknowledged_candidate_ids,
+        "override_timestamp": now_iso(),
+        "override_request_channel": "task-create",
+        "selected_related_task_ids": selected_related_task_ids,
+        "selected_related_capability_ids": selected_related_capability_ids,
+    }
+
+
+def persist_task_creation_preflight(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    task_version: int,
+    request: dict[str, Any],
+    response: dict[str, Any],
+    classification: str,
+    novelty_rationale: str,
+    related_task_ids: list[str],
+    related_capability_ids: list[str],
+    override_kind: str,
+    override_reason: str | None,
+    override_metadata: dict[str, Any],
+    performed_by: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO task_creation_preflight (
+            task_id,
+            task_version,
+            preflight_revision,
+            preflight_token,
+            preflight_request_json,
+            preflight_response_json,
+            query_text,
+            classification,
+            novelty_rationale,
+            override_reason,
+            override_kind,
+            related_task_ids_json,
+            related_capability_ids_json,
+            matched_task_ids_json,
+            matched_capability_ids_json,
+            blocking_bucket,
+            strong_overlap_count,
+            override_allowed,
+            performed_at,
+            performed_by,
+            metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_id,
+            task_version,
+            compact_json(response["preflight_revision"]),
+            response["preflight_token"],
+            compact_json(request),
+            compact_json(canonical_preflight_response_body(response)),
+            request["normalized_task_intent"]["summary"],
+            classification,
+            novelty_rationale,
+            override_reason,
+            override_kind,
+            compact_json(related_task_ids),
+            compact_json(related_capability_ids),
+            compact_json(response["matched_task_ids"]),
+            compact_json(response["matched_capability_ids"]),
+            response["blocking_bucket"],
+            int(response["strong_overlap_count"]),
+            1 if response["override_allowed"] else 0,
+            now_iso(),
+            performed_by,
+            compact_json(override_metadata),
+        ),
     )
 
 
@@ -1819,10 +3694,15 @@ def validate_task_payload(payload: dict[str, Any], *, for_update: bool) -> dict[
     for field in text_fields:
         if field in payload:
             value = payload[field]
-            if value is None and field in ("worker_owner", "initiative"):
+            if value is None and field == "worker_owner":
                 normalized[field] = None
                 continue
             if value is None:
+                if field == "initiative":
+                    die(
+                        'initiative is required. Use a named initiative (e.g. "capability-registry") '
+                        'or "one-off" for standalone tasks that do not belong to an initiative.'
+                    )
                 die(f"missing value for {field}")
             normalized[field] = str(value)
     if "planner_status" in normalized and normalized["planner_status"] not in PLANNER_STATUSES:
@@ -1894,9 +3774,7 @@ def validate_task_payload(payload: dict[str, Any], *, for_update: bool) -> dict[
             "target_repo_id",
             "target_repo_root",
         ]
-        for field in required_fields:
-            if field not in normalized:
-                die(f"missing required field: {field}")
+        missing_fields = [f for f in required_fields if f not in normalized]
         if "approval_required" not in normalized:
             normalized["approval_required"] = False
         if "source_kind" not in normalized:
@@ -1906,7 +3784,16 @@ def validate_task_payload(payload: dict[str, Any], *, for_update: bool) -> dict[
         if "dependencies" not in normalized:
             normalized["dependencies"] = []
         if "execution" not in normalized:
-            die("missing required field: execution")
+            missing_fields.append("execution")
+        if missing_fields:
+            die("missing required fields: " + ", ".join(missing_fields))
+        # initiative is required on create. Use "one-off" for standalone tasks
+        # that don't belong to a named initiative.
+        if not normalized.get("initiative"):
+            die(
+                'initiative is required. Use a named initiative (e.g. "capability-registry") '
+                'or "one-off" for standalone tasks that do not belong to an initiative.'
+            )
     return normalized
 
 
@@ -2003,7 +3890,13 @@ def create_task(conn: sqlite3.Connection, payload: dict[str, Any], *, actor_kind
 
 
 def task_requires_audit(*, task_type: str, source_kind: str, metadata: dict[str, Any]) -> bool:
-    """Return True when the task's metadata indicates an audit is required."""
+    """Return True when the task's metadata indicates an audit is required.
+
+    Investigation tasks are exempt — auditing an investigation is low-value
+    and wastes tokens. This is a hard constraint, not a default.
+    """
+    if task_type == "investigation":
+        return False
     return bool(metadata.get("audit_required"))
 
 
@@ -2078,25 +3971,107 @@ def create_task_graph(
 
     Returns the parent task snapshot.
     """
-    task_id = str(payload.get("task_id") or "")
-    metadata = dict(payload.get("metadata") or {})
-    task_type = str(payload.get("task_type") or "implementation")
-    source_kind = str(payload.get("source_kind") or "planner")
+    normalized_payload = validate_task_payload(payload, for_update=False)
+    resolve_task_repo_target(conn, normalized_payload)
+    preflight_block = payload.get("preflight")
+    if not isinstance(preflight_block, dict):
+        die_preflight(error_code="preflight_missing", message="task creation requires a preflight block")
+    request = canonicalize_preflight_request(preflight_block.get("request") or {})
+    submitted_intent = request["normalized_task_intent"]
+    expected_intent = canonicalize_task_intent(normalized_payload)
+    if submitted_intent != expected_intent:
+        die_preflight(error_code="preflight_untrusted", message="normalized task payload does not match preflight intent")
+    response = parse_preflight_json_object(preflight_block.get("response"), field="preflight.response")
+    token = normalize_text_whitespace(preflight_block.get("preflight_token") or response.get("preflight_token"))
+    if not token:
+        die_preflight(error_code="preflight_missing", message="preflight_token is required")
+    response = dict(response)
+    response["preflight_token"] = token
+    classification = normalize_text_whitespace(preflight_block.get("classification"))
+    novelty_rationale = normalize_text_whitespace(preflight_block.get("novelty_rationale"))
+    related_task_ids = sorted_unique_strings(preflight_block.get("related_task_ids", []))
+    related_capability_ids = sorted_unique_strings(preflight_block.get("related_capability_ids", []))
+    if not classification or not novelty_rationale:
+        die_preflight(error_code="preflight_missing", message="classification and novelty_rationale are required", response=response)
+    validate_preflight_binding(request=request, response=response, token=token)
+    if classification not in response.get("classification_options", []):
+        die_preflight(
+            error_code="preflight_classification_invalid",
+            message=f"classification {classification!r} is not allowed for bucket {response.get('blocking_bucket')!r}",
+            response=response,
+        )
+    if not set(related_task_ids).issubset(set(response.get("matched_task_ids", []))):
+        die_preflight(error_code="preflight_related_references_invalid", message="related_task_ids must come from matched task IDs", response=response)
+    if not set(related_capability_ids).issubset(set(response.get("matched_capability_ids", []))):
+        die_preflight(error_code="preflight_related_references_invalid", message="related_capability_ids must come from matched capability IDs", response=response)
+    override_kind, override_reason, override_metadata = validate_override_payload(
+        override=payload.get("override") if isinstance(payload.get("override"), dict) else None,
+        response=response,
+        classification=classification,
+        actor_kind=actor_kind,
+        actor_id=actor_id,
+        related_task_ids=related_task_ids,
+        related_capability_ids=related_capability_ids,
+    )
+    task_id = str(normalized_payload.get("task_id") or "")
+    metadata = dict(normalized_payload.get("metadata") or {})
+    task_type = str(normalized_payload.get("task_type") or "implementation")
+    source_kind = str(normalized_payload.get("source_kind") or "planner")
+    if override_kind != "none":
+        metadata["preflight_override"] = {
+            "kind": override_kind,
+            "reason": override_reason,
+            "actor_id": override_metadata.get("override_actor_id"),
+            "acknowledged_candidate_ids": override_metadata.get("acknowledged_candidate_ids", []),
+        }
+    normalized_payload["metadata"] = metadata
 
-    if task_requires_audit(task_type=task_type, source_kind=source_kind, metadata=metadata):
-        audit_task_id = f"{task_id}-AUDIT"
-        # Inject audit linkage into parent metadata
-        parent_metadata = dict(metadata)
-        parent_metadata["child_audit_task_id"] = audit_task_id
-        parent_metadata["audit_verdict"] = "pending"
-        parent_payload = dict(payload)
-        parent_payload["metadata"] = parent_metadata
-        parent_snapshot = create_task(conn, parent_payload, actor_kind=actor_kind, actor_id=actor_id)
-        audit_payload = build_audit_task_payload(parent_payload)
-        create_task(conn, audit_payload, actor_kind=actor_kind, actor_id=actor_id)
+    try:
+        begin_immediate(conn)
+        current_response = build_task_preflight_response(conn, request, issued_at=response.get("issued_at"))
+        if current_response["preflight_revision"] != response["preflight_revision"]:
+            die_preflight(error_code="preflight_stale", message="preflight revision is stale; rerun task-preflight", response=response)
+        if compact_json(canonical_preflight_response_body(current_response)) != compact_json(canonical_preflight_response_body(response)):
+            die_preflight(error_code="preflight_untrusted", message="submitted preflight response does not match canonical recomputation", response=response)
+        bucket = response["blocking_bucket"]
+        if bucket == "strong_overlap" and override_kind != "strong_overlap_privileged":
+            die_preflight(error_code="preflight_strong_overlap_blocked", message="strong overlap blocks ordinary task creation", response=response)
+        if bucket == "duplicate":
+            die_preflight(error_code="preflight_duplicate_blocked", message="duplicate overlap blocks ordinary task creation", response=response)
+        if bucket == "weak_overlap" and not novelty_rationale:
+            die_preflight(error_code="preflight_missing", message="weak overlap requires novelty_rationale", response=response)
+        if task_requires_audit(task_type=task_type, source_kind=source_kind, metadata=metadata):
+            audit_task_id = f"{task_id}-AUDIT"
+            parent_metadata = dict(metadata)
+            parent_metadata["child_audit_task_id"] = audit_task_id
+            parent_metadata["audit_verdict"] = "pending"
+            parent_payload = dict(normalized_payload)
+            parent_payload["metadata"] = parent_metadata
+            parent_snapshot = create_task(conn, parent_payload, actor_kind=actor_kind, actor_id=actor_id)
+            audit_payload = build_audit_task_payload(parent_payload)
+            create_task(conn, audit_payload, actor_kind=actor_kind, actor_id=actor_id)
+        else:
+            parent_snapshot = create_task(conn, normalized_payload, actor_kind=actor_kind, actor_id=actor_id)
+        persist_task_creation_preflight(
+            conn,
+            task_id=task_id,
+            task_version=int(parent_snapshot["version"]),
+            request=request,
+            response=response,
+            classification=classification,
+            novelty_rationale=novelty_rationale,
+            related_task_ids=related_task_ids,
+            related_capability_ids=related_capability_ids,
+            override_kind=override_kind,
+            override_reason=override_reason,
+            override_metadata=override_metadata,
+            performed_by=actor_id,
+        )
+        conn.commit()
         return parent_snapshot
-    else:
-        return create_task(conn, payload, actor_kind=actor_kind, actor_id=actor_id)
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def runtime_requeue_task(
@@ -2724,6 +4699,7 @@ def reconcile_audit_pass(
     audit_task_id: str,
     summary: str,
     actor_id: str,
+    worker_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Handle audit verdict=accepted (or any non-rework verdict that closes the audit as done).
 
@@ -2742,6 +4718,21 @@ def reconcile_audit_pass(
     updated_at = now_iso()
     audit_version = int(audit_row["version"])
 
+    parent_row = fetch_task_row(conn, parent_task_id) if parent_task_id else None
+    parent_version = int(parent_row["version"]) if parent_row is not None else None
+    try:
+        capability_closeout = apply_audit_capability_mutations(
+            conn,
+            audit_task_id=audit_task_id,
+            parent_task_id=parent_task_id or None,
+            parent_version=parent_version,
+            actor_id=actor_id,
+            worker_result=worker_result,
+        )
+    except SystemExit as exc:
+        conn.rollback()
+        raise RuntimeError("audit acceptance blocked by invalid or missing capability mutation payload") from exc
+
     # Close the audit as done
     audit_metadata["closeout"] = {
         "outcome": "done",
@@ -2749,6 +4740,8 @@ def reconcile_audit_pass(
         "notes": "audit verdict: accepted",
         "reconciled_at": updated_at,
         "actor_id": actor_id,
+        "capability_mutation_applied": bool(capability_closeout["capability_mutations"]),
+        "capability_emission_required": bool(capability_closeout["capability_emission_required"]),
     }
     conn.execute(
         """
@@ -2780,7 +4773,6 @@ def reconcile_audit_pass(
         conn.commit()
         return fetch_task_snapshots(conn, task_id=audit_task_id)[0]
 
-    parent_row = fetch_task_row(conn, parent_task_id)
     if parent_row is None or str(parent_row["planner_status"]) != "awaiting_audit":
         conn.commit()
         return fetch_task_snapshots(conn, task_id=audit_task_id)[0]
@@ -3852,6 +5844,39 @@ def _health_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _health_enrich_row(row: dict[str, Any]) -> dict[str, Any]:
+    report: dict[str, Any] | None = None
+    try:
+        parsed = json.loads(str(row.get("report_json") or ""))
+        if isinstance(parsed, dict):
+            report = parsed
+    except (TypeError, ValueError, json.JSONDecodeError):
+        report = None
+    if report is None:
+        return row
+
+    repo = report.get("repo") or {}
+    coverage = report.get("coverage") or {}
+    metadata = report.get("metadata") or {}
+    test_run = metadata.get("test_run") or {}
+    counts = test_run.get("counts")
+    if not isinstance(counts, dict):
+        counts = metadata.get("counts") if isinstance(metadata.get("counts"), dict) else {}
+
+    row["report"] = report
+    row["repo_root"] = repo.get("repo_root")
+    row["display_name"] = repo.get("display_name")
+    row["runner"] = test_run.get("runner") or metadata.get("runner")
+    row["test_summary"] = {
+        "runner": row.get("runner"),
+        "exit_code": test_run.get("exit_code"),
+        "counts": counts,
+        "coverage_percent": coverage.get("measured_percent"),
+        "coverage_status": coverage.get("status"),
+    }
+    return row
+
+
 def command_health_snapshot_write(args: argparse.Namespace) -> int:
     """Write repo health snapshots from a bundle JSON into the CENTRAL DB."""
     conn, _ = open_initialized_connection(args.db_path)
@@ -3923,6 +5948,7 @@ def command_health_snapshot_latest(args: argparse.Namespace) -> int:
 
     now_str = now_iso()
     rows = _health_annotate_stale(rows, now_str)
+    rows = [_health_enrich_row(row) for row in rows]
 
     def fmt(data: list[dict[str, Any]]) -> str:
         if not data:
@@ -4334,6 +6360,75 @@ def command_repo_show(args: argparse.Namespace) -> int:
     return print_or_json(payload, as_json=args.json, formatter=render_repo_detail)
 
 
+_CAPABILITY_CREATE_TEMPLATE = {
+    "capability_id": "dispatcher_parked_task_visibility",
+    "name": "Dispatcher parked task visibility",
+    "summary": "Dispatcher status surfaces parked non-eligible tasks.",
+    "status": "active",
+    "kind": "reporting_surface",
+    "scope_kind": "workflow",
+    "owning_repo_id": "CENTRAL",
+    "affected_repo_ids": ["CENTRAL"],
+    "when_to_use_md": "Use when triaging queue state and non-eligible work.",
+    "do_not_use_for_md": "Do not treat as scheduler policy output.",
+    "entrypoints": ["scripts/dispatcher_control.py status"],
+    "keywords": ["dispatcher", "visibility", "parked"],
+    "evidence_summary_md": "Seeded from accepted implementation work.",
+    "verification_level": "planner_verified",
+    "verified_by_task_id": "CENTRAL-OPS-0000",
+    "metadata": {"bootstrap_mode": True},
+    "source_tasks": [{"task_id": "CENTRAL-OPS-0000", "relationship_kind": "seeded_from"}],
+}
+
+
+def command_capability_list(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        repo_id = resolve_repo_filter(conn, args.repo_id)
+        payload = fetch_capability_registry(
+            conn,
+            repo_id=repo_id,
+            status=args.status,
+            kind=args.kind,
+            verification_level=args.verification_level,
+        )
+    finally:
+        conn.close()
+    return print_or_json(payload, as_json=args.json, formatter=render_capability_rows)
+
+
+def command_capability_show(args: argparse.Namespace) -> int:
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        payload = fetch_capability_payload(conn, normalize_capability_id(args.capability_id))
+    finally:
+        conn.close()
+    if payload is None:
+        die(f"capability not found: {args.capability_id}")
+    return print_or_json(payload, as_json=args.json, formatter=render_capability_detail)
+
+
+def command_capability_create(args: argparse.Namespace) -> int:
+    if args.template:
+        print(json_dumps(_CAPABILITY_CREATE_TEMPLATE))
+        return 0
+    if not args.input:
+        die("--input is required when --template is not set")
+    payload = load_json_document(args.input)
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        with conn:
+            created = create_capability(
+                conn,
+                payload,
+                actor_kind=args.actor_kind,
+                actor_id=args.actor_id,
+            )
+    finally:
+        conn.close()
+    return print_or_json(created, as_json=args.json, formatter=render_capability_detail)
+
+
 def _build_batch_task_payload(
     item: dict[str, Any],
     *,
@@ -4514,12 +6609,101 @@ def command_task_batch_create(args: argparse.Namespace) -> int:
     return 1 if failed_count > 0 else 0
 
 
+_TASK_CREATE_TEMPLATE = {
+    "task_id": "",
+    "title": "",
+    "summary": "",
+    "objective_md": "",
+    "context_md": "",
+    "scope_md": "",
+    "deliverables_md": "",
+    "acceptance_md": "",
+    "testing_md": "",
+    "dispatch_md": "",
+    "closeout_md": "",
+    "reconciliation_md": "",
+    "planner_status": "pending",
+    "priority": 50,
+    "task_type": "",
+    "planner_owner": "planner/coordinator",
+    "worker_owner": None,
+    "target_repo_id": "",
+    "target_repo_root": "",
+    "source_kind": "planner",
+    "initiative": None,
+    "approval_required": False,
+    "metadata": {},
+    "dependencies": [],
+    "execution": {
+        "task_kind": "",
+        "timeout_seconds": 3600,
+        "sandbox_mode": "normal",
+        "approval_policy": "auto",
+    },
+}
+
+_TASK_PREFLIGHT_TEMPLATE = {
+    "normalized_task_intent": {
+        "title": "",
+        "summary": "",
+        "objective_md": "",
+        "scope_md": "",
+        "deliverables_md": "",
+        "acceptance_md": "",
+        "target_repo_id": "CENTRAL",
+        "task_type": "implementation",
+        "dependency_task_ids": [],
+        "dependency_kinds": {},
+        "parent_task_id": None,
+        "initiative_key": None,
+        "related_repo_ids": [],
+        "requested_capability_ids": [],
+        "requested_task_ids": [],
+        "labels": [],
+    },
+    "search_scope": {
+        "repo_ids": ["CENTRAL"],
+        "include_active_tasks": True,
+        "include_recent_done_days": 90,
+        "include_capabilities": True,
+        "include_deprecated_capabilities": True,
+        "max_candidates_per_kind": 50,
+    },
+    "request_context": {
+        "requested_by": "planner/coordinator",
+        "request_channel": "task-create",
+        "is_material_update": False,
+        "existing_task_id": None,
+        "existing_task_version": None,
+    },
+}
+
+
+def command_task_preflight(args: argparse.Namespace) -> int:
+    if args.template:
+        print(json_dumps(_TASK_PREFLIGHT_TEMPLATE))
+        return 0
+    if not args.input:
+        die("--input is required when --template is not set")
+    request = canonicalize_preflight_request(load_json_document(args.input))
+    conn, _ = open_initialized_connection(args.db_path)
+    try:
+        response = build_task_preflight_response(conn, request)
+    finally:
+        conn.close()
+    return print_or_json(response, as_json=True, formatter=json_dumps)
+
+
 def command_task_create(args: argparse.Namespace) -> int:
+    if args.template:
+        print(json_dumps(_TASK_CREATE_TEMPLATE))
+        return 0
+    if not args.input:
+        die("--input is required when --template is not set")
     payload = load_json_document(args.input)
     conn, _ = open_initialized_connection(args.db_path)
     try:
-        with conn:
-            snapshot = create_task(conn, payload, actor_kind="planner", actor_id=args.actor_id)
+        snapshot = create_task_graph(conn, payload, actor_kind="planner", actor_id=args.actor_id)
     finally:
         conn.close()
     return print_or_json(render_task_card(snapshot), as_json=args.json, formatter=json_dumps)
@@ -4630,12 +6814,11 @@ def command_planner_new(args: argparse.Namespace) -> int:
             }
             payload = validate_task_payload(payload, for_update=False)
             resolve_task_repo_target(conn, payload)
-            create_task(conn, payload, actor_kind="planner", actor_id=args.actor_id)
     finally:
         conn.close()
     if not args.depends_on:
         print(
-            f"NOTE: {task_id} created with no --depends-on. "
+            f"NOTE: {task_id} scaffolded with no --depends-on. "
             "Run 'dep-lint' after creation to check for undeclared dependency edges.",
             file=sys.stderr,
         )
@@ -5691,9 +7874,44 @@ def build_parser() -> argparse.ArgumentParser:
     add_json_argument(repo_show_parser)
     repo_show_parser.set_defaults(func=command_repo_show)
 
+    capability_list_parser = subparsers.add_parser("capability-list", help="List canonical capability registry entries.")
+    add_db_argument(capability_list_parser)
+    capability_list_parser.add_argument("--repo-id", help="Filter to capabilities affecting a specific canonical repo or alias.")
+    capability_list_parser.add_argument("--status", choices=sorted(CAPABILITY_STATUSES))
+    capability_list_parser.add_argument("--kind")
+    capability_list_parser.add_argument("--verification-level", choices=sorted(CAPABILITY_VERIFICATION_LEVELS))
+    add_json_argument(capability_list_parser)
+    capability_list_parser.set_defaults(func=command_capability_list)
+
+    capability_show_parser = subparsers.add_parser("capability-show", help="Show a capability row with scope, provenance, and events.")
+    add_db_argument(capability_show_parser)
+    capability_show_parser.add_argument("--capability-id", required=True)
+    add_json_argument(capability_show_parser)
+    capability_show_parser.set_defaults(func=command_capability_show)
+
+    capability_create_parser = subparsers.add_parser(
+        "capability-create",
+        help="Create a canonical capability row plus scope/provenance join rows. Internal/admin bootstrap helper.",
+    )
+    add_db_argument(capability_create_parser)
+    capability_create_parser.add_argument("--input", help="Path to JSON payload, or - for stdin.")
+    capability_create_parser.add_argument("--template", action="store_true", help="Print a skeleton JSON payload and exit 0.")
+    capability_create_parser.add_argument("--actor-kind", default="admin")
+    capability_create_parser.add_argument("--actor-id", default="planner/coordinator")
+    add_json_argument(capability_create_parser)
+    capability_create_parser.set_defaults(func=command_capability_create)
+
+    task_preflight_parser = subparsers.add_parser("task-preflight", help="Run canonical capability/task overlap preflight for a proposed task.")
+    add_db_argument(task_preflight_parser)
+    task_preflight_parser.add_argument("--input", help="Path to JSON payload, or - for stdin.")
+    task_preflight_parser.add_argument("--template", action="store_true", help="Print a skeleton preflight request JSON and exit 0.")
+    add_json_argument(task_preflight_parser)
+    task_preflight_parser.set_defaults(func=command_task_preflight)
+
     task_create_parser = subparsers.add_parser("task-create", help="Create a planner-owned task from JSON input. Target repos must already be onboarded.")
     add_db_argument(task_create_parser)
-    task_create_parser.add_argument("--input", required=True, help="Path to JSON payload, or - for stdin.")
+    task_create_parser.add_argument("--input", help="Path to JSON payload, or - for stdin.")
+    task_create_parser.add_argument("--template", action="store_true", help="Print a skeleton JSON with all required fields and exit 0.")
     task_create_parser.add_argument("--actor-id", default="planner/coordinator")
     add_json_argument(task_create_parser)
     task_create_parser.set_defaults(func=command_task_create)

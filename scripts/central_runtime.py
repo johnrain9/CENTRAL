@@ -801,6 +801,9 @@ def build_stub_command(snapshot: dict[str, Any], run_id: str, result_path: Path)
         "'discoveries':[],"
         "'blockers':[],"
         "'validation':[{'name':'stub-mode','passed':True,'notes':'synthetic worker result'}],"
+        "'verdict':'accepted',"
+        "'requirements_assessment':[{'requirement':'stub worker mode only','verdict':'met','notes':'synthetic worker emitted a valid result payload'}],"
+        "'system_fit_assessment':{'verdict':'fit','notes':'stub worker path completed successfully','local_optimization_risk':'low'},"
         "'files_changed':[],"
         "'warnings':[],"
         "'artifacts':[]"
@@ -1887,6 +1890,7 @@ class CentralDispatcher:
             notes = None
             tests = None
             result = None
+            raw_result_payload: dict[str, object] | None = None
             extra_artifacts: list[tuple[str, str, dict[str, Any]]] = []
             result_artifacts = terminal_artifacts.copy()
             # For Claude workers, claude -p JSON output goes to the log file (stdout=log_handle).
@@ -1900,6 +1904,9 @@ class CentralDispatcher:
             if state.result_path.exists():
                 result_artifacts.append(str(state.result_path))
                 try:
+                    loaded_payload = json.loads(state.result_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded_payload, dict):
+                        raw_result_payload = loaded_payload
                     autonomy_runner = load_autonomy_runner()
                     result = autonomy_runner.load_result_file(state.result_path, task_id=task_id, run_id=state.run_id)
                     runtime_status = success_runtime_status(state.task) if result.status == "COMPLETED" else "failed"
@@ -2017,6 +2024,7 @@ class CentralDispatcher:
                                 audit_task_id=task_id,
                                 summary=notes or "audit verdict: accepted",
                                 actor_id="central.dispatcher",
+                                worker_result=raw_result_payload,
                             )
                             audit_meta = pass_snap.get("metadata") or {}
                             parent_id = audit_meta.get("parent_task_id") or "?"
@@ -2590,7 +2598,7 @@ def command_daemon(args: argparse.Namespace) -> int:
 
 def smoke_task_payload() -> dict[str, Any]:
     return {
-        "task_id": "CENTRAL-RUNTIME-SMOKE",
+        "task_id": "CENTRAL-RUNTIME-1",
         "title": "CENTRAL runtime smoke task",
         "summary": "Validate CENTRAL runtime daemon and worker bridge",
         "objective_md": "Run the CENTRAL-native runtime smoke path.",
@@ -2602,6 +2610,7 @@ def smoke_task_payload() -> dict[str, Any]:
         "dispatch_md": "Dispatch locally through central_runtime self-check.",
         "closeout_md": "Review synthetic smoke artifacts only.",
         "reconciliation_md": "CENTRAL DB remains canonical.",
+        "initiative": "one-off",
         "planner_status": "todo",
         "priority": 1,
         "task_type": "implementation",
@@ -2663,7 +2672,7 @@ def command_self_check(args: argparse.Namespace) -> int:
                 LEFT JOIN task_runtime_state rs ON rs.task_id = t.task_id
                 WHERE t.task_id = ?
                 """,
-                ("CENTRAL-RUNTIME-SMOKE",),
+                ("CENTRAL-RUNTIME-1",),
             ).fetchone()
             payload = {
                 "db_path": str(db_path),

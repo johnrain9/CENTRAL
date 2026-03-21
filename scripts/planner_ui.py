@@ -22,7 +22,8 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from flask import Flask, jsonify, request
 
@@ -75,6 +76,58 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _run_text(cmd: list[str], timeout: int = 15, cwd: str | None = None) -> tuple[str | None, str | None]:
+    """Run a command and return (stdout_text, error_string)."""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or result.stdout.strip()
+            return None, f"exit {result.returncode}: {stderr[:300]}"
+        return result.stdout.strip(), None
+    except subprocess.TimeoutExpired:
+        return None, f"timeout after {timeout}s"
+    except Exception as e:
+        return None, str(e)
+
+
+def _git_last_commit(repo_root: str | None) -> str:
+    if not repo_root:
+        return "unknown"
+    out, err = _run_text(["git", "-C", repo_root, "log", "-1", "--format=%ar"])
+    if err or not out:
+        return "unknown"
+    return out
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def _weekly_completed_count(tasks: list[dict[str, Any]]) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    count = 0
+    for task in tasks:
+        if task.get("planner_status") != "done":
+            continue
+        closed_at = _parse_iso(task.get("closed_at"))
+        if closed_at and closed_at >= cutoff:
+            count += 1
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Data aggregation
 # ---------------------------------------------------------------------------
@@ -118,17 +171,35 @@ def build_ui_payload() -> dict:
         errors.append(f"view-blocked: {err}")
         blocked = []
 
+    # Repo registry + all tasks for repo-initiative mapping
+    repos, err = _db("repo-list", "--json")
+    if err:
+        errors.append(f"repo-list: {err}")
+        repos = []
+
+    all_tasks, err = _db("task-list", "--json")
+    if err:
+        errors.append(f"task-list: {err}")
+        all_tasks = []
+
+    health_rows, err = _db("health-snapshot-latest", "--json")
+    if err:
+        errors.append(f"health-snapshot-latest: {err}")
+        health_rows = []
+
+    weekly_completed = _weekly_completed_count(all_tasks)
+
     return {
         "generated_at": _now_iso(),
         "errors": errors,
         "dispatcher": _shape_dispatcher(disp_status),
         "workers": _shape_workers(workers_data),
         "actionable": _shape_actionable(panel),
-        "needs_attention": _shape_attention(review, panel, blocked),
+        "needs_attention": _shape_attention(review, panel, blocked, summary.get("mismatches", [])),
         "awaiting_audit": panel.get("awaiting_audit", []),
-        "by_repo": _shape_by_repo(summary, workers_data),
+        "by_repo": _shape_by_repo(summary, all_tasks, repos, health_rows),
         "recent_changes": panel.get("changed_since", []),
-        "summary": _shape_summary(disp_status, summary, panel, workers_data),
+        "summary": _shape_summary(disp_status, summary, panel, workers_data, weekly_completed),
     }
 
 
@@ -172,61 +243,138 @@ def _shape_actionable(panel: dict) -> dict:
     }
 
 
-def _shape_attention(review: list, panel: dict, blocked: list) -> list:
+def _shape_attention(review: list, panel: dict, blocked: list, mismatches: list[dict[str, Any]]) -> list:
     """Merge review items, recent failures, and blocked tasks into attention list."""
+    def _item_key(item: dict, source: str, idx: int) -> str:
+        base = item.get("task_id") or item.get("audit_task_id") or ""
+        if base:
+            return f"{source}:{base}"
+        repo = item.get("repo") or item.get("target_repo_id") or ""
+        initiative = item.get("initiative") or ""
+        return f"{source}:{repo}:{initiative}:{idx}"
+
     seen = set()
     items = []
 
     for r in (review or []):
-        tid = r.get("task_id", "")
-        if tid not in seen:
-            seen.add(tid)
+        key = _item_key(r, "review", len(items))
+        if key not in seen:
+            seen.add(key)
             items.append({**r, "_source": "review"})
 
     for f in panel.get("recent_failures", []):
-        tid = f.get("task_id", "")
-        if tid not in seen:
-            seen.add(tid)
+        key = _item_key(f, "failure", len(items))
+        if key not in seen:
+            seen.add(key)
             items.append({**f, "_source": "failure"})
 
     for b in (blocked or []):
-        tid = b.get("task_id", "")
-        if tid not in seen:
-            seen.add(tid)
+        key = _item_key(b, "blocked", len(items))
+        if key not in seen:
+            seen.add(key)
             items.append({**b, "_source": "blocked"})
+
+    for mismatch in (mismatches or []):
+        key = _item_key(mismatch, "mismatch", len(items))
+        if key not in seen:
+            seen.add(key)
+            items.append({**mismatch, "_source": "mismatch"})
 
     return items
 
 
-def _shape_by_repo(summary: dict, workers_data: dict) -> list:
-    per_repo = summary.get("per_repo", [])
-    # Build running worker count by task → repo mapping
-    worker_repo_counts: dict[str, int] = {}
-    for w in workers_data.get("active_workers", []):
-        # workers don't carry repo directly; we'll count from task-id prefix patterns
-        # but that's unreliable — use per_repo running count from summary instead
-        pass
+def _shape_by_repo(summary: dict, tasks: list[dict], repos: list[dict], health_rows: list[dict]) -> list:
+    repo_meta = {r.get("repo_id", ""): r for r in repos or []}
+    health_by_repo = {h.get("repo_id", ""): h for h in health_rows or []}
+    summary_by_repo = {r.get("repo_id", ""): r for r in summary.get("per_repo", [])}
+
+    initiatives_by_repo: dict[str, dict[str, dict[str, int]]] = {}
+    for row in tasks or []:
+        repo_id = row.get("repo") or row.get("target_repo_id") or row.get("repo_id") or ""
+        if not repo_id:
+            continue
+        initiative = (row.get("initiative") or "(unassigned)").strip() or "(unassigned)"
+        initiatives_by_repo.setdefault(repo_id, {})
+        bucket = initiatives_by_repo[repo_id].setdefault(
+            initiative,
+            {
+                "initiative": initiative,
+                "total": 0,
+                "done": 0,
+                "in_progress": 0,
+                "blocked": 0,
+                "failed": 0,
+            },
+        )
+
+        bucket["total"] += 1
+        planner_status = row.get("planner_status")
+        runtime_status = row.get("runtime_status")
+        if planner_status == "done":
+            bucket["done"] += 1
+        else:
+            bucket["in_progress"] += 1
+        if planner_status == "blocked":
+            bucket["blocked"] += 1
+        if planner_status == "failed" or runtime_status == "failed":
+            bucket["failed"] += 1
 
     out = []
-    for row in per_repo:
+    for repo_id in sorted(set(summary_by_repo) | set(initiatives_by_repo)):
+        summary_row = summary_by_repo.get(repo_id, {})
+        initiatives = []
+        for bucket in initiatives_by_repo.get(repo_id, {}).values():
+            done = bucket.get("done", 0)
+            total = bucket.get("total", 0)
+            blocked = bucket.get("blocked", 0)
+            failed = bucket.get("failed", 0)
+            if total <= 0:
+                continue
+            if total > 0 and done == total:
+                color = "green"
+            elif failed > 0:
+                color = "red"
+            elif blocked > 0:
+                color = "yellow"
+            else:
+                color = "blue"
+            bucket["color"] = color
+            initiatives.append(bucket)
+
+        initiatives.sort(key=lambda b: (-(b["total"]), b["initiative"].lower()))
+
+        repo_info = repo_meta.get(repo_id, {})
+        repo_health = health_by_repo.get(repo_id, {})
         out.append({
-            "repo": row.get("repo_id", ""),
-            "total": row.get("total", 0),
-            "running": row.get("running", 0),
-            "eligible": row.get("eligible", 0),
-            "blocked": row.get("blocked", 0),
-            "pending_review": row.get("pending_review", 0),
+            "repo": repo_id,
+            "display_name": repo_info.get("display_name", repo_id),
+            "repo_root": repo_info.get("repo_root", ""),
+            "last_commit": _git_last_commit(repo_info.get("repo_root")),
+            "test_health": repo_health.get("overall_status") or repo_health.get("working_status") or "unknown",
+            "test_health_freshness": repo_health.get("freshness") or "unknown",
+            "total": summary_row.get("total", 0),
+            "running": summary_row.get("running", 0),
+            "eligible": summary_row.get("eligible", 0),
+            "blocked": summary_row.get("blocked", 0),
+            "pending_review": summary_row.get("pending_review", 0),
+            "initiatives": initiatives,
         })
-    return sorted(out, key=lambda r: r["running"], reverse=True)
+
+    # Keep cards deterministic and remove zero-task repos from the display.
+    return [r for r in out if (r["initiatives"])]
 
 
-def _shape_summary(disp: dict, summary: dict, panel: dict, workers_data: dict) -> dict:
+def _shape_summary(disp: dict, summary: dict, panel: dict, workers_data: dict, weekly_completed: int) -> dict:
     panel_summary = panel.get("summary", {})
     planner = summary.get("planner_counts", {})
     runtime = summary.get("runtime_counts", {})
     active_workers = workers_data.get("active_workers", [])
     lock = disp.get("lock_payload") or {}
     max_w = lock.get("max_workers") or disp.get("configured_max_workers") or 0
+
+    mismatch_count = summary.get("mismatch_count", 0)
+    blocked_count = summary.get("blocked_count", 0)
+    failure_count = panel_summary.get("stale_count", 0) + runtime.get("failed", 0) + planner.get("failed", 0)
 
     return {
         "dispatcher_running": disp.get("running", False),
@@ -236,7 +384,10 @@ def _shape_summary(disp: dict, summary: dict, panel: dict, workers_data: dict) -
         "eligible_count": panel_summary.get("eligible_count", 0),
         "awaiting_audit_count": panel_summary.get("awaiting_audit_count", 0),
         "failed_audit_count": panel_summary.get("failed_audit_count", 0),
-        "blocked_count": summary.get("blocked_count", 0),
+        "blocked_count": blocked_count,
+        "mismatch_count": mismatch_count,
+        "alert_count": mismatch_count + blocked_count + failure_count,
+        "weekly_completed": weekly_completed,
         "stale_count": panel_summary.get("stale_count", 0),
         "recent_changes_count": panel_summary.get("changed_since_count", 0),
         "planner_done": planner.get("done", 0),
@@ -267,6 +418,23 @@ def api_tasks():
     data, err = _db("task-list", "--json")
     if err:
         return jsonify({"error": err}), 500
+    # Enrich with objective_md (description) so the UI can search across it
+    try:
+        import sqlite3 as _sqlite3
+        db_path = os.environ.get(
+            "CENTRAL_TASK_DB_PATH",
+            os.path.join(REPO_ROOT, "state", "central_tasks.db"),
+        )
+        if os.path.exists(db_path):
+            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn.row_factory = _sqlite3.Row
+            rows = conn.execute("SELECT task_id, objective_md FROM tasks").fetchall()
+            conn.close()
+            desc_map = {row["task_id"]: row["objective_md"] or "" for row in rows}
+            for t in data:
+                t["description"] = desc_map.get(t["task_id"], "")
+    except Exception:
+        pass  # descriptions are optional; proceed without them
     return jsonify(data)
 
 
@@ -469,6 +637,8 @@ a:hover { text-decoration: underline; }
 .section.collapsed .collapse-arrow { transform: rotate(-90deg); }
 .section-body { padding: 10px 12px; background: var(--bg); }
 .section.collapsed .section-body { display: none; }
+.section.hidden { display: none; }
+.section.note { opacity: 0.9; }
 
 /* ── Worker Cards ────────────────────────────────────────────────────── */
 .workers-grid {
@@ -560,6 +730,7 @@ tr.selected td { background: #1a2540; }
 .badge-green   { background: #1a3a2a; color: var(--green); }
 .badge-teal    { background: #1a3535; color: var(--teal); }
 .badge-amber   { background: #3d2a00; color: var(--amber); }
+.badge-yellow  { background: #4a3f1d; color: #f6ad55; }
 .badge-red     { background: #3d1515; color: var(--red); }
 .badge-orange  { background: #3d2800; color: var(--orange); }
 .badge-gray    { background: var(--bg3); color: var(--gray); }
@@ -586,7 +757,7 @@ tr.selected td { background: #1a2540; }
 .filter-bar input { min-width: 160px; }
 .filter-label { color: var(--text-dim); font-size: 10px; }
 
-/* ── Repo breakdown ──────────────────────────────────────────────────── */
+/* ── Repo cards / initiatives ─────────────────────────────────────────── */
 .repo-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -599,12 +770,74 @@ tr.selected td { background: #1a2540; }
   background: var(--bg2);
 }
 .repo-name { font-weight: 700; font-size: 12px; color: var(--text); margin-bottom: 6px; }
-.repo-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 12px; font-size: 10px; }
-.rs-key { color: var(--text-dim); }
-.rs-val { color: var(--text); font-weight: 600; }
-.rs-val.hot { color: var(--blue); }
-.rs-val.warn { color: var(--amber); }
-.rs-val.fail { color: var(--red); }
+.repo-meta {
+  font-size: 10px;
+  display: grid;
+  gap: 3px 8px;
+  margin-bottom: 10px;
+  color: var(--text-muted);
+}
+.repo-meta span { color: var(--text-dim); }
+.repo-meta .kv { display: grid; grid-template-columns: 120px 1fr; }
+.repo-initiatives {
+  display: grid;
+  gap: 8px;
+}
+.initiative {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: var(--bg3);
+}
+.initiative-head {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  margin-bottom: 4px;
+  font-size: 10px;
+}
+.initiative-name {
+  color: var(--text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.initiative-count {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+.progress-wrap {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+.progress-track {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg4);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.progress-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+}
+.progress-fill.green { background: var(--green); }
+.progress-fill.blue { background: var(--blue); }
+.progress-fill.yellow { background: #d69e2e; }
+.progress-fill.red { background: var(--red); }
+.initiative-text {
+  min-width: 50px;
+  text-align: right;
+  font-size: 9px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
 
 /* ── Detail Drawer ───────────────────────────────────────────────────── */
 #drawer {
@@ -731,12 +964,10 @@ tr.selected td { background: #1a2540; }
 <div id="topbar">
   <span class="brand">⬡ CENTRAL</span>
   <span id="disp-pill" class="pill neutral">— dispatcher</span>
-  <span class="pill neutral"><span class="stat-label">workers</span>&nbsp;<span id="s-workers">—</span></span>
+  <span id="p-weekly" class="pill neutral"><span class="stat-label">weekly done</span>&nbsp;<span id="s-weekly">—</span></span>
+  <span id="p-active" class="pill neutral"><span class="stat-label">active workers</span>&nbsp;<span id="s-workers">—</span></span>
+  <span id="p-alert" class="pill neutral"><span class="stat-label">alerts</span>&nbsp;<span id="s-alerts">—</span></span>
   <span class="pill neutral"><span class="stat-label">slots</span>&nbsp;<span id="s-slots">—</span></span>
-  <span class="pill neutral"><span class="stat-label">eligible</span>&nbsp;<span id="s-eligible">—</span></span>
-  <span id="p-audit" class="pill neutral"><span class="stat-label">awaiting audit</span>&nbsp;<span id="s-audit">—</span></span>
-  <span id="p-fail-audit" class="pill neutral"><span class="stat-label">failed audit</span>&nbsp;<span id="s-fail-audit">—</span></span>
-  <span id="p-blocked" class="pill neutral"><span class="stat-label">blocked</span>&nbsp;<span id="s-blocked">—</span></span>
   <span id="p-stale" class="pill neutral"><span class="stat-label">stale</span>&nbsp;<span id="s-stale">—</span></span>
 
   <div id="refresh-info">
@@ -827,10 +1058,10 @@ tr.selected td { background: #1a2540; }
     </div>
   </div>
 
-  <!-- By Repo -->
+  <!-- Repo Cards -->
   <div class="section" id="sec-repo">
     <div class="section-header" onclick="toggleSection('sec-repo')">
-      <span class="section-title">By Repo</span>
+      <span class="section-title">Repo Cards</span>
       <span class="section-count" id="cnt-repo">0</span>
       <span class="collapse-arrow">▾</span>
     </div>
@@ -849,7 +1080,7 @@ tr.selected td { background: #1a2540; }
     <div class="section-body">
       <div class="filter-bar">
         <span class="filter-label">filter:</span>
-        <input id="f-search" type="text" placeholder="title or task id…" oninput="applyFilters()">
+        <input id="f-search" type="text" placeholder="id, title, or description…" oninput="applyFilters()" onkeydown="if(event.key==='Escape'){this.value='';applyFilters();this.blur();}">
         <select id="f-repo" onchange="applyFilters()"><option value="">all repos</option></select>
         <select id="f-pstatus" onchange="applyFilters()">
           <option value="">all planner status</option>
@@ -950,6 +1181,20 @@ async function fetchData() {
   scheduleRefresh();
 }
 
+function setSectionState(sectionId, hasItems) {
+  const section = document.getElementById(sectionId);
+  if (!section) return;
+  if (hasItems) {
+    section.classList.remove('hidden', 'collapsed');
+  } else {
+    if (sectionId === 'sec-attention') {
+      section.classList.add('hidden');
+    } else {
+      section.classList.add('collapsed');
+    }
+  }
+}
+
 async function fetchTaskList() {
   try {
     const resp = await fetch('/api/tasks');
@@ -969,7 +1214,7 @@ function scheduleRefresh() {
       document.getElementById('stale-warn').style.display = 'inline';
     }
     fetchData();
-  }, 10000); // 10 second polling
+  }, 30000); // 30 second polling
 }
 
 function showError(msg) {
@@ -1004,21 +1249,12 @@ function renderSummaryBar(s, disp) {
     dispPill.textContent = '○ stopped';
   }
 
+  document.getElementById('s-weekly').textContent = s.weekly_completed;
   document.getElementById('s-workers').textContent = s.active_workers;
+  const alertPill = document.getElementById('p-alert');
+  alertPill.className = 'pill ' + (s.alert_count > 0 ? 'red' : 'neutral');
+  document.getElementById('s-alerts').textContent = s.alert_count;
   document.getElementById('s-slots').textContent = s.idle_slots + ' idle / ' + s.max_workers + ' max';
-  document.getElementById('s-eligible').textContent = s.eligible_count;
-
-  const auditPill = document.getElementById('p-audit');
-  auditPill.className = 'pill ' + (s.awaiting_audit_count > 0 ? 'teal' : 'neutral');
-  document.getElementById('s-audit').textContent = s.awaiting_audit_count;
-
-  const failAuditPill = document.getElementById('p-fail-audit');
-  failAuditPill.className = 'pill ' + (s.failed_audit_count > 0 ? 'red' : 'neutral');
-  document.getElementById('s-fail-audit').textContent = s.failed_audit_count;
-
-  const blockedPill = document.getElementById('p-blocked');
-  blockedPill.className = 'pill ' + (s.blocked_count > 0 ? 'orange' : 'neutral');
-  document.getElementById('s-blocked').textContent = s.blocked_count;
 
   const stalePill = document.getElementById('p-stale');
   stalePill.className = 'pill ' + (s.stale_count > 0 ? 'warn' : 'neutral');
@@ -1039,6 +1275,7 @@ function renderWorkers(w) {
   const grid = document.getElementById('workers-grid');
   const active = w.active || [];
   document.getElementById('cnt-workers').textContent = active.length;
+  setSectionState('sec-workers', active.length > 0);
 
   if (!active.length) {
     grid.innerHTML = '<div class="empty-state">No active workers.</div>';
@@ -1087,6 +1324,7 @@ function renderActionable(a) {
   const audit = a.audit || [];
   const total = impl.length + audit.length;
   document.getElementById('cnt-actionable').textContent = total;
+  setSectionState('sec-actionable', total > 0);
 
   if (!total) {
     document.getElementById('actionable-body').innerHTML = '<div class="empty-state">Nothing actionable right now.</div>';
@@ -1110,22 +1348,27 @@ function renderActionable(a) {
 // ─── Attention ────────────────────────────────────────────────────────────────
 function renderAttention(items) {
   document.getElementById('cnt-attention').textContent = items.length;
+  const section = document.getElementById('sec-attention');
+  const shouldRender = items.length > 0;
+  section.classList.toggle('hidden', !shouldRender);
   if (!items.length) {
+    setSectionState('sec-attention', false);
     document.getElementById('attention-body').innerHTML = '<div class="empty-state">No attention items.</div>';
     return;
   }
+
+  section.classList.remove('hidden');
 
   const rows = items.map(item => {
     const src = item._source || '';
     const srcBadge = src === 'review' ? badge('review','red')
       : src === 'failure' ? badge('failure','amber')
+      : src === 'mismatch' ? badge('mismatch','yellow')
       : badge('blocked','orange');
     const tid = item.task_id || '';
     const repo = item.repo || '';
     const title = item.title || '';
     const reason = item.last_error || item.blocker || item.summary || '';
-    const rtStatus = item.runtime_status || item.failure_type || '';
-
     return `<div class="attention-row" onclick="openTaskDrawer('${esc(tid)}')" style="cursor:pointer">
       <span class="tid">${esc(tid)}</span>
       <span>${repoBadge(repo)}</span>
@@ -1141,6 +1384,7 @@ function renderAttention(items) {
 // ─── Awaiting Audit ───────────────────────────────────────────────────────────
 function renderAudit(items) {
   document.getElementById('cnt-audit').textContent = items.length;
+  setSectionState('sec-audit', items.length > 0);
   const tbody = document.getElementById('audit-tbody');
   if (!items.length) {
     tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No tasks awaiting audit.</td></tr>';
@@ -1159,17 +1403,47 @@ function renderAudit(items) {
 // ─── By Repo ──────────────────────────────────────────────────────────────────
 function renderByRepo(repos) {
   document.getElementById('cnt-repo').textContent = repos.length;
+  setSectionState('sec-repo', repos.length > 0);
   const grid = document.getElementById('repo-grid');
-  grid.innerHTML = repos.map(r => {
-    return `<div class="repo-card">
-      <div class="repo-name">${esc(r.repo)}</div>
-      <div class="repo-stats">
-        <span class="rs-key">total</span><span class="rs-val">${r.total}</span>
-        <span class="rs-key">running</span><span class="rs-val ${r.running > 0 ? 'hot' : ''}">${r.running}</span>
-        <span class="rs-key">eligible</span><span class="rs-val">${r.eligible}</span>
-        <span class="rs-key">blocked</span><span class="rs-val ${r.blocked > 0 ? 'warn' : ''}">${r.blocked}</span>
-        <span class="rs-key">pending review</span><span class="rs-val ${r.pending_review > 0 ? 'fail' : ''}">${r.pending_review}</span>
+  const healthLabel = (status) => {
+    const normalized = (status || '').toLowerCase();
+    if (!status || normalized === 'unknown') return badge('unknown', 'gray');
+    if (normalized.includes('pass') || normalized === 'healthy') return badge(status, 'green');
+    if (normalized.includes('warn') || normalized.includes('degrade')) return badge(status, 'yellow');
+    return badge(status, 'red');
+  };
+
+  const initiativeRows = (item) => {
+    const pct = item.total ? Math.max(0, Math.min(100, Math.round((item.done / item.total) * 100))) : 0;
+    const label = item.done >= item.total ? '✓' : `${pct}%`;
+    return `<div class="initiative">
+      <div class="initiative-head">
+        <span class="initiative-name" title="${esc(item.initiative)}">${esc(item.initiative)}</span>
+        <span class="initiative-count">${item.done}/${item.total}</span>
       </div>
+      <div class="progress-wrap">
+        <div class="progress-track">
+          <div class="progress-fill ${item.color}" style="width:${pct}%"></div>
+        </div>
+        <span class="initiative-text">${label}</span>
+      </div>
+    </div>`;
+  };
+
+  if (!repos.length) {
+    grid.innerHTML = '<div class="empty-state">No repository initiatives to display.</div>';
+    return;
+  }
+
+  grid.innerHTML = repos.map(r => {
+    const initiatives = (r.initiatives || []).map(initiativeRows).join('');
+    return `<div class="repo-card">
+      <div class="repo-name">${esc(r.display_name || r.repo)}</div>
+      <div class="repo-meta">
+        <span class="kv"><span>commit:</span><span>${esc(r.last_commit || 'unknown')}</span></span>
+        <span class="kv"><span>tests:</span><span>${healthLabel(r.test_health)} ${r.test_health_freshness || ''}</span></span>
+      </div>
+      <div class="repo-initiatives">${initiatives || '<div class="empty-state">No initiatives.</div>'}</div>
     </div>`;
   }).join('');
 }
@@ -1177,6 +1451,7 @@ function renderByRepo(repos) {
 // ─── Recent Changes ───────────────────────────────────────────────────────────
 function renderChanges(changes) {
   document.getElementById('cnt-changes').textContent = changes.length;
+  setSectionState('sec-changes', changes.length > 0);
   if (!changes.length) {
     document.getElementById('changes-body').innerHTML = '<div class="empty-state">No recent changes.</div>';
     return;
@@ -1209,6 +1484,7 @@ function buildTaskExplorer(d, allTasksFromApi) {
       initiative: t.initiative || '',
       audit_verdict: '',
       closed_at: t.closed_at || null,
+      description: t.description || '',
     }));
   } else {
     // Fallback: build from partial DATA sections
@@ -1256,7 +1532,7 @@ function applyFilters() {
   const type = document.getElementById('f-type').value;
 
   FILTER_TASKS = ALL_TASKS.filter(t => {
-    if (search && !t.task_id?.toLowerCase().includes(search) && !t.title?.toLowerCase().includes(search)) return false;
+    if (search && !t.task_id?.toLowerCase().includes(search) && !t.title?.toLowerCase().includes(search) && !t.description?.toLowerCase().includes(search)) return false;
     if (repo && t.repo !== repo) return false;
     if (pstatus && t.planner_status !== pstatus) return false;
     if (rtstatus && t.runtime_status !== rtstatus) return false;

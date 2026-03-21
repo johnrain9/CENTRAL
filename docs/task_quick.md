@@ -2,7 +2,7 @@
 
 `scripts/task_quick.py` is a planner-facing wrapper around `planner-new` + `task-create` that reduces task creation to 2 required flags.
 It now runs `task-preflight` automatically, injects the preflight payload, and only then calls `task-create`.
-In planner-ops smoke mode, the command runs the same pipeline against a temporary copied DB and includes the temporary DB path in output for traceability.
+In planner-ops smoke mode, the command runs the same pipeline against a temporary copied DB, prints that temp DB path for traceability, and removes the copied DB before exit.
 If `--initiative` is omitted, `task_quick.py` defaults it to `one-off` so the 2-flag path still works even though initiative is now required at the DB layer.
 
 ## Minimum Usage
@@ -14,7 +14,7 @@ python3 scripts/task_quick.py --title "Fix login bug" --repo MOTO_HELPER
 That's it. The tool picks the `feature` template by default, allocates the next `CENTRAL-OPS` task ID, fills required fields from the template, defaults initiative to `one-off`, and persists the task to the DB.
 Use `--dry-run` for a safe validation path that runs preflight and prints planned task metadata without writing.
 For planner-ops-specific smoke output, use `--planner-ops-smoke`.
-That mode writes only to a temporary DB copy and synthesizes a temporary smoke-only title suffix so repeated validation runs do not collide with prior planner-ops tasks.
+That mode writes only to a temporary DB copy, synthesizes a temporary smoke-only title suffix so repeated validation runs do not collide with prior planner-ops tasks, and reports the cleanup explicitly in output.
 
 ## Templates
 
@@ -90,7 +90,7 @@ python3 scripts/task_quick.py --title "Verify planner preflight smoke" --repo CE
 
 Expected smoke output pattern:
 ```
-Planner-ops preflight smoke 2: pass
+Planner-ops preflight smoke: pass
   task_id:      CENTRAL-OPS-999
   template:     planner-ops
   repo:         CENTRAL
@@ -102,9 +102,10 @@ Planner-ops preflight smoke 2: pass
   created_state:todo
   created_ver:  v1
   smoke_db:     /tmp/.../central_tasks_smoke.db
+  cleanup:      temp smoke DB removed after validation
 ```
 
-In smoke mode, `task_quick.py` adds a temporary `[{task_id} smoke]` suffix to the scaffold title before preflight and `task-create` run against the copied DB. That keeps the user-facing command stable while avoiding exact-duplicate blockers when earlier smoke tasks already exist in the source DB.
+In smoke mode, `task_quick.py` adds a temporary smoke-only marker suffix to the scaffold title before preflight and `task-create` run against the copied DB. That keeps the user-facing command stable while avoiding exact-duplicate blockers when earlier smoke tasks already exist in the source DB.
 
 # Remove deprecated layer
 python3 scripts/task_quick.py --title "Remove .worker-reports layer" --repo CENTRAL --template cleanup

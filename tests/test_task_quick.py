@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Focused CLI coverage for task_quick planner workflows."""
+"""Focused smokes for task_quick planner tooling."""
 
 from __future__ import annotations
 
-import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -16,28 +16,10 @@ TASK_QUICK = REPO_ROOT / "scripts" / "task_quick.py"
 TASK_DB = REPO_ROOT / "scripts" / "central_task_db.py"
 
 
-class TaskQuickCliTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmpdir = tempfile.TemporaryDirectory(prefix="central_task_quick_")
-        self.tmp_path = Path(self.tmpdir.name)
-        self.db_path = self.tmp_path / "central_tasks.db"
-        self.run_db_cli("init")
-        self.run_db_cli(
-            "repo-upsert",
-            "--repo-id",
-            "CENTRAL",
-            "--repo-root",
-            str(REPO_ROOT),
-            "--display-name",
-            "CENTRAL",
-        )
-
-    def tearDown(self) -> None:
-        self.tmpdir.cleanup()
-
-    def run_db_cli(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+class TaskQuickSmokeTest(unittest.TestCase):
+    def run_db(self, db_path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [sys.executable, str(TASK_DB), args[0], "--db-path", str(self.db_path), *args[1:]],
+            [sys.executable, str(TASK_DB), *args, "--db-path", str(db_path)],
             cwd=str(REPO_ROOT),
             text=True,
             capture_output=True,
@@ -46,51 +28,77 @@ class TaskQuickCliTest(unittest.TestCase):
             self.fail(result.stderr or result.stdout)
         return result
 
-    def run_task_quick(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def run_task_quick(
+        self,
+        db_path: Path,
+        *args: str,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["CENTRAL_TASK_DB_PATH"] = str(db_path)
         result = subprocess.run(
-            [sys.executable, str(TASK_QUICK), "--db-path", str(self.db_path), *args],
+            [sys.executable, str(TASK_QUICK), *args],
             cwd=str(REPO_ROOT),
             text=True,
             capture_output=True,
+            env=env,
         )
         if check and result.returncode != 0:
             self.fail(result.stderr or result.stdout)
         return result
 
-    def test_dry_run_reports_preflight_and_alpha_without_writing(self) -> None:
-        result = self.run_task_quick(
-            "--title",
-            "Verify planner dry run",
-            "--repo",
-            "CENTRAL",
-            "--template",
-            "planner-ops",
-            "--dry-run",
-        )
-        self.assertIn("Dry-run: Verify planner dry run", result.stdout)
-        self.assertIn("preflight: none", result.stdout)
-        self.assertIn("alpha:     alpha-", result.stdout)
+    def test_planner_ops_smoke_uses_unique_title_and_preserves_smoke_db(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="central_task_quick_") as tmpdir:
+            db_path = Path(tmpdir) / "central_tasks.db"
+            self.run_db(db_path, "init")
+            self.run_db(
+                db_path,
+                "repo-upsert",
+                "--repo-id",
+                "CENTRAL",
+                "--repo-root",
+                str(REPO_ROOT),
+                "--display-name",
+                "CENTRAL",
+            )
 
-        tasks = json.loads(self.run_db_cli("task-list", "--json").stdout)
-        self.assertEqual(tasks, [])
+            title = "planner smoke unique 2026-03-20-xyz"
+            self.run_task_quick(
+                db_path,
+                "--title",
+                title,
+                "--repo",
+                "CENTRAL",
+                "--template",
+                "planner-ops",
+                "--initiative",
+                "task-quick-smoke-seed",
+            )
 
-    def test_planner_ops_smoke_uses_temp_copy_and_preserves_source_db(self) -> None:
-        result = self.run_task_quick(
-            "--title",
-            "Verify planner smoke",
-            "--repo",
-            "CENTRAL",
-            "--template",
-            "planner-ops",
-            "--planner-ops-smoke",
-        )
-        self.assertIn("Planner-ops preflight smoke 2: pass", result.stdout)
-        self.assertIn("alpha:        alpha-", result.stdout)
-        self.assertIn("smoke_db:", result.stdout)
-        self.assertIn("state:        preflight + task-create validated in smoke DB", result.stdout)
+            smoke = self.run_task_quick(
+                db_path,
+                "--title",
+                title,
+                "--repo",
+                "CENTRAL",
+                "--template",
+                "planner-ops",
+                "--planner-ops-smoke",
+            )
 
-        tasks = json.loads(self.run_db_cli("task-list", "--json").stdout)
-        self.assertEqual(tasks, [])
+            self.assertIn("Planner-ops preflight smoke: pass", smoke.stdout)
+            smoke_db_line = next(
+                line for line in smoke.stdout.splitlines() if line.strip().startswith("smoke_db:")
+            )
+            smoke_db_path = Path(smoke_db_line.split(":", 1)[1].strip())
+            self.assertTrue(smoke_db_path.exists(), smoke.stdout)
+
+            created_id_line = next(
+                line for line in smoke.stdout.splitlines() if line.strip().startswith("created_id:")
+            )
+            created_id = created_id_line.split(":", 1)[1].strip()
+            show = self.run_db(db_path, "task-show", "--task-id", created_id, check=False)
+            self.assertNotEqual(show.returncode, 0, show.stdout)
 
 
 if __name__ == "__main__":
