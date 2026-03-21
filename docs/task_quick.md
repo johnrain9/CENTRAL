@@ -1,6 +1,9 @@
 # task_quick — Streamlined Task Creation
 
 `scripts/task_quick.py` is a planner-facing wrapper around `planner-new` + `task-create` that reduces task creation to 2 required flags.
+It now runs `task-preflight` automatically, injects the preflight payload, and only then calls `task-create`.
+In planner-ops smoke mode, the command runs the same pipeline against a temporary copied DB and includes the temporary DB path in output for traceability.
+If `--initiative` is omitted, `task_quick.py` defaults it to `one-off` so the 2-flag path still works even though initiative is now required at the DB layer.
 
 ## Minimum Usage
 
@@ -8,7 +11,10 @@
 python3 scripts/task_quick.py --title "Fix login bug" --repo MOTO_HELPER
 ```
 
-That's it. The tool picks the `feature` template by default, allocates the next `CENTRAL-OPS` task ID, fills all required fields from the template, and persists the task to the DB.
+That's it. The tool picks the `feature` template by default, allocates the next `CENTRAL-OPS` task ID, fills required fields from the template, defaults initiative to `one-off`, and persists the task to the DB.
+Use `--dry-run` for a safe validation path that runs preflight and prints planned task metadata without writing.
+For planner-ops-specific smoke output, use `--planner-ops-smoke`.
+That mode writes only to a temporary DB copy and synthesizes a temporary smoke-only title suffix so repeated validation runs do not collide with prior planner-ops tasks.
 
 ## Templates
 
@@ -78,6 +84,28 @@ python3 scripts/task_quick.py --title "Add health adapter" --repo PHOTO_AUTO_TAG
 # End-to-end validation run
 python3 scripts/task_quick.py --title "Validate voice PTT on real desktop" --repo CENTRAL --template validation
 
+# Planner preflight validation without persistence
+python3 scripts/task_quick.py --title "Verify preflight integration" --repo CENTRAL --template planner-ops --dry-run
+python3 scripts/task_quick.py --title "Verify planner preflight smoke" --repo CENTRAL --template planner-ops --planner-ops-smoke
+
+Expected smoke output pattern:
+```
+Planner-ops preflight smoke 2: pass
+  task_id:      CENTRAL-OPS-999
+  template:     planner-ops
+  repo:         CENTRAL
+  series:       CENTRAL-OPS
+  priority:     50
+  preflight:    strong_overlap (token: abc...)
+  alpha:        alpha-1234abcd56
+  created_id:   CENTRAL-OPS-999
+  created_state:todo
+  created_ver:  v1
+  smoke_db:     /tmp/.../central_tasks_smoke.db
+```
+
+In smoke mode, `task_quick.py` adds a temporary `[{task_id} smoke]` suffix to the scaffold title before preflight and `task-create` run against the copied DB. That keeps the user-facing command stable while avoiding exact-duplicate blockers when earlier smoke tasks already exist in the source DB.
+
 # Remove deprecated layer
 python3 scripts/task_quick.py --title "Remove .worker-reports layer" --repo CENTRAL --template cleanup
 
@@ -106,6 +134,7 @@ python3 scripts/task_quick.py --title "Debug transaction nesting" --repo PHOTO_A
 |---|---|---|
 | `--title` | yes | Task title |
 | `--repo` | yes | Target repo ID or alias |
+| `--db-path` | no | Override the CENTRAL DB path (useful for isolated smoke tests) |
 | `--template` | no | Template name (default: `feature`) |
 | `--series` | no | Task ID series (default: `CENTRAL-OPS`) |
 | `--priority` | no | Override priority (0–100) |
@@ -117,6 +146,8 @@ python3 scripts/task_quick.py --title "Debug transaction nesting" --repo PHOTO_A
 | `--acceptance` | no | Override acceptance criteria |
 | `--testing` | no | Override testing section |
 | `--reconciliation` | no | Override reconciliation section |
+| `--dry-run` | no | Run preflight/validation and skip DB write |
+| `--planner-ops-smoke` | no | Planner-ops preflight smoke mode: runs planner-new, task-preflight, and task-create against a temporary DB copy; exits non-zero on preflight validation mismatch |
 | `--depends-on` | no | Dependency task ID (repeatable) |
 | `--initiative` | no | Initiative/epic tag for grouping (e.g. `dispatcher-infrastructure`) |
 | `--list-templates` | no | Print template details and exit |

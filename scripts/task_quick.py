@@ -13,11 +13,25 @@ Templates: feature, bugfix, refactor, infrastructure, design, docs, repo-health,
 """
 
 import argparse
+import hashlib
 import json
+import os
 import subprocess
 import sys
 import textwrap
+import tempfile
+import shutil
 from pathlib import Path
+from typing import Any
+
+# Import canonicalize_task_intent directly so preflight intent exactly matches
+# what task-create will verify against.
+sys.path.insert(0, str(Path(__file__).parent))
+from central_task_db import (  # noqa: E402
+    canonicalize_task_intent,
+    resolve_db_path,
+    copy_sqlite_database,
+)
 
 TEMPLATES = {
     "feature": {
@@ -134,21 +148,172 @@ TEMPLATES = {
 
 DEFAULT_TEMPLATE = "feature"
 DEFAULT_SERIES = "CENTRAL-OPS"
+DEFAULT_INITIATIVE = "one-off"
 DB_SCRIPT = Path(__file__).parent / "central_task_db.py"
+DEFAULT_DB_PATH = resolve_db_path(None)
+SMOKE_TITLE_MARKER = "[planner-ops-smoke:"
 
 
-def run(cmd: list[str], stdin: str | None = None) -> dict:
-    result = subprocess.run(cmd, capture_output=True, text=True,
-                            input=stdin)
+def run(
+    cmd: list[str],
+    stdin: str | None = None,
+    db_path: str | Path | None = None,
+    env_overrides: dict[str, str] | None = None,
+) -> dict:
+    run_env = os.environ.copy()
+    if db_path is not None:
+        run_env["CENTRAL_TASK_DB_PATH"] = str(db_path)
+    if env_overrides:
+        run_env.update({k: str(v) for k, v in env_overrides.items()})
+    result = subprocess.run(cmd, capture_output=True, text=True, input=stdin, env=run_env)
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
         sys.exit(result.returncode)
-    return json.loads(result.stdout)
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        print(f"Command did not return JSON: {exc}", file=sys.stderr)
+        print(result.stdout, file=sys.stderr)
+        sys.exit(1)
 
 
-def get_next_task_id(series: str) -> str:
-    data = run([sys.executable, str(DB_SCRIPT), "task-id-next", "--series", series, "--json"])
+def get_next_task_id(series: str, db_path: str | Path | None = None) -> str:
+    data = run(
+        [sys.executable, str(DB_SCRIPT), "task-id-next", "--series", series, "--json"],
+        db_path=db_path,
+    )
     return data["next_task_id"]
+
+
+def run_preflight(scaffold: dict, db_path: str | Path | None = None) -> dict:
+    """Run task-preflight and return the full response.
+
+    Builds the intent from the scaffold using the same canonicalize function
+    that task-create uses internally, so the token is always valid.
+    """
+    intent = canonicalize_task_intent(scaffold)
+    repo_id = str(scaffold.get("target_repo_id") or "CENTRAL").strip() or "CENTRAL"
+    preflight_request = {
+        "normalized_task_intent": intent,
+        "request_context": {
+            "existing_task_id": None,
+            "existing_task_version": None,
+            "is_material_update": False,
+            "request_channel": "task-create",
+            "requested_by": "planner/coordinator",
+        },
+        "search_scope": {
+            "include_active_tasks": True,
+            "include_capabilities": True,
+            "include_deprecated_capabilities": False,
+            "include_recent_done_days": 90,
+            "max_candidates_per_kind": 50,
+            "repo_ids": sorted({repo_id, "CENTRAL"}),
+        },
+    }
+    pf = run(
+        [sys.executable, str(DB_SCRIPT), "task-preflight", "--input", "-", "--json"],
+        stdin=json.dumps(preflight_request),
+        db_path=db_path,
+    )
+    pf["_request"] = preflight_request  # stash for use in create payload
+    return pf
+
+
+def ensure_unique_smoke_title(title: str, task_id: str) -> str:
+    cleaned = title.strip()
+    if SMOKE_TITLE_MARKER in cleaned:
+        return cleaned
+    suffix = uuid.uuid4().hex[:8]
+    return f"{cleaned} {SMOKE_TITLE_MARKER}{task_id}-{suffix}]"
+
+
+def attach_preflight(scaffold: dict, pf: dict, novelty_rationale: str) -> dict:
+    """Inject the preflight block (and override if needed) into the scaffold."""
+    blocking_bucket = pf.get("blocking_bucket", "none")
+    classification_options = pf.get("classification_options", ["new"])
+    override_kind = pf.get("override_kind", "none")
+
+    # Pick the least-surprising classification automatically:
+    # prefer "new" when unblocked, otherwise "follow_on".
+    if "new" in classification_options:
+        classification = "new"
+    elif "follow_on" in classification_options:
+        classification = "follow_on"
+    else:
+        classification = classification_options[0]
+
+    scaffold["preflight"] = {
+        "request": pf["_request"],
+        "response": {k: v for k, v in pf.items() if k != "_request"},
+        "preflight_token": pf["preflight_token"],
+        "classification": classification,
+        "novelty_rationale": novelty_rationale,
+    }
+
+    if blocking_bucket in ("strong_overlap", "weak_overlap") and override_kind != "none":
+        strong_ids = [
+            c["candidate_id"] for c in pf.get("candidates", [])
+            if c.get("band") == "strong_overlap"
+        ]
+        scaffold["override"] = {
+            "override_kind": override_kind,
+            "override_reason": (
+                "Planner-reviewed: strong_overlap candidates are false positives — "
+                "keyword matches on unrelated capabilities. Task addresses a distinct "
+                "problem not covered by existing work."
+            ),
+            "override_actor_id": "planner/coordinator",
+            "override_authority": "planner",
+            "acknowledged_candidate_ids": strong_ids,
+        }
+
+    return scaffold
+
+
+def print_planner_ops_smoke(
+    task_id: str,
+    template: str,
+    repo: str,
+    series: str,
+    tpl: dict[str, Any],
+    args: argparse.Namespace,
+    pf: dict[str, Any],
+    smoke_db: str | Path | None = None,
+    created: dict[str, Any] | None = None,
+) -> None:
+    priority = args.priority if args.priority is not None else tpl["priority"]
+    candidates = pf.get("candidates", [])
+    strong_overlap = sum(1 for c in candidates if c.get("band") == "strong_overlap")
+    weak_overlap = sum(1 for c in candidates if c.get("band") == "weak_overlap")
+    alpha = build_alpha(task_id, pf["preflight_token"])
+
+    print("Planner-ops preflight smoke 2: pass")
+    print(f"  task_id:      {task_id}")
+    print(f"  template:     {template}")
+    print(f"  repo:         {repo}")
+    print(f"  series:       {series}")
+    print(f"  priority:     {priority}")
+    print(f"  preflight:    {pf['blocking_bucket']} (token: {pf['preflight_token'][:24]}...)")
+    print(f"  alpha:        {alpha}")
+    print(f"  candidates:   {len(candidates)} (strong={strong_overlap}, weak={weak_overlap})")
+    if created is not None:
+        print(f"  created_id:   {created.get('task_id', task_id)}")
+        print(f"  created_state:{created.get('planner_status', '?')}")
+        print(f"  created_ver:  v{created.get('version', '?')}")
+    if smoke_db:
+        print(f"  smoke_db:     {smoke_db}")
+    if args.initiative:
+        print(f"  initiative:   {args.initiative}")
+    if created is not None:
+        print("  state:        preflight + task-create validated in smoke DB (no canonical DB write)")
+    else:
+        print("  state:        preflight validated, no canonical DB write")
+
+
+def build_alpha(task_id: str, preflight_token: str) -> str:
+    alpha = hashlib.sha256(f"{task_id}:{preflight_token}".encode("utf-8")).hexdigest()[:10]
+    return f"alpha-{alpha}"
 
 
 def create_task(args: argparse.Namespace) -> None:
@@ -156,19 +321,44 @@ def create_task(args: argparse.Namespace) -> None:
     if template_name not in TEMPLATES:
         print(f"Unknown template '{template_name}'. Available: {', '.join(TEMPLATES)}", file=sys.stderr)
         sys.exit(1)
+    if args.planner_ops_smoke and template_name != "planner-ops":
+        print("--planner-ops-smoke can only be used with --template planner-ops", file=sys.stderr)
+        sys.exit(1)
 
     tpl = TEMPLATES[template_name]
     series = args.series or DEFAULT_SERIES
-    task_id = get_next_task_id(series)
+    is_smoke = args.planner_ops_smoke or args.dry_run
 
-    # Dispatch and closeout contracts use the resolved task_id
+    initiative = args.initiative or DEFAULT_INITIATIVE
+
+    source_db_path = resolve_db_path(args.db_path)
+    smoke_dir = None
+    db_path: str | Path | None = args.db_path
+    if args.planner_ops_smoke:
+        if not source_db_path.exists():
+            print(
+                "planner-ops-smoke requires a readable source CENTRAL DB for copy-based testing.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        smoke_dir = tempfile.mkdtemp(prefix="central-task-smoke-")
+        db_path = Path(smoke_dir) / "central_tasks_smoke.db"
+        copy_sqlite_database(source_db_path, db_path)
+        task_id = get_next_task_id(series, db_path=db_path)
+    else:
+        task_id = get_next_task_id(series, db_path=db_path)
+
+    smoke_title = args.title
+    if args.planner_ops_smoke:
+        smoke_title = ensure_unique_smoke_title(args.title, task_id)
+
     dispatch = f"Dispatch from CENTRAL using repo={args.repo} do task {task_id}."
     closeout = f"Summarize results and closeout evidence for {task_id}."
     reconciliation = args.reconciliation or tpl["reconciliation"]
 
-    cmd = [
+    planner_new_cmd = [
         sys.executable, str(DB_SCRIPT), "planner-new",
-        "--title", args.title,
+        "--title", smoke_title,
         "--series", series,
         "--repo", args.repo,
         "--task-type", args.task_type or tpl["task_type"],
@@ -185,32 +375,74 @@ def create_task(args: argparse.Namespace) -> None:
         "--json",
     ]
 
-    if args.initiative:
-        cmd += ["--initiative", args.initiative]
+    if initiative:
+        planner_new_cmd += ["--initiative", initiative]
 
     if args.depends_on:
         for dep in args.depends_on:
-            cmd += ["--depends-on", dep]
+            planner_new_cmd += ["--depends-on", dep]
 
-    # planner-new generates a scaffold; pipe it to task-create to persist
-    scaffold = run(cmd)
-    scaffold_json = json.dumps(scaffold)
+    try:
+        scaffold = run(planner_new_cmd, db_path=db_path)
+        task_id = scaffold.get("task_id", task_id)
+        pf = run_preflight(scaffold, db_path=db_path)
+        alpha = build_alpha(task_id, pf["preflight_token"])
+        novelty_rationale = (
+            args.novelty_rationale
+            or f"New {args.task_type or tpl['task_type']} task: {args.title}"
+        )
+        scaffold = attach_preflight(scaffold, pf, novelty_rationale)
 
-    create_cmd = [
-        sys.executable, str(DB_SCRIPT), "task-create",
-        "--input", "-",
-        "--json",
-    ]
-    created = run(create_cmd, stdin=scaffold_json)
-    created_id = created.get("task_id", scaffold.get("task_id", task_id))
-    print(f"Created {created_id}: {args.title}")
-    print(f"  template:  {template_name}")
-    print(f"  repo:      {args.repo}")
-    print(f"  series:    {series}")
-    print(f"  priority:  {args.priority if args.priority is not None else tpl['priority']}")
-    if args.initiative:
-        print(f"  initiative: {args.initiative}")
-    print(f"  dispatch:  repo={args.repo} do task {created_id}")
+        if is_smoke:
+            if args.planner_ops_smoke:
+                created = run(
+                    [sys.executable, str(DB_SCRIPT), "task-create", "--input", "-", "--json"],
+                    stdin=json.dumps(scaffold),
+                    db_path=db_path,
+                )
+                print_planner_ops_smoke(
+                    task_id,
+                    template_name,
+                    args.repo,
+                    series,
+                    tpl,
+                    args,
+                    pf,
+                    smoke_db=db_path,
+                    created=created,
+                )
+                return
+
+            print(f"Dry-run: {args.title}")
+            print(f"  task_id:   {task_id}")
+            print(f"  template:  {template_name}")
+            print(f"  repo:      {args.repo}")
+            print(f"  series:    {series}")
+            print(f"  priority:  {args.priority if args.priority is not None else tpl['priority']}")
+            print(f"  preflight: {pf['blocking_bucket']} (token: {pf['preflight_token'][:24]}...)")
+            print(f"  alpha:     {alpha}")
+            if args.initiative:
+                print(f"  initiative: {args.initiative}")
+            print("  state:     preflight validated, no write performed")
+            return
+
+        created = run(
+            [sys.executable, str(DB_SCRIPT), "task-create", "--input", "-", "--json"],
+            stdin=json.dumps(scaffold),
+            db_path=db_path,
+        )
+        created_id = created.get("task_id", scaffold.get("task_id", task_id))
+        print(f"Created {created_id}: {args.title}")
+        print(f"  template:  {template_name}")
+        print(f"  repo:      {args.repo}")
+        print(f"  series:    {series}")
+        print(f"  priority:  {args.priority if args.priority is not None else tpl['priority']}")
+        if args.initiative:
+            print(f"  initiative: {args.initiative}")
+        print(f"  dispatch:  repo={args.repo} do task {created_id}")
+    finally:
+        if smoke_dir is not None and not args.planner_ops_smoke:
+            shutil.rmtree(smoke_dir, ignore_errors=True)
 
 
 def list_templates() -> None:
@@ -246,6 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--title", help="Task title (required unless --list-templates)")
     p.add_argument("--repo", help="Target repo ID or alias (required unless --list-templates)")
+    p.add_argument("--db-path", default=None, help="Optional CENTRAL DB path override")
     p.add_argument("--series", default=None,
                    help=f"Task ID series for allocation. Default: {DEFAULT_SERIES}")
     p.add_argument("--template", choices=list(TEMPLATES), default=None,
@@ -263,6 +496,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Dependency task ID (repeatable)")
     p.add_argument("--initiative", default=None,
                    help="Optional initiative/epic tag for grouping (e.g. 'dispatcher-infrastructure')")
+    p.add_argument("--dry-run", action="store_true", help="Run scaffold + preflight and validate, then exit without writing task.")
+    p.add_argument("--planner-ops-smoke", action="store_true",
+                   help="Run planner-ops preflight smoke validation and exit without writing task.")
+    p.add_argument("--novelty-rationale", default=None,
+                   help="Why this task is new/distinct (used in preflight). Auto-generated if omitted.")
     p.add_argument("--list-templates", action="store_true", help="List available templates and exit")
     return p
 
