@@ -15,6 +15,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -236,6 +237,36 @@ def task_payload(
         },
         "dependencies": [],
     }
+
+
+def attach_preflight(
+    conn: task_db.sqlite3.Connection,
+    payload: dict[str, object],
+    *,
+    actor_id: str = "dispatcher.tests",
+) -> dict[str, object]:
+    request = task_db.canonicalize_preflight_request(
+        {
+            "normalized_task_intent": task_db.canonicalize_task_intent(payload),
+            "search_scope": {"repo_ids": [str(payload["target_repo_id"])]},
+            "request_context": {
+                "requested_by": actor_id,
+                "request_channel": "task-create",
+            },
+        }
+    )
+    response = task_db.build_task_preflight_response(conn, request)
+    enriched = dict(payload)
+    enriched["preflight"] = {
+        "request": request,
+        "response": response,
+        "preflight_token": response["preflight_token"],
+        "classification": response["classification_options"][0],
+        "novelty_rationale": "No material overlap detected in dispatcher test setup.",
+        "related_task_ids": [],
+        "related_capability_ids": [],
+    }
+    return enriched
 
 
 class BuildersTest(unittest.TestCase):
@@ -489,12 +520,23 @@ class DispatcherIntegrationTest(unittest.TestCase):
         _remove_tree(self._tmp_path)
         self.dispatcher = None
 
-    def create_task(self, task_id: str, *, execution_metadata: dict[str, object] | None = None) -> None:
-        payload = task_payload(task_id, execution_metadata=execution_metadata)
+    def create_task(
+        self,
+        task_id: str,
+        *,
+        execution_metadata: dict[str, object] | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        payload = task_payload(task_id, execution_metadata=execution_metadata, metadata=metadata)
         conn = task_db.connect(self.db_path)
         try:
             with conn:
-                task_db.create_task_graph(conn, payload, actor_kind="test", actor_id="dispatcher.tests")
+                task_db.create_task_graph(
+                    conn,
+                    attach_preflight(conn, payload),
+                    actor_kind="test",
+                    actor_id="dispatcher.tests",
+                )
         finally:
             conn.close()
 
@@ -506,6 +548,66 @@ class DispatcherIntegrationTest(unittest.TestCase):
             return snapshots[0]
         finally:
             conn.close()
+
+    def _set_runtime_done(self, task_id: str, notes: str = "test runtime done") -> None:
+        conn = task_db.connect(self.db_path)
+        try:
+            task_db.runtime_transition(
+                conn,
+                task_id=task_id,
+                status="done",
+                worker_id=None,
+                error_text=None,
+                notes=notes,
+                artifacts=[],
+                actor_id="dispatcher.tests",
+            )
+        finally:
+            conn.close()
+
+    def _make_worker_state(self, task_id: str) -> dispatcher_module.ActiveWorker:
+        snapshot = self.fetch_snapshot(task_id)
+        run_id = f"run-{task_id.lower()}"
+        worker_path = self.state_dir / "workers" / task_id
+        worker_path.mkdir(parents=True, exist_ok=True)
+        return dispatcher_module.ActiveWorker(
+            task=snapshot,
+            worker_id=f"central-worker:test:{task_id}",
+            run_id=run_id,
+            pid=1234,
+            proc=None,
+            log_handle=None,
+            prompt_path=worker_path / f"{run_id}.md",
+            result_path=worker_path / f"{run_id}.json",
+            log_path=worker_path / f"{run_id}.log",
+            process_start_token=None,
+            started_at=None,
+            start_monotonic=None,
+            last_heartbeat_monotonic=0.0,
+            timeout_seconds=30,
+        )
+
+    def _setup_parent_and_audit(self, task_id: str) -> tuple[str, str]:
+        self.create_task(task_id, metadata={"audit_required": True})
+        conn = task_db.connect(self.db_path)
+        try:
+            parent_before = task_db.fetch_task_snapshots(conn, task_id=task_id)[0]
+            audit_task_id = str((parent_before.get("metadata") or {}).get("child_audit_task_id") or f"{task_id}-AUDIT")
+            task_db.reconcile_task(
+                conn,
+                task_id=task_id,
+                expected_version=int(parent_before["version"]),
+                outcome="awaiting_audit",
+                summary="implementation complete",
+                notes="ready for audit",
+                tests="synthetic",
+                artifacts=[],
+                actor_kind="planner",
+                actor_id="dispatcher.tests",
+            )
+        finally:
+            conn.close()
+        return task_id, audit_task_id
 
     def test_stub_cycle_moves_task_to_done(self) -> None:
         task_id = "CENTRAL-OPS-5901"
@@ -536,6 +638,97 @@ class DispatcherIntegrationTest(unittest.TestCase):
         for key in REQUIRED_WORKER_FIELDS:
             self.assertIn(key, payload, f"missing required key: {key}")
         autonomy_runner.validate_worker_payload(payload, task_id=task_id, run_id=payload["run_id"])
+
+    def test_reconcile_done_audit_pass_routes_and_forwards_raw_payload(self) -> None:
+        parent_task_id, audit_task_id = self._setup_parent_and_audit("CENTRAL-OPS-5905")
+        self._set_runtime_done(audit_task_id, notes="audit completed")
+        state = self._make_worker_state(audit_task_id)
+        raw_payload = {"status": "COMPLETED", "verdict": "accepted", "task_id": audit_task_id, "run_id": state.run_id}
+
+        with mock.patch.object(dispatcher_module.task_db, "reconcile_audit_pass", wraps=task_db.reconcile_audit_pass) as pass_mock:
+            self.dispatcher._reconcile_done(
+                state,
+                result=SimpleNamespace(verdict="accepted"),
+                notes="audit passed",
+                tests="n/a",
+                result_artifacts=[],
+                raw_result_payload=raw_payload,
+            )
+
+        pass_mock.assert_called_once()
+        self.assertEqual(pass_mock.call_args.kwargs["worker_result"], raw_payload)
+        audit_snapshot = self.fetch_snapshot(audit_task_id)
+        parent_snapshot = self.fetch_snapshot(parent_task_id)
+        self.assertEqual(audit_snapshot["planner_status"], "done")
+        self.assertEqual(parent_snapshot["planner_status"], "done")
+        self.assertEqual((parent_snapshot.get("metadata") or {}).get("audit_verdict"), "accepted")
+
+    def test_reconcile_done_audit_pass_accepts_pass_and_done_aliases(self) -> None:
+        for verdict in ("pass", "done"):
+            with self.subTest(verdict=verdict):
+                parent_task_id, audit_task_id = self._setup_parent_and_audit(f"CENTRAL-OPS-59-{verdict}-v")
+                self._set_runtime_done(audit_task_id, notes="audit completed")
+                state = self._make_worker_state(audit_task_id)
+
+                self.dispatcher._reconcile_done(
+                    state,
+                    result=SimpleNamespace(verdict=verdict),
+                    notes=f"audit {verdict}",
+                    tests=None,
+                    result_artifacts=[],
+                    raw_result_payload={"status": "COMPLETED", "verdict": verdict},
+                )
+
+                audit_snapshot = self.fetch_snapshot(audit_task_id)
+                parent_snapshot = self.fetch_snapshot(parent_task_id)
+                self.assertEqual(audit_snapshot["planner_status"], "done")
+                self.assertEqual(parent_snapshot["planner_status"], "done")
+
+    def test_reconcile_done_audit_rework_requeues_parent_and_audit(self) -> None:
+        parent_task_id, audit_task_id = self._setup_parent_and_audit("CENTRAL-OPS-5906")
+        self._set_runtime_done(audit_task_id, notes="audit completed")
+        state = self._make_worker_state(audit_task_id)
+
+        self.dispatcher._reconcile_done(
+            state,
+            result=SimpleNamespace(verdict="rework_required"),
+            notes="critical failure: add missing raw payload handoff",
+            tests="n/a",
+            result_artifacts=[],
+            raw_result_payload=None,
+        )
+
+        audit_snapshot = self.fetch_snapshot(audit_task_id)
+        parent_snapshot = self.fetch_snapshot(parent_task_id)
+        self.assertEqual(audit_snapshot["planner_status"], "todo")
+        self.assertEqual((audit_snapshot.get("runtime") or {}).get("runtime_status"), "queued")
+        self.assertEqual(parent_snapshot["planner_status"], "todo")
+        self.assertEqual((parent_snapshot.get("runtime") or {}).get("runtime_status"), "queued")
+        parent_meta = parent_snapshot.get("metadata") or {}
+        self.assertEqual(parent_meta.get("audit_verdict"), "rework_required")
+        self.assertEqual(parent_meta.get("rework_count"), 1)
+
+    def test_reconcile_done_generic_auto_reconcile_path(self) -> None:
+        task_id = "CENTRAL-OPS-5907"
+        self.create_task(task_id)
+        self._set_runtime_done(task_id, notes="worker completed")
+        state = self._make_worker_state(task_id)
+
+        with mock.patch.object(dispatcher_module.task_db, "auto_reconcile_runtime_success", wraps=task_db.auto_reconcile_runtime_success) as auto_mock:
+            self.dispatcher._reconcile_done(
+                state,
+                result=SimpleNamespace(verdict="accepted"),
+                notes="runtime completed successfully",
+                tests="synthetic=pass",
+                result_artifacts=["/tmp/runtime-artifact.txt"],
+                raw_result_payload=None,
+            )
+
+        auto_mock.assert_called_once()
+        snapshot = self.fetch_snapshot(task_id)
+        closeout = (snapshot.get("metadata") or {}).get("closeout") or {}
+        self.assertEqual(snapshot["planner_status"], "done")
+        self.assertEqual(closeout.get("source"), "runtime_auto_reconcile")
 
 
 class DispatcherConfigTest(unittest.TestCase):
@@ -568,13 +761,13 @@ class DispatcherConfigTest(unittest.TestCase):
                         repo_root=str(REPO_ROOT),
                         display_name="CENTRAL",
                     )
-                    task_payload_obj = task_payload("CENTRAL-OPS-5904")
-                    task_db.create_task_graph(
-                        conn,
-                        task_payload_obj,
-                        actor_kind="test",
-                        actor_id="dispatcher.tests",
-                    )
+                task_payload_obj = task_payload("CENTRAL-OPS-5904")
+                task_db.create_task_graph(
+                    conn,
+                    attach_preflight(conn, task_payload_obj),
+                    actor_kind="test",
+                    actor_id="dispatcher.tests",
+                )
             finally:
                 conn.close()
 
@@ -618,8 +811,13 @@ class DispatcherConfigTest(unittest.TestCase):
                         repo_root=str(REPO_ROOT),
                         display_name="CENTRAL",
                     )
-                    payload = task_payload("CENTRAL-OPS-5900")
-                    task_db.create_task_graph(conn, payload, actor_kind="test", actor_id="dispatcher.tests")
+                payload = task_payload("CENTRAL-OPS-5900")
+                task_db.create_task_graph(
+                    conn,
+                    attach_preflight(conn, payload),
+                    actor_kind="test",
+                    actor_id="dispatcher.tests",
+                )
             finally:
                 conn.close()
 
@@ -668,6 +866,34 @@ class DispatcherConfigTest(unittest.TestCase):
             return snapshots[0]
         finally:
             conn.close()
+
+    def test_create_task_graph_requires_preflight_but_helper_satisfies_it(self) -> None:
+        with managed_tmpdir("central-runtime-v2-preflight-helper-") as tmp_path:
+            db_path = tmp_path / "central_tasks.db"
+            conn = task_db.connect(db_path)
+            try:
+                task_db.apply_migrations(conn, task_db.load_migrations(task_db.resolve_migrations_dir(None)))
+                with conn:
+                    task_db.ensure_repo(
+                        conn,
+                        repo_id="CENTRAL",
+                        repo_root=str(REPO_ROOT),
+                        display_name="CENTRAL",
+                    )
+                payload = task_payload("CENTRAL-OPS-5905")
+                with self.assertRaises(SystemExit):
+                    task_db.create_task_graph(conn, payload, actor_kind="test", actor_id="dispatcher.tests")
+                task_db.create_task_graph(
+                    conn,
+                    attach_preflight(conn, payload),
+                    actor_kind="test",
+                    actor_id="dispatcher.tests",
+                )
+            finally:
+                conn.close()
+
+            snapshot = self.fetch_snapshot(db_path=db_path, task_id="CENTRAL-OPS-5905")
+            self.assertEqual(snapshot["task_id"], "CENTRAL-OPS-5905")
 
 
 class RepoHealthCheckTest(unittest.TestCase):
