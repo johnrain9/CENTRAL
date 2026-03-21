@@ -17,7 +17,7 @@ from typing import Iterable
 from urllib.parse import urlsplit
 
 
-REPO_DIR = Path("/home/cobra/aimSoloAnalysis")
+REPO_DIR = Path(os.environ.get("CENTRAL_AIM_ROOT", str(Path.home() / "projects" / "aimSoloAnalysis")))
 STATE_DIR = Path.home() / ".local" / "state" / "aimsolo"
 BACKEND_PORT = 8000
 DEFAULT_UI_PORT = 5173

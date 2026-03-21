@@ -18,11 +18,10 @@ Key references:
 - Dispatcher: `python3 scripts/dispatcher_control.py --help`
 - Dispatch snippets: `skills/multi-repo-planner/references/dispatch-and-status.md`
 
-## Critical: machine-specific paths
+## Critical: portable paths
 
-This repo was originally developed on a machine at `/home/cobra/`. It now runs on `/Users/paul/projects/`.
+All repos live under `$HOME/projects/` (i.e. `$PROJECTS_DIR`). Scripts must never hardcode `/home/cobra/` or `/Users/paul/` — always use `REPO_ROOT.parent / "repo_name"` or an env-overridable form.
 
-**`/home/cobra/photo_auto_tagging` does not exist on this machine.** The Dispatcher/autonomy module lives at `/Users/paul/projects/Dispatcher`.
-
-- `AUTONOMY_ROOT` in `scripts/central_runtime.py` **must** use the env-overridable form: `Path(os.environ.get("CENTRAL_AUTONOMY_ROOT", str(REPO_ROOT.parent / "Dispatcher")))`. Do not change it to a hardcoded path.
-- Any doc references to `/home/cobra/...` are stale. The canonical paths are `/Users/paul/projects/CENTRAL` and `/Users/paul/projects/Dispatcher`.
+- `AUTONOMY_ROOT` in `scripts/central_runtime.py` **must** use: `Path(os.environ.get("CENTRAL_AUTONOMY_ROOT", str(REPO_ROOT.parent / "Dispatcher")))`.
+- `AIM_ROOT` / `MOTO_ROOT` in `scripts/repo_health.py` use `CENTRAL_AIM_ROOT` / `CENTRAL_MOTO_ROOT` env vars, defaulting to `REPO_ROOT.parent / repo_name`.
+- Any remaining doc references to `/home/cobra/...` are stale legacy — do not propagate them.

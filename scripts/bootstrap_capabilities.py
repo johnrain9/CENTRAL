@@ -365,7 +365,7 @@ CAPABILITY_SPECS: list[dict[str, Any]] = [
         "when_to_use_md": "Use when surfacing post-task repo health, test counts, or coverage freshness in planner/operator workflows.",
         "do_not_use_for_md": "Do not assume every repo snapshot implies a fully passing test suite; snapshot metadata records failures too.",
         "entrypoints": [
-            "python3 scripts/repo_health_check.py /Users/paul/projects/CENTRAL",
+            "python3 scripts/repo_health_check.py $PROJECTS_DIR/CENTRAL",
             "python3 scripts/central_task_db.py health-snapshot-latest --repo CENTRAL",
         ],
         "keywords": ["repo-health", "snapshot", "tests", "coverage"],

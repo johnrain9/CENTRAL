@@ -31,8 +31,8 @@ from tools.repo_health.contract import (
 
 DISPATCHER_DEFAULT_ROOT = REPO_ROOT
 ECO_ROOT = Path(os.environ.get("CENTRAL_ECO_ROOT", str(REPO_ROOT.parent / "ecosystem")))
-AIM_ROOT = Path("/home/cobra/aimSoloAnalysis")
-MOTO_ROOT = Path("/home/cobra/motoHelper")
+AIM_ROOT = Path(os.environ.get("CENTRAL_AIM_ROOT", str(REPO_ROOT.parent / "aimSoloAnalysis")))
+MOTO_ROOT = Path(os.environ.get("CENTRAL_MOTO_ROOT", str(REPO_ROOT.parent / "motoHelper")))
 LEGACY_STATUS_MAP = {
     "ok": "pass",
     "warn": "warn",
