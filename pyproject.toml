@@ -9,12 +9,13 @@ dependencies = []
 test = [
   "pytest>=8.2,<9",
   "pytest-cov>=5,<7",
+  "pytest-timeout>=4.2",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "scripts/tests"]
 pythonpath = ["scripts"]
-addopts = "-ra"
+addopts = "-ra --timeout=300"
 
 [tool.coverage.run]
 branch = true
