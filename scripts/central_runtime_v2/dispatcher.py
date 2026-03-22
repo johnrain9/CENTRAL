@@ -121,18 +121,73 @@ def process_matches(pid: int | None, expected_start_token: str | None) -> bool:
     return current == expected_start_token if current is not None else False
 
 
-def terminate_process(pid: int | None, proc: subprocess.Popen[str] | None) -> None:
-    if proc is not None:
+def terminate_process(
+    pid: int | None,
+    proc: subprocess.Popen[str] | None,
+    pgid: int | None = None,
+) -> None:
+    """Send SIGTERM to the worker's process group, then SIGKILL after a grace period.
+
+    Using start_new_session=True at spawn means the worker PID is also the PGID,
+    so killing the group terminates cargo builds, claude subprocesses, and any other
+    children that would otherwise become orphans.
+    """
+    # Resolve pgid: prefer the stored value, fall back to looking up from proc/pid.
+    _pgid = pgid
+    if _pgid is None and proc is not None:
         try:
-            proc.terminate()
-            return
-        except Exception:
+            _pgid = os.getpgid(proc.pid)
+        except OSError:
             pass
-    if pid and pid > 0:
+    if _pgid is None and pid and pid > 0:
+        try:
+            _pgid = os.getpgid(pid)
+        except OSError:
+            pass
+
+    if _pgid and _pgid > 0:
+        try:
+            os.killpg(_pgid, signal.SIGTERM)
+        except OSError:
+            pass
+
+        def _deferred_sigkill(pgid: int) -> None:
+            time.sleep(5)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+
+        threading.Thread(target=_deferred_sigkill, args=(_pgid,), daemon=True).start()
+    elif pid and pid > 0:
+        # Fallback: plain SIGTERM if we couldn't determine a pgid.
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
+
+
+def _kill_orphan_pgid(pgid: int | None, logger: Any, task_id: str) -> None:
+    """Kill an orphaned process group left behind by a dead worker.
+
+    Called during startup adoption when the worker PID is gone but the process
+    group may still contain orphaned children (e.g. cargo test, claude CLI).
+    """
+    if not pgid or pgid <= 0:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        logger.emit("INF", "central.dispatcher", f"orphan_pgid_sigterm pgid={pgid} task={task_id}")
+    except OSError:
+        return
+    # Deferred SIGKILL for anything that ignored SIGTERM.
+    def _deferred(pgid: int) -> None:
+        time.sleep(5)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+    threading.Thread(target=_deferred, args=(pgid,), daemon=True).start()
 
 
 def connect_initialized(db_path: Path):
@@ -166,6 +221,9 @@ class CentralDispatcher:
         self._capacity_backoff_until: float = 0.0
         self._spark_quota_exhausted: bool = False
         self._health_snapshot_last_run: dict[str, float] = {}
+        self._notify_queue: list[dict] = []
+        self._notify_last_sent: float = 0.0
+        self._notify_batch_seconds: float = 300.0  # max one notification per 5 min
 
     def _capacity_backoff_active(self) -> bool:
         """Return True if the dispatcher is currently in a capacity backoff window."""
@@ -213,6 +271,7 @@ class CentralDispatcher:
         payload = {
             "run_id": state.run_id,
             "worker_pid": state.pid,
+            "worker_pgid": state.pgid,
             "worker_process_start_token": state.process_start_token,
             "worker_mode": self.config.worker_mode,
             "prompt_path": str(state.prompt_path),
@@ -491,10 +550,16 @@ class CentralDispatcher:
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             text=True,
+            start_new_session=True,
         )
         if stdin_mode == subprocess.PIPE and proc.stdin is not None:
             proc.stdin.write(prompt_text)
             proc.stdin.close()
+
+        try:
+            worker_pgid: int | None = os.getpgid(proc.pid)
+        except OSError:
+            worker_pgid = None
 
         started_at = datetime.now(timezone.utc).replace(microsecond=0)
         state = ActiveWorker(
@@ -511,31 +576,28 @@ class CentralDispatcher:
             started_at=started_at,
             start_monotonic=time.monotonic(),
             last_heartbeat_monotonic=time.monotonic(),
-            timeout_seconds=int((snapshot.get("execution") or {}).get("timeout_seconds") or 1800),
+            timeout_seconds=int((snapshot.get("execution") or {}).get("timeout_seconds") or 3600),
             selected_worker_model=str(worker_task["worker_model"]) if worker_task.get("worker_model") else None,
             selected_worker_model_source=str(worker_task["worker_model_source"]) if worker_task.get("worker_model_source") else None,
             selected_worker_backend=effective_backend,
+            pgid=worker_pgid,
         )
         try:
             self._persist_worker_supervision(state, handoff={})
         except Exception:
-            terminate_process(state.pid, state.proc)
+            terminate_process(state.pid, state.proc, pgid=state.pgid)
             self._close_worker_state(state)
             raise
 
-        self.logger.emit(
-            "INF",
-            "central.dispatcher",
-            " ".join(
-                item
-                for item in [
-                    f"worker_spawned task={snapshot['task_id']} run={run_id} pid={proc.pid} mode={effective_backend}{_title_kv(snapshot)}",
-                    f"model={worker_task.get('worker_model', '-')}",
-                    f"model_source={worker_task.get('worker_model_source', '-')}",
-                ]
-                if item
-            ),
-        )
+        log_parts = [
+            f"worker_spawned task={snapshot['task_id']} run={run_id} pid={proc.pid} mode={effective_backend}{_title_kv(snapshot)}",
+            f"model={worker_task.get('worker_model', '-')}",
+            f"model_source={worker_task.get('worker_model_source', '-')}",
+        ]
+        if self.config.audit_worker_model:
+            log_parts.append(f"impl_model={self.config.default_worker_model}")
+            log_parts.append(f"audit_model={self.config.audit_worker_model}")
+        self.logger.emit("INF", "central.dispatcher", " ".join(p for p in log_parts if p))
         self._active[snapshot["task_id"]] = state
         self._emit_status_heartbeat(force=True)
 
@@ -565,13 +627,17 @@ class CentralDispatcher:
                 pid = int(worker_pid)
             except (TypeError, ValueError):
                 continue
+            try:
+                adopted_pgid: int | None = int(supervision["worker_pgid"])
+            except (TypeError, ValueError, KeyError):
+                adopted_pgid = None
             prompt_path = Path(str(supervision.get("prompt_path") or self.paths.worker_prompts_dir / snapshot["task_id"] / f"{run_id}.md"))
             result_path = Path(str(supervision.get("result_path") or self.paths.worker_results_dir / snapshot["task_id"] / f"{run_id}.json"))
             log_path = Path(str(supervision.get("log_path") or self.paths.worker_logs_dir / snapshot["task_id"] / f"{run_id}.log"))
             try:
-                timeout_seconds = int(supervision.get("timeout_seconds") or (snapshot.get("execution") or {}).get("timeout_seconds") or 1800)
+                timeout_seconds = int(supervision.get("timeout_seconds") or (snapshot.get("execution") or {}).get("timeout_seconds") or 3600)
             except (TypeError, ValueError):
-                timeout_seconds = int((snapshot.get("execution") or {}).get("timeout_seconds") or 1800)
+                timeout_seconds = int((snapshot.get("execution") or {}).get("timeout_seconds") or 3600)
             state = ActiveWorker(
                 task=snapshot,
                 worker_id=str(lease.get("lease_owner_id") or runtime.get("claimed_by") or ""),
@@ -591,8 +657,12 @@ class CentralDispatcher:
                 selected_worker_model=normalize_optional_string(supervision.get("worker_model") or supervision.get("codex_model")),
                 selected_worker_model_source=normalize_optional_string(supervision.get("worker_model_source") or supervision.get("codex_model_source")),
                 selected_worker_backend=normalize_optional_string(supervision.get("worker_backend") or supervision.get("worker_mode")),
+                pgid=adopted_pgid,
             )
             if not process_matches(state.pid, state.process_start_token):
+                # Worker PID is gone but its process group may have orphaned children
+                # (e.g. cargo builds, claude subprocesses). Kill the group now.
+                _kill_orphan_pgid(state.pgid, self.logger, snapshot["task_id"])
                 if state.result_path.exists() or state.log_path.exists() or state.prompt_path.exists():
                     handoff_state = (metadata.get("handoff") or {}).get("state", "")
                     was_interrupted = handoff_state in {"interrupted_by_restart", "pending_adoption"}
@@ -697,25 +767,73 @@ class CentralDispatcher:
         except Exception:
             return False
 
-    def _maybe_notify(self, *, title: str, runtime_status: str, summary: str | None = None) -> None:
+    def _maybe_notify(self, *, title: str, runtime_status: str, summary: str | None = None, task_id: str | None = None) -> None:
         if not self.config.notify:
             return
-        import subprocess as _subprocess
+        # Only notify for actionable failures — success is visible via menu bar pulse.
         if runtime_status in {"done", "pending_review"}:
-            notif_title = f"\u2705 {title}"
-            sound = "Glass"
-        elif runtime_status == "timeout":
-            notif_title = f"\u23f1 {title}"
-            sound = "Basso"
+            return
+        self._notify_queue.append({
+            "title": title,
+            "runtime_status": runtime_status,
+            "summary": summary,
+            "task_id": task_id,
+        })
+        self._flush_notify_if_due()
+
+    def _flush_notify_if_due(self) -> None:
+        if not self._notify_queue:
+            return
+        if time.monotonic() - self._notify_last_sent < self._notify_batch_seconds:
+            return
+        self._send_batched_notification()
+
+    def _send_batched_notification(self) -> None:
+        import shutil as _shutil
+        import subprocess as _subprocess
+        pending = self._notify_queue[:]
+        self._notify_queue.clear()
+        self._notify_last_sent = time.monotonic()
+
+        done = [n for n in pending if n["runtime_status"] in {"done", "pending_review"}]
+        failed = [n for n in pending if n["runtime_status"] not in {"done", "pending_review"}]
+        any_failed = bool(failed)
+
+        if len(pending) == 1:
+            n = pending[0]
+            if n["runtime_status"] in {"done", "pending_review"}:
+                notif_title = f"\u2705 {n['title']}"
+                sound = "Glass"
+            elif n["runtime_status"] == "timeout":
+                notif_title = f"\u23f1 {n['title']}"
+                sound = "Basso"
+            else:
+                notif_title = f"\u274c {n['title']}"
+                sound = "Basso"
+            body = (n["summary"] or n["runtime_status"])[:100]
+            open_url = f"http://localhost:7099/#{n['task_id']}" if n.get("task_id") else "http://localhost:7099/"
         else:
-            notif_title = f"\u274c {title}"
-            sound = "Basso"
-        body = (summary or runtime_status)[:100].replace('"', '\\"')
-        notif_title = notif_title.replace('"', '\\"')
-        _subprocess.run(
-            ["osascript", "-e", f'display notification "{body}" with title "{notif_title}" sound name "{sound}"'],
-            check=False,
-        )
+            parts = []
+            if done:
+                parts.append(f"\u2705 {len(done)} done")
+            if failed:
+                parts.append(f"\u274c {len(failed)} failed")
+            notif_title = ", ".join(parts)
+            sound = "Basso" if any_failed else "Glass"
+            ids = [n["task_id"] for n in pending if n.get("task_id")]
+            body = ", ".join(ids[:5]) + ("…" if len(ids) > 5 else "")
+            open_url = "http://localhost:7099/"
+
+        if _shutil.which("terminal-notifier"):
+            cmd = ["terminal-notifier", "-title", notif_title, "-message", body, "-sound", sound, "-open", open_url]
+            _subprocess.run(cmd, check=False)
+        else:
+            body_esc = body.replace('"', '\\"')
+            title_esc = notif_title.replace('"', '\\"')
+            _subprocess.run(
+                ["osascript", "-e", f'display notification "{body_esc}" with title "{title_esc}" sound name "{sound}"'],
+                check=False,
+            )
 
     # ------------------------------------------------------------------
     # _finalize_worker helpers
@@ -1059,7 +1177,7 @@ class CentralDispatcher:
                         actor_id="central.dispatcher",
                     )
                 self.logger.emit("INF", "central.dispatcher", f"worker_timeout task={task_id} run={state.run_id}{_title_kv(state.task)}")
-                self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status="timeout", summary="hard timeout exceeded")
+                self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status="timeout", summary="hard timeout exceeded", task_id=task_id)
                 return
 
             runtime_status, notes, error_text, tests, result, raw_result_payload, result_artifacts, extra_artifacts = (
@@ -1080,7 +1198,7 @@ class CentralDispatcher:
                         artifacts=result_artifacts,
                         actor_id="central.dispatcher",
                     )
-                self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status=runtime_status, summary=notes or error_text)
+                self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status=runtime_status, summary=notes or error_text, task_id=task_id)
                 if runtime_status == "done":
                     self._reconcile_done(state, result=result, notes=notes, tests=tests, result_artifacts=result_artifacts, raw_result_payload=raw_result_payload)
                     self._run_health_snapshot_in_background(
@@ -1103,7 +1221,7 @@ class CentralDispatcher:
         for task_id, state in list(self._active.items()):
             elapsed = self._worker_elapsed_seconds(state)
             if elapsed > state.timeout_seconds:
-                terminate_process(state.pid, state.proc)
+                terminate_process(state.pid, state.proc, pgid=state.pgid)
                 self._finalize_worker(state, timed_out=True)
                 self._close_worker_state(state)
                 self._active.pop(task_id, None)
@@ -1259,7 +1377,7 @@ class CentralDispatcher:
                             )
                         except Exception:
                             pass
-                        terminate_process(state.pid, state.proc)
+                        terminate_process(state.pid, state.proc, pgid=state.pgid)
                     break
                 if self._stop_requested:
                     self._prepare_handoff()
@@ -1268,6 +1386,7 @@ class CentralDispatcher:
                 if not self._stop_requested:
                     self._fill_workers()
                 self._emit_status_heartbeat()
+                self._flush_notify_if_due()
                 time.sleep(max(0.2, self.config.poll_interval))
         finally:
             for state in list(self._active.values()):

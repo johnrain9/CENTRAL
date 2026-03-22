@@ -104,6 +104,7 @@ class ActiveWorker:
     selected_worker_model: str | None = None
     selected_worker_model_source: str | None = None
     selected_worker_backend: str | None = None
+    pgid: int | None = None
 
 
 @dataclass

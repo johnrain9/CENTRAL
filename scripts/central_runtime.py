@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -93,6 +94,7 @@ class ActiveWorker:
     selected_worker_model: str | None = None
     selected_worker_model_source: str | None = None
     selected_worker_backend: str | None = None
+    pgid: int | None = None
 
 
 @dataclass
@@ -233,18 +235,72 @@ def process_matches(pid: int | None, expected_start_token: str | None) -> bool:
     return current == expected_start_token if current is not None else False
 
 
-def terminate_process(pid: int | None, proc: subprocess.Popen[str] | None) -> None:
-    if proc is not None:
+def terminate_process(
+    pid: int | None,
+    proc: subprocess.Popen[str] | None,
+    pgid: int | None = None,
+) -> None:
+    """Send SIGTERM to the worker's process group, then SIGKILL after a grace period.
+
+    Using start_new_session=True at spawn means the worker PID is also the PGID,
+    so killing the group terminates cargo builds, claude subprocesses, and any other
+    children that would otherwise become orphans.
+    """
+    _pgid = pgid
+    if _pgid is None and proc is not None:
         try:
-            proc.terminate()
-            return
-        except Exception:
+            _pgid = os.getpgid(proc.pid)
+        except OSError:
             pass
-    if pid and pid > 0:
+    if _pgid is None and pid and pid > 0:
+        try:
+            _pgid = os.getpgid(pid)
+        except OSError:
+            pass
+
+    if _pgid and _pgid > 0:
+        try:
+            os.killpg(_pgid, signal.SIGTERM)
+        except OSError:
+            pass
+
+        def _deferred_sigkill(pgid: int) -> None:
+            time.sleep(5)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+
+        threading.Thread(target=_deferred_sigkill, args=(_pgid,), daemon=True).start()
+    elif pid and pid > 0:
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
+
+
+def _kill_orphan_pgid(pgid: int | None, logger: Any, task_id: str) -> None:
+    """Kill an orphaned process group left behind by a dead worker.
+
+    Called during startup adoption when the worker PID is gone but the process
+    group may still contain orphaned children (e.g. cargo test, claude CLI).
+    """
+    if not pgid or pgid <= 0:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        logger.emit("INF", "central.dispatcher", f"orphan_pgid_sigterm pgid={pgid} task={task_id}")
+    except OSError:
+        return
+
+    def _deferred(pgid: int) -> None:
+        time.sleep(5)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    threading.Thread(target=_deferred, args=(pgid,), daemon=True).start()
 
 
 def read_lock(lock_path: Path) -> dict[str, Any] | None:
@@ -1376,6 +1432,7 @@ class CentralDispatcher:
         payload = {
             "run_id": state.run_id,
             "worker_pid": state.pid,
+            "worker_pgid": state.pgid,
             "worker_process_start_token": state.process_start_token,
             "worker_mode": self.config.worker_mode,
             "prompt_path": str(state.prompt_path),
@@ -1648,10 +1705,16 @@ class CentralDispatcher:
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             text=True,
+            start_new_session=True,
         )
         if stdin_mode == subprocess.PIPE and proc.stdin is not None:
             proc.stdin.write(prompt_text)
             proc.stdin.close()
+
+        try:
+            worker_pgid: int | None = os.getpgid(proc.pid)
+        except OSError:
+            worker_pgid = None
 
         started_at = datetime.now(timezone.utc).replace(microsecond=0)
         state = ActiveWorker(
@@ -1668,15 +1731,16 @@ class CentralDispatcher:
             started_at=started_at,
             start_monotonic=time.monotonic(),
             last_heartbeat_monotonic=time.monotonic(),
-            timeout_seconds=int((snapshot.get("execution") or {}).get("timeout_seconds") or 1800),
+            timeout_seconds=int((snapshot.get("execution") or {}).get("timeout_seconds") or 3600),
             selected_worker_model=str(worker_task["worker_model"]) if worker_task.get("worker_model") else None,
             selected_worker_model_source=str(worker_task["worker_model_source"]) if worker_task.get("worker_model_source") else None,
             selected_worker_backend=effective_backend,
+            pgid=worker_pgid,
         )
         try:
             self._persist_worker_supervision(state, handoff={})
         except Exception:
-            terminate_process(state.pid, state.proc)
+            terminate_process(state.pid, state.proc, pgid=state.pgid)
             self._close_worker_state(state)
             raise
 
@@ -1722,13 +1786,17 @@ class CentralDispatcher:
                 pid = int(worker_pid)
             except (TypeError, ValueError):
                 continue
+            try:
+                adopted_pgid: int | None = int(supervision["worker_pgid"])
+            except (TypeError, ValueError, KeyError):
+                adopted_pgid = None
             prompt_path = Path(str(supervision.get("prompt_path") or self.paths.worker_prompts_dir / snapshot["task_id"] / f"{run_id}.md"))
             result_path = Path(str(supervision.get("result_path") or self.paths.worker_results_dir / snapshot["task_id"] / f"{run_id}.json"))
             log_path = Path(str(supervision.get("log_path") or self.paths.worker_logs_dir / snapshot["task_id"] / f"{run_id}.log"))
             try:
-                timeout_seconds = int(supervision.get("timeout_seconds") or (snapshot.get("execution") or {}).get("timeout_seconds") or 1800)
+                timeout_seconds = int(supervision.get("timeout_seconds") or (snapshot.get("execution") or {}).get("timeout_seconds") or 3600)
             except (TypeError, ValueError):
-                timeout_seconds = int((snapshot.get("execution") or {}).get("timeout_seconds") or 1800)
+                timeout_seconds = int((snapshot.get("execution") or {}).get("timeout_seconds") or 3600)
             state = ActiveWorker(
                 task=snapshot,
                 worker_id=str(lease.get("lease_owner_id") or runtime.get("claimed_by") or ""),
@@ -1748,8 +1816,10 @@ class CentralDispatcher:
                 selected_worker_model=normalize_optional_string(supervision.get("worker_model") or supervision.get("codex_model")),
                 selected_worker_model_source=normalize_optional_string(supervision.get("worker_model_source") or supervision.get("codex_model_source")),
                 selected_worker_backend=normalize_optional_string(supervision.get("worker_backend") or supervision.get("worker_mode")),
+                pgid=adopted_pgid,
             )
             if not process_matches(state.pid, state.process_start_token):
+                _kill_orphan_pgid(state.pgid, self.logger, snapshot["task_id"])
                 if state.result_path.exists() or state.log_path.exists() or state.prompt_path.exists():
                     handoff_state = (metadata.get("handoff") or {}).get("state", "")
                     was_interrupted = handoff_state in {"interrupted_by_restart", "pending_adoption"}
@@ -2100,7 +2170,7 @@ class CentralDispatcher:
         for task_id, state in list(self._active.items()):
             elapsed = self._worker_elapsed_seconds(state)
             if elapsed > state.timeout_seconds:
-                terminate_process(state.pid, state.proc)
+                terminate_process(state.pid, state.proc, pgid=state.pgid)
                 self._finalize_worker(state, timed_out=True)
                 self._close_worker_state(state)
                 self._active.pop(task_id, None)
@@ -2256,7 +2326,7 @@ class CentralDispatcher:
                             )
                         except Exception:
                             pass
-                        terminate_process(state.pid, state.proc)
+                        terminate_process(state.pid, state.proc, pgid=state.pgid)
                     break
                 if self._stop_requested:
                     self._prepare_handoff()
