@@ -124,8 +124,12 @@ class DaemonLog:
         if message.startswith("worker_spawned "):
             mode = fields.get("mode", "-")
             model = fields.get("model", "")
+            impl_model = fields.get("impl_model", "")
+            audit_model = fields.get("audit_model", "")
             extra = f"mode={mode}"
-            if model and model not in ("-", ""):
+            if impl_model and audit_model:
+                extra += f" impl={impl_model} audit={audit_model}"
+            elif model and model not in ("-", ""):
                 extra += f" model={model}"
             return task_line("→", "START", self.GREEN, extra, self.CYAN)
         if message.startswith("worker_finished "):

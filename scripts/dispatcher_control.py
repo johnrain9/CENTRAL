@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -20,6 +21,12 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import central_runtime_v2 as central_runtime
 from central_runtime_v2.config import ALLOWED_CODEX_MODELS, ALLOWED_REASONING_EFFORTS
+
+ALLOWED_CLAUDE_MODELS: list[str] = [
+    "claude-sonnet-4-6",
+    "claude-opus-4-6",
+    "claude-haiku-4-5-20251001",
+]
 
 REPO_DIR = Path(os.environ.get("CENTRAL_DISPATCHER_REPO_DIR", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
 RUNTIME_SCRIPT = Path(os.environ.get("CENTRAL_DISPATCHER_RUNTIME_SCRIPT", str(REPO_DIR / "scripts" / "central_runtime_v2" / "__main__.py")))
@@ -415,14 +422,6 @@ def resolve_worker_model(cli_value: str | None, *, restart: bool) -> ResolvedWor
     env_value = env_codex_model()
     if env_value is not None:
         return ResolvedWorkerModel(value=env_value, source="model_env")
-    if restart:
-        payload = running_lock_payload() or {}
-        running_value = payload.get("default_worker_model") or payload.get("default_codex_model")
-        if running_value is not None:
-            return ResolvedWorkerModel(
-                value=central_runtime.normalize_codex_model(running_value, label="running dispatcher worker model"),
-                source="running_daemon",
-            )
     persisted = saved_worker_model()
     if persisted is not None:
         return ResolvedWorkerModel(value=persisted, source="saved_config")
@@ -690,6 +689,73 @@ def _effective_db_path() -> str:
     return DB_PATH or str(REPO_DIR / "state" / "central_tasks.db")
 
 
+DEFAULT_REPO_MAX_CONCURRENT_WORKERS = 3
+
+
+def _open_db_rw() -> sqlite3.Connection:
+    conn = sqlite3.connect(_effective_db_path())
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def show_repo_config(*, repo: str | None = None, max_workers: int | None = None, as_json: bool = False) -> int:
+    """Show or update per-repo concurrency caps."""
+    conn = _open_db_rw()
+    try:
+        if max_workers is not None:
+            if not repo:
+                print("--repo is required when setting --max-workers", file=sys.stderr)
+                return 1
+            row = conn.execute("SELECT metadata_json FROM repos WHERE repo_id = ?", (repo,)).fetchone()
+            if row is None:
+                print(f"Repo not found: {repo!r}", file=sys.stderr)
+                return 1
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            meta["max_concurrent_workers"] = max_workers
+            conn.execute(
+                "UPDATE repos SET metadata_json = ? WHERE repo_id = ?",
+                (json.dumps(meta), repo),
+            )
+            conn.commit()
+            print(f"Set {repo} max_concurrent_workers={max_workers}")
+
+        where = "WHERE repo_id = ?" if repo else ""
+        params = (repo,) if repo else ()
+        rows = conn.execute(
+            f"SELECT repo_id, metadata_json FROM repos {where} ORDER BY repo_id", params
+        ).fetchall()
+
+        result = []
+        for row in rows:
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            cap = meta.get("max_concurrent_workers", DEFAULT_REPO_MAX_CONCURRENT_WORKERS)
+            is_default = "max_concurrent_workers" not in meta
+            result.append({
+                "repo_id": row["repo_id"],
+                "max_concurrent_workers": cap,
+                "is_default": is_default,
+            })
+
+        if as_json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"\n{'Repo':<24} {'Max Workers':<12} {'Source'}")
+            print(f"{'----':<24} {'-----------':<12} {'------'}")
+            for r in result:
+                src = "default" if r["is_default"] else "configured"
+                print(f"{r['repo_id']:<24} {r['max_concurrent_workers']:<12} {src}")
+            print()
+        return 0
+    finally:
+        conn.close()
+
+
 def _run_self_check_stub() -> dict[str, object]:
     result = subprocess.run(
         [PYTHON_BIN, str(RUNTIME_SCRIPT), "self-check"],
@@ -843,6 +909,28 @@ def prompt_worker_mode(default: str) -> str:
         selected = options.get(key)
         if selected:
             return selected
+
+
+def prompt_worker_model_select(label: str, default: str, mode: str) -> str:
+    """Numbered selection for worker/audit model; never free-form."""
+    if mode == "codex":
+        choices = sorted(ALLOWED_CODEX_MODELS)
+    else:
+        choices = list(ALLOWED_CLAUDE_MODELS)
+    numbered = {str(i + 1): m for i, m in enumerate(choices)}
+    reverse = {m: str(i + 1) for i, m in enumerate(choices)}
+    default_key = reverse.get(default, "1")
+    while True:
+        print(f"{label}:")
+        for k, m in numbered.items():
+            marker = " *" if m == default else ""
+            print(f"  {k}. {m}{marker}")
+        raw = prompt_line(f"Select [{default_key}]: ")
+        key = default_key if raw == "" else raw
+        selected = numbered.get(key)
+        if selected:
+            return selected
+        print(f"Enter a number 1–{len(choices)}.")
         print("Invalid selection.")
 
 
@@ -873,6 +961,7 @@ def print_menu_header() -> None:
     print("  9. Run once")
     print(" 10. Run check")
     print(" 11. Kill task")
+    print(" 12. Repo concurrency caps")
     print("  0. Exit")
     print()
 
@@ -881,12 +970,15 @@ def run_start_or_restart(*, restart: bool) -> int:
     workers_default = resolve_max_workers(None, restart=restart).value
     model_default = resolve_worker_model(None, restart=restart).value
     mode_default = saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
+    audit_default = saved_audit_model() or model_default
     notify_default = saved_notify() or False
 
     max_workers = prompt_positive_int("Max workers", workers_default)
-    worker_model = prompt_optional_text("Default worker model", model_default)
     worker_mode = prompt_worker_mode(mode_default)
+    worker_model = prompt_worker_model_select("Implementor model", model_default, worker_mode)
+    audit_model = prompt_worker_model_select("Audit model", audit_default, worker_mode)
     notify = prompt_yes_no("Enable notifications", notify_default)
+    save_config(audit_model=audit_model)
     return start_dispatcher(
         restart=restart,
         max_workers=max_workers,
@@ -900,18 +992,33 @@ def run_config_update() -> int:
     workers_default = saved_max_workers() or resolve_max_workers(None, restart=False).value
     model_default = saved_worker_model() or resolve_worker_model(None, restart=False).value
     mode_default = saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
+    audit_default = saved_audit_model() or model_default
     notify_default = saved_notify() or False
 
     max_workers = prompt_positive_int("Saved max workers", workers_default)
-    worker_model = prompt_optional_text("Saved default worker model", model_default)
     worker_mode = prompt_worker_mode(mode_default)
+    worker_model = prompt_worker_model_select("Implementor model", model_default, worker_mode)
+    audit_model = prompt_worker_model_select("Audit model", audit_default, worker_mode)
     notify = prompt_yes_no("Saved notify default", notify_default)
-    return show_config(
+    rc = show_config(
         max_workers=max_workers,
         worker_model=worker_model,
         worker_mode=worker_mode,
         notify=notify,
+        audit_model=audit_model,
     )
+
+    # Per-repo concurrency caps
+    print()
+    show_repo_config()
+    while True:
+        repo = prompt_line("Set cap for repo (leave blank to skip): ").strip()
+        if not repo:
+            break
+        cap = prompt_positive_int(f"Max concurrent workers for {repo!r}", DEFAULT_REPO_MAX_CONCURRENT_WORKERS)
+        show_repo_config(repo=repo, max_workers=cap)
+
+    return rc
 
 
 def run_workers_prompt() -> int:
@@ -980,6 +1087,9 @@ def run_menu() -> int:
             if choice == "11":
                 run_kill_task_prompt()
                 continue
+            if choice == "12":
+                show_repo_config()
+                continue
             print(f"Invalid menu option: {choice!r}")
     except MenuExitRequested:
         print("Exiting dispatcher menu.")
@@ -1040,6 +1150,11 @@ def build_parser() -> argparse.ArgumentParser:
     kill_parser.add_argument("--reason", default="operator kill requested")
     kill_parser.add_argument("--json", action="store_true")
 
+    repo_config_parser = subparsers.add_parser("repo-config", help="Show or set per-repo concurrency caps")
+    repo_config_parser.add_argument("--repo", help="Repo ID to filter or update")
+    repo_config_parser.add_argument("--max-workers", type=int, help="Max concurrent workers for this repo")
+    repo_config_parser.add_argument("--json", action="store_true", help="Output JSON")
+
     return parser
 
 
@@ -1097,6 +1212,12 @@ def main(argv: list[str]) -> int:
         )
     if cmd == "kill-task":
         return kill_task(task_id=args.task_id, reason=args.reason, as_json=getattr(args, "json", False))
+    if cmd == "repo-config":
+        return show_repo_config(
+            repo=getattr(args, "repo", None),
+            max_workers=getattr(args, "max_workers", None),
+            as_json=getattr(args, "json", False),
+        )
     parser.print_help()
     return 1
 

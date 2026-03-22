@@ -44,7 +44,7 @@ TASK_ID_RESERVATION_STATUSES = {"active", "completed", "expired"}
 DEFAULT_TASK_ID_SERIES = "CENTRAL-OPS"
 DEFAULT_TASK_ID_RESERVATION_HOURS = 48
 MAX_TASK_ID_RESERVATION_COUNT = 10
-TASK_FILE_NAME_RE = re.compile(r"^CENTRAL-OPS-[0-9]+\\.md$")
+TASK_FILE_NAME_RE = re.compile(r"^CENTRAL-OPS-[0-9]+\.md$")
 TASK_ID_RE = re.compile(r"^(?P<series>[A-Z0-9]+(?:-[A-Z0-9]+)*)-(?P<number>[0-9]+)$")
 TASK_ID_SERIES_RE = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)*$")
 REPO_MAX_CONCURRENT_WORKERS_METADATA_KEY = "max_concurrent_workers"
@@ -5774,6 +5774,13 @@ def runtime_transition(
         die(f"lease owner mismatch for {task_id}: expected {lease['lease_owner_id']}, got {worker_id}")
     transition_at = now_iso()
     current = row_to_dict(runtime_row) or {}
+    # Never regress from a clean terminal state. If the row is already done or
+    # canceled, any attempt to overwrite with timeout/failed/etc is a stale
+    # write (e.g. dispatcher timeout firing after the worker already finished).
+    _CLEAN_TERMINAL = {"done", "canceled"}
+    if current.get("runtime_status") in _CLEAN_TERMINAL and status not in _CLEAN_TERMINAL:
+        conn.rollback()
+        return current
     queue_name = current.get("queue_name")
     claimed_by = current.get("claimed_by")
     claimed_at = current.get("claimed_at")
@@ -5989,6 +5996,7 @@ def parse_task_markdown(path: Path) -> dict[str, Any]:
         "planner_status": metadata.get("Status", "todo"),
         "priority": parse_int(execution.get("Priority", 100), field=f"{task_id}.Priority"),
         "task_type": metadata.get("Task Type", "planning"),
+        "initiative": "one-off",
         "planner_owner": metadata.get("Planner Owner", "planner/coordinator"),
         "worker_owner": normalize_optional_owner(metadata.get("Worker Owner")),
         "target_repo_id": target_repo_id,
@@ -6007,7 +6015,7 @@ def parse_task_markdown(path: Path) -> dict[str, Any]:
             "sandbox_mode": execution.get("Sandbox Mode"),
             "approval_policy": execution.get("Approval Policy"),
             "additional_writable_dirs": additional_dirs if isinstance(additional_dirs, list) else [],
-            "timeout_seconds": parse_int(execution.get("Timeout Seconds", 1800), field=f"{task_id}.Timeout Seconds"),
+            "timeout_seconds": parse_int(execution.get("Timeout Seconds", 3600), field=f"{task_id}.Timeout Seconds"),
             "metadata": {},
         },
         "dependencies": re.findall(r"`([^`]+)`", sections.get("Dependencies", "")),
@@ -6050,6 +6058,7 @@ def parse_packet_tasks(path: Path) -> dict[str, dict[str, Any]]:
             "planner_status": status,
             "priority": 100,
             "task_type": "planning",
+            "initiative": "one-off",
             "planner_owner": "planner/coordinator",
             "worker_owner": None,
             "target_repo_id": repo_id,
@@ -6067,7 +6076,7 @@ def parse_packet_tasks(path: Path) -> dict[str, dict[str, Any]]:
                 "sandbox_mode": "workspace-write",
                 "approval_policy": "never",
                 "additional_writable_dirs": [],
-                "timeout_seconds": 1800,
+                "timeout_seconds": 3600,
                 "metadata": {"imported_from_packet_only": True},
             },
             "dependencies": [],
@@ -8376,7 +8385,7 @@ def build_parser() -> argparse.ArgumentParser:
     planner_new_parser.add_argument("--task-kind", default="mutating")
     planner_new_parser.add_argument("--sandbox-mode", default="workspace-write")
     planner_new_parser.add_argument("--approval-policy", default="never")
-    planner_new_parser.add_argument("--timeout-seconds", type=int, default=1800)
+    planner_new_parser.add_argument("--timeout-seconds", type=int, default=3600)
     planner_new_parser.add_argument(
         "--additional-writable-dir",
         action="append",

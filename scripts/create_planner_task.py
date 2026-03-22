@@ -40,7 +40,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "task_kind": "mutating",
         "sandbox_mode": "workspace-write",
         "approval_policy": "never",
-        "timeout_seconds": 1800,
+        "timeout_seconds": 3600,
         "audit_mode": "full",
         "dispatch": (
             "Implement in the target repo only. Use the execution settings in this task as the runtime contract."
@@ -60,7 +60,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "task_kind": "read_only",
         "sandbox_mode": "workspace-write",
         "approval_policy": "never",
-        "timeout_seconds": 1800,
+        "timeout_seconds": 3600,
         "audit_mode": "none",
         "dispatch": "Plan in CENTRAL only. Do not broaden scope beyond the stated objective and constraints.",
         "closeout": "Return the plan, assumptions, open questions, and any recommended follow-up tasks.",
@@ -72,7 +72,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "task_kind": "read_only",
         "sandbox_mode": "workspace-write",
         "approval_policy": "never",
-        "timeout_seconds": 1800,
+        "timeout_seconds": 3600,
         "audit_mode": "none",
         "dispatch": "Research within the target repo and explicitly cited sources only.",
         "closeout": "Return findings, evidence, gaps, and any follow-up actions needed.",

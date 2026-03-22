@@ -543,6 +543,9 @@ class CentralDispatcher:
         finally:
             conn.close()
 
+        # Strip ANTHROPIC_API_KEY so claude workers use the OAuth session (Claude Max)
+        # rather than a bare API key that may have no credits (e.g. ecosystem test key).
+        worker_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
         proc = subprocess.Popen(
             command,
             cwd=worker_task["repo_root"],
@@ -551,6 +554,7 @@ class CentralDispatcher:
             stderr=subprocess.STDOUT,
             text=True,
             start_new_session=True,
+            env=worker_env,
         )
         if stdin_mode == subprocess.PIPE and proc.stdin is not None:
             proc.stdin.write(prompt_text)

@@ -1942,7 +1942,15 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') closeDrawer();
 });
 
-fetchData();
+fetchData().then(() => {
+  const hash = window.location.hash.slice(1);
+  if (hash) openTaskDrawer(hash);
+});
+
+window.addEventListener('hashchange', () => {
+  const hash = window.location.hash.slice(1);
+  if (hash) openTaskDrawer(hash);
+});
 </script>
 </body>
 </html>"""

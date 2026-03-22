@@ -564,7 +564,7 @@ def run(
     repo_root: Path,
     ttl_seconds: int,
     db_path: str | None = None,
-    timeout_seconds: int = 30,
+    timeout_seconds: int = 300,
     min_coverage: float | None = None,
 ) -> tuple[dict[str, Any], bool]:
     resolved_min_coverage = resolve_min_coverage(repo_root, min_coverage)
@@ -610,7 +610,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Write a repo health snapshot for a single repo root.")
     parser.add_argument("repo_root", help="Repo root path.")
     parser.add_argument("--ttl-seconds", type=int, default=3600)
-    parser.add_argument("--timeout-seconds", type=int, default=30, help="Per-runner timeout before recording a failed snapshot.")
+    parser.add_argument("--timeout-seconds", type=int, default=300, help="Per-runner timeout before recording a failed snapshot.")
     parser.add_argument(
         "--min-coverage",
         type=float,
