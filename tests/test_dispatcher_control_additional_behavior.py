@@ -397,8 +397,10 @@ class DispatcherControlAdditionalBehaviorTest(unittest.TestCase):
             dispatcher_control, "saved_worker_mode", return_value="stub"
         ), mock.patch.object(
             dispatcher_control, "saved_notify", return_value=True
+        ), mock.patch.object(
+            dispatcher_control, "save_config"
         ), mock.patch(
-            "builtins.input", side_effect=["3", "", "", "1", "", "0"]
+            "builtins.input", side_effect=["3", "", "1", "", "", "", "0"]
         ), mock.patch.object(
             dispatcher_control, "start_dispatcher", return_value=0
         ) as start_dispatcher:

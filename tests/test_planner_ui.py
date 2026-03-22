@@ -293,6 +293,17 @@ class TestPlannerUIServer(unittest.TestCase):
         self.assertIn(b"active_desc", html)
         self.assertIn(b"active_asc", html)
 
+    def test_html_has_cmd_k_shortcut(self):
+        html = _get_html("/")
+        self.assertIn(b"metaKey", html, "cmd+k handler must check metaKey")
+        self.assertIn(b"ctrlKey", html, "ctrl+k handler must check ctrlKey")
+        self.assertIn(b"f-search", html, "cmd+k handler must target #f-search")
+        self.assertIn(b"kbd-highlight", html, "cmd+k handler must apply kbd-highlight class")
+
+    def test_html_kbd_highlight_css(self):
+        html = _get_html("/")
+        self.assertIn(b"kbd-highlight", html, "kbd-highlight CSS class must be defined")
+
     # ── Consistency with CLI ─────────────────────────────────────────────────
 
     def test_eligible_count_matches_cli(self):

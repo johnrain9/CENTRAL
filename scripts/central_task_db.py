@@ -6797,6 +6797,7 @@ def _build_batch_task_payload(
         "target_repo_root": str(resolved_repo["repo_root"]),
         "target_repo_display_name": str(resolved_repo["display_name"]),
         "approval_required": merged.get("approval_required", False),
+        "initiative": merged.get("initiative"),
         "source_kind": merged.get("source_kind", "batch_scaffold"),
         "metadata": {
             **(merged.get("metadata") or {}),

@@ -359,6 +359,261 @@ class CommandsBehaviorTest(unittest.TestCase):
         self.assertIn("execution", payload)
         self.assertEqual(payload["task_id"], commands.SELF_CHECK_TASK_ID)
 
+    def test_status_payload_handles_invalid_pid_in_lock(self) -> None:
+        fake_conn = FakeConn(rows=[], active_leases=0)
+        paths = commands.build_runtime_paths(Path("/tmp/central-runtime-bad-pid"))
+        with mock.patch("central_runtime_v2.commands.read_lock", return_value={"pid": "not-a-number"}), mock.patch(
+            "central_runtime_v2.commands.pid_alive", return_value=False
+        ), mock.patch(
+            "central_runtime_v2.commands.connect_initialized", return_value=fake_conn
+        ), mock.patch(
+            "central_runtime_v2.commands.task_db.fetch_task_snapshots", return_value=[]
+        ), mock.patch(
+            "central_runtime_v2.commands.task_db.order_eligible_snapshots", return_value=[]
+        ):
+            payload = commands.status_payload(Path("/tmp/central.db"), paths)
+
+        self.assertIsNone(payload["pid"])
+        self.assertFalse(payload["running"])
+
+    def test_status_payload_worker_model_fallback_when_worker_model_none(self) -> None:
+        fake_conn = FakeConn(rows=[], active_leases=0)
+        paths = commands.build_runtime_paths(Path("/tmp/central-runtime-fallback"))
+        with mock.patch("central_runtime_v2.commands.read_lock", return_value={
+            "pid": "555",
+            "max_workers": "2",
+            "worker_mode": None,
+            "default_worker_model": None,  # will fall back to codex model
+            "default_codex_model": "codex-fallback",
+        }), mock.patch("central_runtime_v2.commands.pid_alive", return_value=True), mock.patch(
+            "central_runtime_v2.commands.connect_initialized", return_value=fake_conn
+        ), mock.patch(
+            "central_runtime_v2.commands.task_db.fetch_task_snapshots", return_value=[]
+        ), mock.patch(
+            "central_runtime_v2.commands.task_db.order_eligible_snapshots", return_value=[]
+        ):
+            payload = commands.status_payload(Path("/tmp/central.db"), paths)
+
+        # When default_worker_model is None, it falls back to the codex model
+        self.assertEqual(payload["configured_default_codex_model"], "codex-fallback")
+        self.assertEqual(payload["configured_default_worker_model"], "codex-fallback")
+
+    def test_command_stop_returns_not_running_when_no_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = argparse.Namespace(state_dir=tmpdir, db_path=None)
+            with mock.patch("central_runtime_v2.commands.read_lock", return_value=None):
+                out = StringIO()
+                with mock.patch("sys.stdout", out):
+                    rc = commands.command_stop(args)
+
+        self.assertEqual(rc, 0)
+        self.assertIn("dispatcher_not_running", out.getvalue())
+
+    def test_command_stop_calls_die_for_invalid_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = argparse.Namespace(state_dir=tmpdir, db_path=None)
+            # die() raises SystemExit — simulate that so execution stops there
+            with mock.patch(
+                "central_runtime_v2.commands.read_lock", return_value={"pid": None}
+            ), mock.patch("central_runtime_v2.commands.die", side_effect=SystemExit(1)) as die_mock:
+                with self.assertRaises(SystemExit):
+                    commands.command_stop(args)
+
+        die_mock.assert_called_once_with("invalid dispatcher lock payload")
+
+    def test_command_status_non_json_branch_emits_json(self) -> None:
+        args = argparse.Namespace(db_path=None, state_dir=None, json=False)
+        with mock.patch("central_runtime_v2.commands.task_db.resolve_db_path", return_value=Path("/tmp/central.db")), mock.patch(
+            "central_runtime_v2.commands.resolve_state_dir", return_value=Path("/tmp/state")
+        ), mock.patch(
+            "central_runtime_v2.commands.build_runtime_paths", return_value=mock.sentinel.paths
+        ), mock.patch(
+            "central_runtime_v2.commands.ensure_runtime_dirs"
+        ), mock.patch(
+            "central_runtime_v2.commands.status_payload", return_value={"running": False}
+        ):
+            out = StringIO()
+            with mock.patch("sys.stdout", out):
+                rc = commands.command_status(args)
+
+        self.assertEqual(rc, 0)
+        self.assertIn('"running": false', out.getvalue())
+
+    def test_command_worker_status_json_branch_emits_json(self) -> None:
+        args = argparse.Namespace(db_path=None, state_dir=None, task_id=None, limit=5, recent_hours=1.0, json=True)
+        fake_payload = {
+            "summary": {"overall_status": "idle"},
+            "active_workers": [],
+            "recent_workers": [],
+        }
+        with mock.patch("central_runtime_v2.commands.task_db.resolve_db_path", return_value=Path("/tmp/central.db")), mock.patch(
+            "central_runtime_v2.commands.resolve_state_dir", return_value=Path("/tmp/state")
+        ), mock.patch(
+            "central_runtime_v2.commands.build_runtime_paths", return_value=mock.sentinel.paths
+        ), mock.patch(
+            "central_runtime_v2.commands.worker_status_payload", return_value=fake_payload
+        ):
+            out = StringIO()
+            with mock.patch("sys.stdout", out):
+                rc = commands.command_worker_status(args)
+
+        self.assertEqual(rc, 0)
+        self.assertIn('"overall_status": "idle"', out.getvalue())
+
+    def test_worker_status_payload_headline_variants(self) -> None:
+        """Test potentially_stuck and healthy+low_activity headline paths."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            paths = commands.build_runtime_paths(state_dir)
+            commands.ensure_runtime_dirs(paths)
+
+            stuck_snapshot = {
+                "task_id": "TASK-STUCK",
+                "title": "Stuck worker",
+                "lease": {
+                    "lease_owner_id": "worker-stuck",
+                    "execution_run_id": "run-stuck",
+                    "last_heartbeat_at": "2020-01-01T00:00:00+00:00",
+                    "lease_expires_at": "2020-01-01T00:01:00+00:00",  # way in the past
+                    "lease_acquired_at": "2020-01-01T00:00:00+00:00",
+                    "metadata": {"supervision": {"worker_backend": "stub", "worker_model": None}},
+                },
+                "runtime": {
+                    "runtime_status": "running",
+                    "claimed_by": "worker-stuck",
+                    "claimed_at": "2020-01-01T00:00:00+00:00",
+                    "started_at": "2020-01-01T00:00:01+00:00",
+                    "last_transition_at": "2020-01-01T00:00:01+00:00",
+                    "retry_count": 0,
+                    "last_runtime_error": None,
+                },
+            }
+
+            with mock.patch("central_runtime_v2.commands.status_payload", return_value={"running": True}), mock.patch(
+                "central_runtime_v2.commands.connect_initialized", return_value=mock.MagicMock(close=lambda: None)
+            ), mock.patch(
+                "central_runtime_v2.commands.task_db.fetch_task_snapshots", return_value=[stuck_snapshot]
+            ), mock.patch(
+                "central_runtime_v2.commands.task_db.fetch_latest_events", return_value=[]
+            ), mock.patch(
+                "central_runtime_v2.commands.task_db.fetch_artifacts", return_value=[]
+            ):
+                payload = commands.worker_status_payload(
+                    Path("/tmp/central.db"),
+                    paths,
+                    task_id=None,
+                    recent_limit=5,
+                    recent_hours=24.0,
+                )
+
+        self.assertEqual(payload["summary"]["overall_status"], "potentially_stuck")
+        self.assertIn("stuck", payload["summary"]["headline"])
+
+    def test_worker_status_payload_idle_and_low_activity_headlines(self) -> None:
+        """Test idle headline (no active workers) and low_activity headline."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir)
+            paths = commands.build_runtime_paths(state_dir)
+            commands.ensure_runtime_dirs(paths)
+
+            # Idle: no snapshots at all
+            with mock.patch("central_runtime_v2.commands.status_payload", return_value={"running": False}), mock.patch(
+                "central_runtime_v2.commands.connect_initialized", return_value=mock.MagicMock(close=lambda: None)
+            ), mock.patch(
+                "central_runtime_v2.commands.task_db.fetch_task_snapshots", return_value=[]
+            ):
+                idle_payload = commands.worker_status_payload(
+                    Path("/tmp/central.db"), paths, task_id=None, recent_limit=5, recent_hours=24.0
+                )
+
+            self.assertEqual(idle_payload["summary"]["overall_status"], "idle")
+            self.assertIn("No active", idle_payload["summary"]["headline"])
+
+            # Low-activity: one running worker with stale-ish heartbeat and log
+            # Lease window ~70min → recent_window=120s, stale_window=600s
+            # Heartbeat age 180s: > recent_window but < stale_window → low_activity
+            low_snapshot = {
+                "task_id": "TASK-LOW",
+                "title": "Quiet worker",
+                "lease": {
+                    "lease_owner_id": "worker-low",
+                    "execution_run_id": "run-low",
+                    "last_heartbeat_at": "2026-03-20T09:58:00+00:00",  # 3min ago
+                    "lease_acquired_at": "2026-03-20T09:50:00+00:00",  # 11min ago
+                    "lease_expires_at": "2026-03-20T11:00:00+00:00",   # 59min from now
+                    "metadata": {"supervision": {}},
+                },
+                "runtime": {
+                    "runtime_status": "running",
+                    "claimed_by": "worker-low",
+                    "claimed_at": "2026-03-20T09:50:00+00:00",
+                    "started_at": "2026-03-20T09:50:01+00:00",
+                    "last_transition_at": "2026-03-20T09:50:01+00:00",
+                    "retry_count": 0,
+                    "last_runtime_error": None,
+                },
+            }
+
+            with mock.patch("central_runtime_v2.commands.status_payload", return_value={"running": True}), mock.patch(
+                "central_runtime_v2.commands.connect_initialized", return_value=mock.MagicMock(close=lambda: None)
+            ), mock.patch(
+                "central_runtime_v2.commands.task_db.fetch_task_snapshots", return_value=[low_snapshot]
+            ), mock.patch(
+                "central_runtime_v2.commands.task_db.fetch_latest_events", return_value=[]
+            ), mock.patch(
+                "central_runtime_v2.commands.task_db.fetch_artifacts", return_value=[]
+            ), mock.patch(
+                "central_runtime_v2.commands.datetime"
+            ) as fake_dt:
+                fake_dt.now.return_value = datetime(2026, 3, 20, 10, 1, 0, tzinfo=timezone.utc)
+                fake_dt.fromtimestamp.side_effect = lambda *a, **kw: datetime.fromtimestamp(*a, **kw)
+                fake_dt.fromisoformat.side_effect = lambda *a, **kw: datetime.fromisoformat(*a, **kw)
+                low_payload = commands.worker_status_payload(
+                    Path("/tmp/central.db"), paths, task_id=None, recent_limit=5, recent_hours=24.0
+                )
+
+        self.assertEqual(low_payload["summary"]["overall_status"], "healthy")
+        self.assertGreater(low_payload["summary"]["low_activity_count"], 0)
+        self.assertIn("quiet", low_payload["summary"]["headline"])
+
+    def test_command_self_check_uses_stub_worker_and_returns_zero(self) -> None:
+        args = argparse.Namespace()
+        fake_dispatcher = mock.MagicMock()
+        fake_dispatcher.run_once.return_value = 0
+
+        with mock.patch("central_runtime_v2.commands.task_db.connect") as fake_connect, mock.patch(
+            "central_runtime_v2.commands.task_db.apply_migrations"
+        ), mock.patch(
+            "central_runtime_v2.commands.task_db.load_migrations", return_value=[]
+        ), mock.patch(
+            "central_runtime_v2.commands.task_db.resolve_migrations_dir", return_value=Path("/tmp/mig")
+        ), mock.patch(
+            "central_runtime_v2.commands.task_db.ensure_repo"
+        ), mock.patch(
+            "central_runtime_v2.commands.task_db.create_task"
+        ), mock.patch(
+            "central_runtime_v2.commands.CentralDispatcher", return_value=fake_dispatcher
+        ), mock.patch(
+            "central_runtime_v2.commands.connect_initialized"
+        ) as fake_ci:
+            fake_conn = mock.MagicMock()
+            fake_task_row = mock.MagicMock()
+            fake_task_row.__getitem__ = lambda self, key: {"planner_status": "done", "runtime_status": "done", "last_runtime_error": None}[key]
+            fake_conn.execute.return_value.fetchone.return_value = fake_task_row
+            fake_ci.return_value = fake_conn
+            fake_connect.return_value.__enter__ = lambda s: s
+            fake_connect.return_value.__exit__ = mock.MagicMock(return_value=False)
+            fake_connect.return_value.close = mock.MagicMock()
+
+            out = StringIO()
+            with mock.patch("sys.stdout", out):
+                rc = commands.command_self_check(args)
+
+        self.assertEqual(rc, 0)
+        output = json.loads(out.getvalue())
+        self.assertIn("db_path", output)
+        self.assertIn("state_dir", output)
+
 
 if __name__ == "__main__":
     unittest.main()

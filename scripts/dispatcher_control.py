@@ -422,6 +422,11 @@ def resolve_worker_model(cli_value: str | None, *, restart: bool) -> ResolvedWor
     env_value = env_codex_model()
     if env_value is not None:
         return ResolvedWorkerModel(value=env_value, source="model_env")
+    if restart:
+        payload = running_lock_payload() or {}
+        running_model = payload.get("default_codex_model") or payload.get("default_worker_model")
+        if running_model:
+            return ResolvedWorkerModel(value=str(running_model), source="running_daemon")
     persisted = saved_worker_model()
     if persisted is not None:
         return ResolvedWorkerModel(value=persisted, source="saved_config")

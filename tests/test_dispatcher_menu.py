@@ -22,11 +22,14 @@ import dispatcher_control
 
 class DispatcherMenuFlowTest(unittest.TestCase):
     def test_menu_start_uses_prompted_dispatcher_args(self) -> None:
+        # Numbered menu flow: max_workers → mode → implementor_model → audit_model → notify
+        # mode default is "codex" (key "1"), model default is "gpt-5.3-codex" (key "1" in codex list)
         inputs = iter([
-            "1",  # start
+            "1",  # menu: start
             "4",  # max workers
-            "gpt-5.3-codex",  # worker model
-            "2",  # claude mode
+            "",   # mode: default (codex)
+            "",   # implementor model: default (gpt-5.3-codex in codex mode)
+            "",   # audit model: default
             "y",  # notify
             "0",  # exit
         ])
@@ -43,6 +46,8 @@ class DispatcherMenuFlowTest(unittest.TestCase):
             dispatcher_control, "saved_worker_mode", return_value="codex"
         ), mock.patch.object(
             dispatcher_control, "saved_notify", return_value=False
+        ), mock.patch.object(
+            dispatcher_control, "save_config"
         ), mock.patch(
             "builtins.input", side_effect=lambda _: next(inputs)
         ), mock.patch.object(
@@ -55,7 +60,7 @@ class DispatcherMenuFlowTest(unittest.TestCase):
             restart=False,
             max_workers=4,
             worker_model="gpt-5.3-codex",
-            worker_mode="claude",
+            worker_mode="codex",
             notify=True,
         )
 

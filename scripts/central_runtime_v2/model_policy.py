@@ -233,6 +233,31 @@ def build_worker_task(
         f"## Dispatch Contract\n{snapshot.get('dispatch_md', '').strip()}",
         f"## Closeout Contract\n{snapshot.get('closeout_md', '').strip()}",
         f"## Reconciliation\n{snapshot.get('reconciliation_md', '').strip()}",
+        (
+            "## Output Contract\n"
+            "Return valid JSON matching the worker result schema. Field guidance:\n"
+            "- status: COMPLETED, PARTIAL, BLOCKED, or FAILED\n"
+            "- summary: Brief prose narrative of what was done and the outcome\n"
+            "- decisions: Array of strings. Each significant decision made or confirmed during "
+            "the work — e.g. 'Chose X over Y because Z', 'Accepted implementation as-is "
+            "because all checks passed'. Populate with at least one entry whenever you made or "
+            "reviewed a decision. Do NOT return an empty array if decisions were made.\n"
+            "- discoveries: Array of strings. Each non-obvious thing found during the work that "
+            "was not in the original spec — e.g. 'Found that X also affects Y', 'Noticed "
+            "pre-existing issue with Z unrelated to this task'. Populate whenever something "
+            "worth surfacing was found. Do NOT return an empty array if discoveries were made.\n"
+            "- warnings: Array of strings. Each risk, concern, or issue noted even if not "
+            "blocking — e.g. 'Pre-existing unrelated modifications in worktree', 'Edge case "
+            "not covered by tests'. Populate whenever anything raised a flag. Do NOT return "
+            "an empty array if warnings apply.\n"
+            "- completed_items / remaining_items: Checklist items done vs still pending\n"
+            "- validation: Array of {name, passed, notes} for each check run\n"
+            "- files_changed: Paths of files modified\n"
+            "- verdict, requirements_assessment, system_fit_assessment, blockers, artifacts: "
+            "as applicable to this task type\n"
+            "IMPORTANT: decisions, discoveries, and warnings are machine-read for analytics. "
+            "Always populate them with substantive content — never leave all three empty."
+        ),
     ]
     task_category = snapshot.get("task_type") or "implementation"
     if task_category not in {"implementation", "truth"}:
@@ -264,7 +289,8 @@ def build_worker_task(
         result["codex_model"] = codex_model.value
         result["codex_model_source"] = codex_model.source
         raw_effort = normalize_optional_string(execution_metadata.get("codex_effort"))
-        result["codex_effort"] = raw_effort if raw_effort in ALLOWED_REASONING_EFFORTS else DEFAULT_CODEX_EFFORT
+        _spark_default = "high" if codex_model.value == "gpt-5.3-codex-spark" else DEFAULT_CODEX_EFFORT
+        result["codex_effort"] = raw_effort if raw_effort in ALLOWED_REASONING_EFFORTS else _spark_default
         # Generic aliases for codex
         result["worker_model"] = codex_model.value
         result["worker_model_source"] = codex_model.source

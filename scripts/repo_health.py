@@ -602,10 +602,14 @@ def external_legacy_payload(
     repo_root: Path,
     adapter_path: Path,
     timeout_seconds: float,
+    command_timeout_seconds: float | None = None,
 ) -> tuple[dict[str, Any] | None, CommandResult]:
     cwd = repo_root if repo_root.exists() else adapter_path.parent
+    cmd = [sys.executable, str(adapter_path), "snapshot", "--json"]
+    if command_timeout_seconds is not None:
+        cmd += ["--command-timeout", str(int(command_timeout_seconds))]
     payload, result = run_json_command(
-        [sys.executable, str(adapter_path), "snapshot", "--json"],
+        cmd,
         cwd=cwd,
         timeout_seconds=timeout_seconds,
     )
@@ -907,10 +911,14 @@ def motohelper_report(args: argparse.Namespace) -> dict[str, Any]:
 def ecosystem_report(args: argparse.Namespace) -> dict[str, Any]:
     profile = "library"
     adapter_path = env_path("CENTRAL_REPO_HEALTH_ECO_ADAPTER", ECO_ROOT / "tools" / "repo_health_adapter.py")
+    # The ecosystem adapter runs cargo test (min 120s) then cargo llvm-cov (min 300s),
+    # so the subprocess needs at least 450s. Pass --command-timeout 90 so the adapter's
+    # per-command minimums (120s tests, 300s coverage) keep the total well under 600s.
     payload, adapter_result = external_legacy_payload(
         repo_root=ECO_ROOT,
         adapter_path=adapter_path,
-        timeout_seconds=max(args.command_timeout, 300.0),
+        timeout_seconds=max(args.command_timeout, 600.0),
+        command_timeout_seconds=90.0,
     )
     evidence = [
         make_file_evidence_item("eco-cargo-toml", ECO_ROOT / "Cargo.toml", "Cargo.toml declares the ecosystem crate and its dependencies."),

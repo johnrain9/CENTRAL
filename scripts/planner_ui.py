@@ -762,6 +762,7 @@ tr.selected td { background: #1a2540; }
   font-size: 10px;
 }
 .filter-bar input { min-width: 160px; }
+.filter-bar input.kbd-highlight { outline: 2px solid var(--accent, #58a6ff); transition: outline 0.1s; }
 .filter-label { color: var(--text-dim); font-size: 10px; }
 
 /* ── Repo cards / initiatives ─────────────────────────────────────────── */
@@ -1939,7 +1940,17 @@ function fmtRelTs(isoStr) {
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeDrawer();
+  if (e.key === 'Escape') { closeDrawer(); return; }
+  if (e.key === 'k' && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    const s = document.getElementById('f-search');
+    if (s) {
+      s.focus();
+      s.select();
+      s.classList.add('kbd-highlight');
+      setTimeout(() => s.classList.remove('kbd-highlight'), 600);
+    }
+  }
 });
 
 fetchData().then(() => {

@@ -334,6 +334,131 @@ class ObservationBehaviorTest(unittest.TestCase):
             cache_path.write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
             self.assertEqual(observation.load_status_cache(cache_path), {})
 
+    def test_read_last_line_returns_empty_for_blank_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "empty.log"
+            path.write_text("   \n\n   \n", encoding="utf-8")
+            # All lines are whitespace-only so stripped lines list is empty
+            self.assertEqual(observation.read_last_line(path), "")
+
+    def test_infer_recent_run_id_returns_none_when_logs_dir_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = make_runtime_paths(root)
+            empty_task_logs_dir = paths.worker_logs_dir / "TASK-EMPTY"
+            empty_task_logs_dir.mkdir(parents=True, exist_ok=True)
+            result = observation.infer_recent_run_id("TASK-EMPTY", [], paths)
+            self.assertIsNone(result)
+
+    def test_latest_heartbeat_event_returns_none_when_absent(self) -> None:
+        events = [
+            {"event_type": "runtime.started", "created_at": "2026-03-20T10:00:00+00:00"},
+            {"event_type": "note", "created_at": "2026-03-20T10:00:01+00:00"},
+        ]
+        self.assertIsNone(observation.latest_heartbeat_event(events))
+        self.assertIsNone(observation.latest_heartbeat_event([]))
+
+    def test_classify_worker_run_lease_expired_returns_potentially_stuck(self) -> None:
+        snapshot = {
+            "runtime": {"runtime_status": "running"},
+            "lease": {
+                "lease_acquired_at": "2026-03-20T10:00:00+00:00",
+                "lease_expires_at": "2026-03-20T10:01:00+00:00",
+            },
+        }
+        state, reason = observation.classify_worker_run(
+            snapshot,
+            heartbeat_age=5.0,
+            seconds_to_lease_expiry=-1.0,  # expired
+            log_info={"age_seconds": 5.0},
+            log_growth={"bytes_since_last_inspection": 0},
+            runtime_event_age=5.0,
+            transition_age=5.0,
+        )
+        self.assertEqual(state, "potentially_stuck")
+        self.assertIn("expired", reason)
+
+    def test_classify_worker_run_returns_idle_for_unknown_status(self) -> None:
+        snapshot = {"runtime": {"runtime_status": "queued"}, "lease": {}}
+        state, reason = observation.classify_worker_run(
+            snapshot,
+            heartbeat_age=None,
+            seconds_to_lease_expiry=None,
+            log_info={"age_seconds": None},
+            log_growth={"bytes_since_last_inspection": None},
+            runtime_event_age=None,
+            transition_age=None,
+        )
+        self.assertEqual(state, "idle")
+
+    def test_worker_status_text_byte_formatting_and_edge_case_paths(self) -> None:
+        base_payload = {
+            "summary": {
+                "overall_status": "idle",
+                "headline": "No active workers.",
+                "active_count": 0,
+                "healthy_count": 0,
+                "low_activity_count": 0,
+                "potentially_stuck_count": 0,
+            },
+            "runtime_paths": {},  # no worker_results_dir key
+            "active_workers": [],
+            "recent_workers": [],
+        }
+        rendered = observation.worker_status_text(base_payload)
+        self.assertIn("- no active workers", rendered)
+        self.assertNotIn("Recent workers:", rendered)
+
+        # Test MB formatting (>= 1MB log size)
+        mb_payload = {
+            **base_payload,
+            "summary": {**base_payload["summary"], "active_count": 1, "healthy_count": 1},
+            "active_workers": [
+                {
+                    "task_id": "TASK-BIG",
+                    "run_id": "run-big",
+                    "runtime_status": "running",
+                    "observed_state": "healthy",
+                    "reason": "active",
+                    "heartbeat": {"age_seconds": 1.0},
+                    "worker": {"model": "gpt-5"},
+                    "log": {
+                        "size_bytes": 2 * 1024 * 1024,
+                        "growth": {"bytes_since_last_inspection": 0},
+                        "signal": {"state": "flat"},
+                    },
+                }
+            ],
+            "recent_workers": [],
+        }
+        mb_rendered = observation.worker_status_text(mb_payload)
+        self.assertIn("2.0MB", mb_rendered)
+
+        # Test bare bytes formatting (< 1KB)
+        byte_payload = {
+            **base_payload,
+            "summary": {**base_payload["summary"], "active_count": 1, "healthy_count": 1},
+            "active_workers": [
+                {
+                    "task_id": "TASK-TINY",
+                    "run_id": "run-tiny",
+                    "runtime_status": "running",
+                    "observed_state": "healthy",
+                    "reason": "active",
+                    "heartbeat": {"age_seconds": None},
+                    "worker": {"model": None},
+                    "log": {
+                        "size_bytes": 512,
+                        "growth": {"bytes_since_last_inspection": None},
+                        "signal": {"state": "flat"},
+                    },
+                }
+            ],
+            "recent_workers": [],
+        }
+        byte_rendered = observation.worker_status_text(byte_payload)
+        self.assertIn("512B", byte_rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
