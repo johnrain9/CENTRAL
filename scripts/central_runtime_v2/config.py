@@ -40,6 +40,9 @@ DEFAULT_CODEX_MODEL_ENV = "CENTRAL_DISPATCHER_CODEX_MODEL"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_CLAUDE_MODEL_ENV = "CENTRAL_DISPATCHER_CLAUDE_MODEL"
 
+DEFAULT_GEMINI_MODEL = "gemini-3-pro-preview"
+DEFAULT_GEMINI_MODEL_ENV = "CENTRAL_DISPATCHER_GEMINI_MODEL"
+
 DEFAULT_WORKER_MODEL_ENV = "CENTRAL_DISPATCHER_WORKER_MODEL"
 
 # Model policy tiers.
@@ -51,11 +54,17 @@ HIGH_TIER_CLAUDE_MODEL: str = os.environ.get(
 HIGH_TIER_CODEX_MODEL: str = os.environ.get(
     "CENTRAL_DISPATCHER_HIGH_TIER_CODEX_MODEL", "o3"
 )
+HIGH_TIER_GEMINI_MODEL: str = os.environ.get(
+    "CENTRAL_DISPATCHER_HIGH_TIER_GEMINI_MODEL", "gemini-3-pro-preview"
+)
 MEDIUM_TIER_CLAUDE_MODEL: str = os.environ.get(
     "CENTRAL_DISPATCHER_MEDIUM_TIER_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL
 )
 MEDIUM_TIER_CODEX_MODEL: str = os.environ.get(
     "CENTRAL_DISPATCHER_MEDIUM_TIER_CODEX_MODEL", DEFAULT_CODEX_MODEL
+)
+MEDIUM_TIER_GEMINI_MODEL: str = os.environ.get(
+    "CENTRAL_DISPATCHER_MEDIUM_TIER_GEMINI_MODEL", "gemini-3-flash-preview"
 )
 
 # Task classes that trigger high-tier model selection.
@@ -64,9 +73,22 @@ HIGH_TIER_TAGS: frozenset[str] = frozenset({"design", "architecture", "planning"
 # Allowed codex worker models (operator-facing allowlist).
 ALLOWED_CODEX_MODELS: frozenset[str] = frozenset({"gpt-5.4", "gpt-5.3-codex", "gpt-5.3-codex-spark"})
 
-# Reasoning effort levels for the codex backend.
-ALLOWED_REASONING_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high"})
-DEFAULT_CODEX_EFFORT = "medium"
+# Allowed gemini worker models.
+ALLOWED_GEMINI_MODELS: frozenset[str] = frozenset({
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+})
+
+# Reasoning effort levels (shared by codex and claude backends).
+ALLOWED_REASONING_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high", "max"})
+DEFAULT_WORKER_EFFORT = "medium"
+# Backend-specific aliases (kept for any legacy references).
+DEFAULT_CODEX_EFFORT = DEFAULT_WORKER_EFFORT
+DEFAULT_CLAUDE_EFFORT = DEFAULT_WORKER_EFFORT
 
 # ---------------------------------------------------------------------------
 # Dataclasses

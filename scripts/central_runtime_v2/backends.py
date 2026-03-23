@@ -53,6 +53,7 @@ def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: 
     """Build a shell command that runs claude -p and converts output to worker_result schema."""
     task_id = worker_task.get("id") or worker_task.get("task_id") or "unknown"
     run_id = worker_task.get("run_id") or "unknown"
+    effort = worker_task.get("worker_effort") or None
     # Read schema for --json-schema flag so Claude outputs structured JSON directly.
     try:
         _schema_str = AUTONOMY_SCHEMA_PATH.read_text(encoding="utf-8").strip()
@@ -63,10 +64,11 @@ def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: 
     # --verbose is required for stream-json in -p mode.
     _SKIP_TYPES = "{'content_block_delta', 'input_json_delta', 'content_block_start', 'content_block_stop'}"
     _schema_arg = f", '--json-schema', {_schema_str!r}" if _schema_str else ""
+    _effort_arg = f", '--effort', {effort!r}" if effort else ""
     script = (
         "import json, subprocess, sys\n"
         f"proc = subprocess.Popen(\n"
-        f"    ['claude', '-p', '--verbose', '--dangerously-skip-permissions', '--model', {model!r}, '--output-format', 'stream-json'{_schema_arg}],\n"
+        f"    ['claude', '-p', '--verbose', '--dangerously-skip-permissions', '--model', {model!r}, '--output-format', 'stream-json'{_schema_arg}{_effort_arg}],\n"
         "    stdin=sys.stdin, stdout=subprocess.PIPE, text=True\n"
         ")\n"
         "lines = []\n"
@@ -336,6 +338,97 @@ class ClaudeBackend(WorkerBackend):
         return prompt_text, command, subprocess.PIPE
 
 
+def build_gemini_command(worker_task: dict[str, Any], result_path: Path, model: str) -> list[str]:
+    """Build a shell command that runs gemini -p and converts output to worker_result schema."""
+    task_id = worker_task.get("id") or worker_task.get("task_id") or "unknown"
+    run_id = worker_task.get("run_id") or "unknown"
+    _VERDICT_LOGIC = (
+        "_verdict = _structured.get('verdict') or None\n"
+        "if not _verdict:\n"
+        "    _verdict = 'accepted'\n"
+        "    if 'rework_required' in _sl: _verdict = 'rework_required'\n"
+        "    else:\n"
+        "        _vi = _sl.find('verdict')\n"
+        "        if _vi >= 0 and ('fail' in _sl[_vi:_vi+80] or '\\u274c' in summary[_vi:_vi+80]): _verdict = 'rework_required'\n"
+    )
+    script = (
+        "import json, subprocess, sys\n"
+        "prompt = sys.stdin.read()\n"
+        # Pipe prompt via stdin; use -p ' ' as minimal headless trigger (gemini prepends stdin to -p)
+        f"proc = subprocess.Popen(\n"
+        f"    ['gemini', '--model', {model!r}, '-y', '--output-format', 'json', '-p', ' '],\n"
+        "    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True\n"
+        ")\n"
+        "raw_output, _ = proc.communicate(input=prompt)\n"
+        # Parse JSON: try full output first, then find first '{' to skip leading status lines
+        "gemini_json = {}\n"
+        "try:\n"
+        "    gemini_json = json.loads(raw_output)\n"
+        "except Exception:\n"
+        "    _idx = (raw_output or '').find('{')\n"
+        "    if _idx >= 0:\n"
+        "        try: gemini_json = json.loads(raw_output[_idx:])\n"
+        "        except Exception: pass\n"
+        "response_text = str(gemini_json.get('response', raw_output or ''))[:50000]\n"
+        # Detect errors: returncode nonzero, or no JSON response and output looks like an error
+        "_error_signals = ('429', 'rateLimitExceeded', 'MODEL_CAPACITY_EXHAUSTED', 'RESOURCE_EXHAUSTED')\n"
+        "is_error = proc.returncode != 0 or (not gemini_json.get('response') and any(s in raw_output for s in _error_signals))\n"
+        # Extract structured JSON — strip markdown code fences if present
+        "_structured = {}\n"
+        "import re as _re\n"
+        "_json_text = response_text\n"
+        "_fence_match = _re.search(r'```(?:json)?\\s*({[\\s\\S]*?})\\s*```', _json_text)\n"
+        "if _fence_match: _json_text = _fence_match.group(1)\n"
+        "try:\n"
+        "    _parsed = json.loads(_json_text)\n"
+        "    if isinstance(_parsed, dict) and 'schema_version' in _parsed:\n"
+        "        _structured = _parsed\n"
+        "except Exception: pass\n"
+        "summary = str(_structured.get('summary', response_text))[:2000]\n"
+        "_sl = summary.lower()\n"
+        + _VERDICT_LOGIC +
+        "payload = {\n"
+        "    'schema_version': 1,\n"
+        f"    'task_id': {task_id!r},\n"
+        f"    'run_id': {run_id!r},\n"
+        "    'status': 'FAILED' if is_error else 'COMPLETED',\n"
+        "    'summary': summary,\n"
+        "    'completed_items': _structured.get('completed_items', [summary] if not is_error else []),\n"
+        "    'remaining_items': _structured.get('remaining_items', []),\n"
+        "    'decisions': _structured.get('decisions', []),\n"
+        "    'discoveries': _structured.get('discoveries', []),\n"
+        "    'blockers': _structured.get('blockers', []),\n"
+        "    'validation': _structured.get('validation', []),\n"
+        "    'verdict': _verdict,\n"
+        "    'requirements_assessment': _structured.get('requirements_assessment', []),\n"
+        "    'system_fit_assessment': _structured.get('system_fit_assessment', {}),\n"
+        "    'capability_mutation': _structured.get('capability_mutation', None),\n"
+        "    'files_changed': _structured.get('files_changed', []),\n"
+        "    'warnings': _structured.get('warnings', []),\n"
+        "    'artifacts': _structured.get('artifacts', []),\n"
+        "    'gemini_raw': {'session_id': gemini_json.get('session_id'), 'stats': gemini_json.get('stats', {})},\n"
+        "}\n"
+        "from pathlib import Path\n"
+        f"Path({str(result_path)!r}).write_text(json.dumps(payload, indent=2), encoding='utf-8')\n"
+        "print(json.dumps({'status': payload['status'], 'summary_preview': summary[:200]}))\n"
+        "sys.exit(proc.returncode)\n"
+    )
+    return [sys.executable, "-c", script]
+
+
+class GeminiBackend(WorkerBackend):
+    def prepare(
+        self,
+        snapshot: dict[str, Any],
+        worker_task: dict[str, Any],
+        run_id: str,
+        result_path: Path,
+    ) -> tuple[str, list[str], Any]:
+        prompt_text = worker_task["prompt_body"]
+        command = build_gemini_command(worker_task, result_path, worker_task["worker_model"])
+        return prompt_text, command, subprocess.PIPE
+
+
 class StubBackend(WorkerBackend):
     def prepare(
         self,
@@ -356,6 +449,7 @@ class StubBackend(WorkerBackend):
 _WORKER_BACKENDS: dict[str, WorkerBackend] = {
     "codex": CodexBackend(),
     "claude": ClaudeBackend(),
+    "gemini": GeminiBackend(),
     "stub": StubBackend(),
 }
 

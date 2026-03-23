@@ -408,6 +408,19 @@ def create_task(args: argparse.Namespace) -> None:
         scaffold = run(planner_new_cmd, db_path=db_path)
         task_id = scaffold.get("task_id", task_id)
 
+        # Wire worker backend/model/effort overrides into execution metadata if provided.
+        if args.worker_backend or args.worker_model or args.effort:
+            execution = scaffold.get("execution") or {}
+            exec_meta = execution.get("metadata") or {}
+            if args.worker_backend:
+                exec_meta["worker_backend"] = args.worker_backend
+            if args.worker_model:
+                exec_meta["worker_model"] = args.worker_model
+            if args.effort:
+                exec_meta["worker_effort"] = args.effort
+            execution["metadata"] = exec_meta
+            scaffold["execution"] = execution
+
         # Wire audit_required into scaffold metadata — required, no defaults.
         if "audit_required" not in tpl:
             print(f"FATAL: template '{template_name}' is missing required 'audit_required' field", file=sys.stderr)
@@ -535,6 +548,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Dependency task ID (repeatable)")
     p.add_argument("--initiative", default=None,
                    help="Optional initiative/epic tag for grouping (e.g. 'dispatcher-infrastructure')")
+    p.add_argument("--worker-backend", default=None, choices=["codex", "claude", "gemini", "stub"],
+                   help="Route task to a specific worker backend (default: dispatcher default)")
+    p.add_argument("--worker-model", default=None,
+                   help="Override the worker model for this task (e.g. 'gemini-3-pro-preview')")
+    p.add_argument("--effort", default=None, choices=["low", "medium", "high", "max"],
+                   help="Reasoning effort level for this task (applies to codex and claude backends)")
     p.add_argument("--dry-run", action="store_true", help="Run scaffold + preflight and validate, then exit without writing task.")
     p.add_argument("--planner-ops-smoke", action="store_true",
                    help="Run planner-ops preflight smoke validation and exit without writing task.")

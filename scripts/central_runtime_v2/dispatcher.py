@@ -498,6 +498,16 @@ class CentralDispatcher:
         effective_model = self.config.default_worker_model
         if is_audit and self.config.audit_worker_model:
             effective_model = self.config.audit_worker_model
+            # If no per-task backend override, infer backend from the audit model name.
+            has_task_backend_override = bool(
+                (snapshot.get("execution") or {}).get("metadata", {}).get("worker_backend")
+            )
+            if not has_task_backend_override:
+                m = effective_model.lower()
+                if m.startswith("claude"):
+                    effective_backend = "claude"
+                elif m.startswith("gemini"):
+                    effective_backend = "gemini"
         worker_task = build_worker_task(
             snapshot,
             effective_model,

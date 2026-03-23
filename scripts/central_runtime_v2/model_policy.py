@@ -15,15 +15,19 @@ from central_runtime_v2.config import (
     AUTONOMY_PROFILE,
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CLAUDE_MODEL_ENV,
-    DEFAULT_CODEX_EFFORT,
     DEFAULT_CODEX_MODEL,
     DEFAULT_CODEX_MODEL_ENV,
+    DEFAULT_GEMINI_MODEL,
+    DEFAULT_GEMINI_MODEL_ENV,
+    DEFAULT_WORKER_EFFORT,
     DEFAULT_WORKER_MODEL_ENV,
     HIGH_TIER_CLAUDE_MODEL,
     HIGH_TIER_CODEX_MODEL,
+    HIGH_TIER_GEMINI_MODEL,
     HIGH_TIER_TAGS,
     MEDIUM_TIER_CLAUDE_MODEL,
     MEDIUM_TIER_CODEX_MODEL,
+    MEDIUM_TIER_GEMINI_MODEL,
     ModelSelection,
 )
 
@@ -76,24 +80,30 @@ def resolve_default_codex_model(explicit: str | None) -> str:
     return DEFAULT_CODEX_MODEL
 
 
-def resolve_worker_codex_model(
-    snapshot: dict[str, Any], dispatcher_default_codex_model: str
+def resolve_worker_model(
+    snapshot: dict[str, Any], dispatcher_default: str, backend: str
 ) -> ModelSelection:
-    execution = snapshot.get("execution") or {}
-    execution_metadata = execution.get("metadata") or {}
-    task_override = normalize_optional_string(execution_metadata.get("codex_model"))
-    if task_override is not None:
-        return ModelSelection(value=task_override, source="task_override")
+    """Unified model resolver for all backends (codex, claude, gemini).
+
+    Resolution priority:
+    1. execution.metadata.worker_model  — unified override (any backend)
+    2. execution.metadata.{backend}_model  — backend-specific override
+    3. Policy: design tasks get the high-tier model for this backend
+    4. dispatcher_default
+    """
+    execution_metadata = (snapshot.get("execution") or {}).get("metadata") or {}
+    unified_override = normalize_optional_string(execution_metadata.get("worker_model"))
+    if unified_override is not None:
+        return ModelSelection(value=unified_override, source="task_override")
+    specific_override = normalize_optional_string(execution_metadata.get(f"{backend}_model"))
+    if specific_override is not None:
+        return ModelSelection(value=specific_override, source="task_override")
     task_class = resolve_task_class(snapshot)
-    policy_model, policy_source = resolve_policy_model(task_class, "codex")
-    # Only apply policy if it differs from the medium-tier default; otherwise fall
-    # through to dispatcher_default so operator-configured defaults still apply.
     if task_class == "design":
+        policy_model, policy_source = resolve_policy_model(task_class, backend)
         return ModelSelection(value=policy_model, source=policy_source)
     return ModelSelection(
-        value=normalize_codex_model(
-            dispatcher_default_codex_model, label="dispatcher default codex model"
-        ),
+        value=normalize_codex_model(dispatcher_default, label=f"dispatcher default {backend} model"),
         source="dispatcher_default",
     )
 
@@ -105,26 +115,6 @@ def resolve_default_claude_model(explicit: str | None) -> str:
     if env_value is not None:
         return env_value
     return DEFAULT_CLAUDE_MODEL
-
-
-def resolve_worker_claude_model(
-    snapshot: dict[str, Any], dispatcher_default_claude_model: str
-) -> ModelSelection:
-    execution = snapshot.get("execution") or {}
-    execution_metadata = execution.get("metadata") or {}
-    task_override = normalize_optional_string(execution_metadata.get("claude_model"))
-    if task_override is not None:
-        return ModelSelection(value=task_override, source="task_override")
-    task_class = resolve_task_class(snapshot)
-    if task_class == "design":
-        policy_model, policy_source = resolve_policy_model(task_class, "claude")
-        return ModelSelection(value=policy_model, source=policy_source)
-    return ModelSelection(
-        value=normalize_codex_model(
-            dispatcher_default_claude_model, label="dispatcher default claude model"
-        ),
-        source="dispatcher_default",
-    )
 
 
 def resolve_task_class(snapshot: dict[str, Any]) -> str:
@@ -157,10 +147,29 @@ def resolve_policy_model(task_class: str, backend: str) -> tuple[str, str]:
     Source tag is 'policy_default' so callers can inspect where the model came from.
     """
     if task_class == "design":
-        model = HIGH_TIER_CLAUDE_MODEL if backend == "claude" else HIGH_TIER_CODEX_MODEL
+        if backend == "claude":
+            model = HIGH_TIER_CLAUDE_MODEL
+        elif backend == "gemini":
+            model = HIGH_TIER_GEMINI_MODEL
+        else:
+            model = HIGH_TIER_CODEX_MODEL
     else:
-        model = MEDIUM_TIER_CLAUDE_MODEL if backend == "claude" else MEDIUM_TIER_CODEX_MODEL
+        if backend == "claude":
+            model = MEDIUM_TIER_CLAUDE_MODEL
+        elif backend == "gemini":
+            model = MEDIUM_TIER_GEMINI_MODEL
+        else:
+            model = MEDIUM_TIER_CODEX_MODEL
     return model, "policy_default"
+
+
+def resolve_default_gemini_model(explicit: str | None) -> str:
+    if explicit is not None:
+        return normalize_codex_model(explicit, label="default gemini model")
+    env_value = normalize_optional_string(os.environ.get(DEFAULT_GEMINI_MODEL_ENV))
+    if env_value is not None:
+        return env_value
+    return DEFAULT_GEMINI_MODEL
 
 
 def resolve_default_worker_model(worker_mode: str, explicit: str | None) -> str:
@@ -172,6 +181,8 @@ def resolve_default_worker_model(worker_mode: str, explicit: str | None) -> str:
         return generic_env
     if worker_mode == "claude":
         return resolve_default_claude_model(None)
+    if worker_mode == "gemini":
+        return resolve_default_gemini_model(None)
     return resolve_default_codex_model(None)
 
 
@@ -180,7 +191,7 @@ def resolve_task_worker_backend(snapshot: dict[str, Any], dispatcher_default: st
     execution = snapshot.get("execution") or {}
     execution_metadata = execution.get("metadata") or {}
     override = normalize_optional_string(execution_metadata.get("worker_backend"))
-    if override is not None and override in ("codex", "claude", "stub"):
+    if override is not None and override in ("codex", "claude", "gemini", "stub"):
         return override
     return dispatcher_default
 
@@ -196,11 +207,11 @@ def build_worker_task(
     metadata = snapshot.get("metadata") or {}
     execution_metadata = execution.get("metadata") or {}
     effective_backend = resolve_task_worker_backend(snapshot, worker_mode)
-    if effective_backend == "claude":
-        claude_default = dispatcher_default_worker_model or resolve_default_claude_model(None)
-        worker_model = resolve_worker_claude_model(snapshot, claude_default)
-    else:
-        codex_model = resolve_worker_codex_model(snapshot, dispatcher_default_codex_model)
+    _backend_default = dispatcher_default_worker_model or {
+        "claude": resolve_default_claude_model(None),
+        "gemini": resolve_default_gemini_model(None),
+    }.get(effective_backend, dispatcher_default_codex_model)
+    resolved_model = resolve_worker_model(snapshot, _backend_default, effective_backend)
     deliverables = extract_markdown_items(snapshot.get("deliverables_md", "")) or [
         snapshot.get("deliverables_md", "").strip()
     ]
@@ -280,21 +291,26 @@ def build_worker_task(
             execution.get("additional_writable_dirs") or []
         ),
     }
-    # Add backend-specific model fields
-    if effective_backend == "claude":
-        result["worker_model"] = worker_model.value
-        result["worker_model_source"] = worker_model.source
-    elif effective_backend == "codex":
+    # Resolve effort: worker_effort is canonical; fall back to backend-specific keys for
+    # backward compat with tasks patched before the unification.
+    _raw_effort = (
+        normalize_optional_string(execution_metadata.get("worker_effort"))
+        or normalize_optional_string(execution_metadata.get("claude_effort"))
+        or normalize_optional_string(execution_metadata.get("codex_effort"))
+    )
+    _effort = _raw_effort if _raw_effort in ALLOWED_REASONING_EFFORTS else None
+
+    result["worker_model"] = resolved_model.value
+    result["worker_model_source"] = resolved_model.source
+
+    if effective_backend == "codex":
         result["codex_profile"] = execution_metadata.get("codex_profile") or AUTONOMY_PROFILE
-        result["codex_model"] = codex_model.value
-        result["codex_model_source"] = codex_model.source
-        raw_effort = normalize_optional_string(execution_metadata.get("codex_effort"))
-        _spark_default = "high" if codex_model.value == "gpt-5.3-codex-spark" else DEFAULT_CODEX_EFFORT
-        result["codex_effort"] = raw_effort if raw_effort in ALLOWED_REASONING_EFFORTS else _spark_default
-        # Generic aliases for codex
-        result["worker_model"] = codex_model.value
-        result["worker_model_source"] = codex_model.source
-    else:
-        result["worker_model"] = None
-        result["worker_model_source"] = None
+        result["codex_model"] = resolved_model.value
+        result["codex_model_source"] = resolved_model.source
+        _spark_default = "high" if resolved_model.value == "gpt-5.3-codex-spark" else DEFAULT_WORKER_EFFORT
+        result["codex_effort"] = _effort if _effort else _spark_default
+    elif effective_backend == "claude":
+        result["worker_effort"] = _effort if _effort else DEFAULT_WORKER_EFFORT
+    elif effective_backend not in ("gemini", "stub"):
+        pass  # unknown backend — model fields already set above
     return result

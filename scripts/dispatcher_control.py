@@ -20,7 +20,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import central_runtime_v2 as central_runtime
-from central_runtime_v2.config import ALLOWED_CODEX_MODELS, ALLOWED_REASONING_EFFORTS
+from central_runtime_v2.config import ALLOWED_CODEX_MODELS, ALLOWED_GEMINI_MODELS, ALLOWED_REASONING_EFFORTS
 
 ALLOWED_CLAUDE_MODELS: list[str] = [
     "claude-sonnet-4-6",
@@ -81,6 +81,11 @@ def validate_model_for_mode(model: str, mode: str) -> None:
         die(
             f"invalid codex model: {model!r}\n"
             f"Allowed: {', '.join(sorted(ALLOWED_CODEX_MODELS))}"
+        )
+    if mode == "gemini" and model not in ALLOWED_GEMINI_MODELS:
+        die(
+            f"invalid gemini model: {model!r}\n"
+            f"Allowed: {', '.join(sorted(ALLOWED_GEMINI_MODELS))}"
         )
 
 
@@ -362,7 +367,7 @@ def save_config(*, max_workers: int | None = None, codex_model: str | None = Non
     elif codex_model is not None:
         payload["default_worker_model"] = central_runtime.normalize_codex_model(codex_model, label="codex model")
     if worker_mode is not None:
-        if worker_mode not in ("codex", "claude", "stub"):
+        if worker_mode not in ("codex", "claude", "gemini", "stub"):
             die(f"invalid worker mode: {worker_mode}")
         payload["worker_mode"] = worker_mode
     if notify is not None:
@@ -375,58 +380,35 @@ def save_config(*, max_workers: int | None = None, codex_model: str | None = Non
 
 def describe_source(source: str) -> str:
     labels = {
-        "cli": "cli flag",
         "env": MAX_WORKERS_ENV,
         "model_env": CODEX_MODEL_ENV,
-        "running_daemon": "running daemon",
         "saved_config": str(CONFIG_PATH),
         "default": "default",
     }
     return labels.get(source, source)
 
 
-def resolve_max_workers(cli_value: int | None, *, restart: bool) -> ResolvedMaxWorkers:
-    if cli_value is not None:
-        return ResolvedMaxWorkers(value=cli_value, source="cli")
+def resolve_max_workers() -> ResolvedMaxWorkers:
     env_value = env_max_workers()
     if env_value is not None:
         return ResolvedMaxWorkers(value=env_value, source="env")
-    if restart:
-        payload = running_lock_payload() or {}
-        running_value = payload.get("max_workers")
-        if running_value is not None:
-            return ResolvedMaxWorkers(
-                value=parse_positive_int(str(running_value), label="running dispatcher max_workers"),
-                source="running_daemon",
-            )
     persisted = saved_max_workers()
     if persisted is not None:
         return ResolvedMaxWorkers(value=persisted, source="saved_config")
     return ResolvedMaxWorkers(value=DEFAULT_MAX_WORKERS, source="default")
 
 
-def resolve_codex_model(cli_value: str | None, *, restart: bool) -> ResolvedWorkerModel:
-    return resolve_worker_model(cli_value, restart=restart)
+def resolve_codex_model() -> ResolvedWorkerModel:
+    return resolve_worker_model()
 
 
-def resolve_worker_model(cli_value: str | None, *, restart: bool) -> ResolvedWorkerModel:
-    if cli_value is not None:
-        return ResolvedWorkerModel(
-            value=central_runtime.normalize_codex_model(cli_value, label="worker model"),
-            source="cli",
-        )
-    # Check generic env var first, then codex-specific
+def resolve_worker_model() -> ResolvedWorkerModel:
     env_generic = env_worker_model()
     if env_generic is not None:
         return ResolvedWorkerModel(value=env_generic, source="model_env")
     env_value = env_codex_model()
     if env_value is not None:
         return ResolvedWorkerModel(value=env_value, source="model_env")
-    if restart:
-        payload = running_lock_payload() or {}
-        running_model = payload.get("default_codex_model") or payload.get("default_worker_model")
-        if running_model:
-            return ResolvedWorkerModel(value=str(running_model), source="running_daemon")
     persisted = saved_worker_model()
     if persisted is not None:
         return ResolvedWorkerModel(value=persisted, source="saved_config")
@@ -450,51 +432,48 @@ def runtime_status_payload() -> dict[str, object]:
 
 def launcher_status_payload() -> dict[str, object]:
     payload = runtime_status_payload()
-    next_start = resolve_max_workers(None, restart=False)
-    next_restart = resolve_max_workers(None, restart=True)
-    next_start_model = resolve_codex_model(None, restart=False)
-    next_restart_model = resolve_codex_model(None, restart=True)
+    effective = resolve_max_workers()
+    effective_model = resolve_worker_model()
     payload.update(
         {
             "launcher_config_path": str(CONFIG_PATH),
             "saved_max_workers": saved_max_workers(),
             "env_max_workers": env_max_workers(),
-            "next_start_max_workers": next_start.value,
-            "next_start_source": next_start.source,
-            "next_restart_max_workers": next_restart.value,
-            "next_restart_source": next_restart.source,
             "saved_default_worker_model": saved_worker_model() or saved_codex_model(),
             "saved_default_codex_model": saved_codex_model(),
+            "saved_audit_worker_model": saved_audit_model(),
             "env_default_worker_model": env_worker_model() or env_codex_model(),
-            "env_default_codex_model": env_codex_model(),
-            "next_start_default_worker_model": next_start_model.value,
-            "next_start_default_worker_model_source": next_start_model.source,
-            "next_start_default_codex_model": next_start_model.value,
-            "next_start_default_codex_model_source": next_start_model.source,
-            "next_restart_default_worker_model": next_restart_model.value,
-            "next_restart_default_worker_model_source": next_restart_model.source,
-            "next_restart_default_codex_model": next_restart_model.value,
-            "next_restart_default_codex_model_source": next_restart_model.source,
+            # effective = what start/restart will use
+            "effective_start_max_workers": effective.value,
+            "effective_start_source": effective.source,
+            "effective_start_default_worker_model": effective_model.value,
+            "effective_start_default_worker_model_source": effective_model.source,
+            "effective_start_default_codex_model": effective_model.value,
+            "effective_start_default_codex_model_source": effective_model.source,
+            # backward-compat aliases
+            "next_start_max_workers": effective.value,
+            "next_start_source": effective.source,
+            "next_start_default_worker_model": effective_model.value,
+            "next_start_default_worker_model_source": effective_model.source,
+            "next_start_default_codex_model": effective_model.value,
+            "next_start_default_codex_model_source": effective_model.source,
         }
     )
     return payload
 
 
-def start_dispatcher(*, restart: bool = False, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None, notify: bool | None = None) -> int:
+def start_dispatcher(*, restart: bool = False) -> int:
     ensure_runtime()
     init_db()
     current = running_pid()
-    resolved = resolve_max_workers(max_workers, restart=restart)
-    resolved_model = resolve_worker_model(worker_model or codex_model, restart=restart)
-    effective_mode = worker_mode or saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
-    effective_notify = notify if notify is not None else (saved_notify() or False)
+    resolved = resolve_max_workers()
+    resolved_model = resolve_worker_model()
+    effective_mode = saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
+    effective_notify = saved_notify() or False
     validate_model_for_mode(resolved_model.value, effective_mode)
     if current and not restart:
-        if max_workers is not None:
-            print("Dispatcher already running; restart is required to apply a new max worker limit.")
-        if codex_model is not None or worker_model is not None:
-            print("Dispatcher already running; restart is required to apply a new default model.")
         print(f"Dispatcher already running (pid {current})")
+        print("Use 'config' to update settings, then 'restart' to apply them.")
         return print_status()
     if current and restart:
         stop_dispatcher(quiet=True)
@@ -524,24 +503,14 @@ def start_dispatcher(*, restart: bool = False, max_workers: int | None = None, c
         pid = running_pid()
         if pid:
             status = runtime_status_payload()
-            print(f"Dispatcher started (pid {pid})")
+            verb = "restarted" if restart else "started"
+            print(f"Dispatcher {verb} (pid {pid})")
             print(f"DB:  {DB_PATH or str(REPO_DIR / 'state' / 'central_tasks.db')}")
             print(f"Log: {LOG_PATH}")
-            print(
-                "Max workers: "
-                f"{status.get('configured_max_workers') or resolved.value} "
-                f"(source: {describe_source(resolved.source)})"
-            )
-            print(
-                "Default model: "
-                f"{status.get('configured_default_worker_model') or status.get('configured_default_codex_model') or resolved_model.value} "
-                f"(source: {describe_source(resolved_model.source)})"
-            )
-            print(f"Worker mode: {status.get('worker_mode') or effective_mode}")
-            if saved_max_workers() is not None:
-                print(f"Saved default: {saved_max_workers()} ({CONFIG_PATH})")
-            if saved_worker_model() is not None:
-                print(f"Saved model: {saved_worker_model()} ({CONFIG_PATH})")
+            print(f"Max workers:   {status.get('configured_max_workers') or resolved.value}")
+            print(f"Worker model:  {status.get('configured_default_worker_model') or resolved_model.value}")
+            print(f"Audit model:   {effective_audit_model or '(same as worker)'}")
+            print(f"Worker mode:   {status.get('worker_mode') or effective_mode}")
             return 0
         if proc.poll() is not None:
             die(tail_file(LAUNCH_LOG_PATH, 80) or "dispatcher failed to start")
@@ -625,7 +594,7 @@ def show_logs(follow: bool = False) -> int:
 def run_once() -> int:
     ensure_runtime()
     init_db()
-    resolved_model = resolve_worker_model(None, restart=False)
+    resolved_model = resolve_worker_model()
     effective_mode = saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
     result = subprocess.run(
         runtime_cmd("run-once", "--default-worker-model", resolved_model.value, "--worker-mode", effective_mode),
@@ -661,7 +630,8 @@ def show_config(*, max_workers: int | None = None, codex_model: str | None = Non
     if max_workers is not None or codex_model is not None or worker_model is not None or worker_mode is not None or notify is not None or audit_model is not None:
         save_config(max_workers=max_workers, codex_model=codex_model, worker_model=worker_model, worker_mode=worker_mode, notify=notify, audit_model=audit_model)
     payload = load_saved_config()
-    effective_model = resolve_worker_model(None, restart=False)
+    effective = resolve_max_workers()
+    effective_model = resolve_worker_model()
     print(
         json.dumps(
             {
@@ -675,9 +645,8 @@ def show_config(*, max_workers: int | None = None, codex_model: str | None = Non
                 "updated_at": payload.get("updated_at"),
                 "env_max_workers": env_max_workers(),
                 "env_default_worker_model": env_worker_model() or env_codex_model(),
-                "env_default_codex_model": env_codex_model(),
-                "effective_start_max_workers": resolve_max_workers(None, restart=False).value,
-                "effective_start_source": resolve_max_workers(None, restart=False).source,
+                "effective_start_max_workers": effective.value,
+                "effective_start_source": effective.source,
                 "effective_start_default_worker_model": effective_model.value,
                 "effective_start_default_worker_model_source": effective_model.source,
                 "effective_start_default_codex_model": effective_model.value,
@@ -801,10 +770,10 @@ def _run_self_check_stub() -> dict[str, object]:
 def run_check() -> int:
     validate_runtime_importable()
     effective_mode = saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
-    resolved_model = resolve_worker_model(None, restart=False)
+    resolved_model = resolve_worker_model()
     validate_model_for_mode(resolved_model.value, effective_mode)
     effort, effort_source = resolve_effort()
-    max_workers = resolve_max_workers(None, restart=False)
+    max_workers = resolve_max_workers()
     effective_config = {
         "mode": effective_mode,
         "model": resolved_model.value,
@@ -901,14 +870,15 @@ def prompt_yes_no(label: str, default: bool) -> bool:
 
 
 def prompt_worker_mode(default: str) -> str:
-    options = {"1": "codex", "2": "claude", "3": "stub"}
+    options = {"1": "codex", "2": "claude", "3": "gemini", "4": "stub"}
     reverse = {value: key for key, value in options.items()}
     default_key = reverse.get(default, "1")
     while True:
         print("Worker provider/mode:")
         print("  1. codex")
         print("  2. claude")
-        print("  3. stub")
+        print("  3. gemini")
+        print("  4. stub")
         raw = prompt_line(f"Select mode [{default_key}]: ")
         key = default_key if raw == "" else raw
         selected = options.get(key)
@@ -920,6 +890,8 @@ def prompt_worker_model_select(label: str, default: str, mode: str) -> str:
     """Numbered selection for worker/audit model; never free-form."""
     if mode == "codex":
         choices = sorted(ALLOWED_CODEX_MODELS)
+    elif mode == "gemini":
+        choices = sorted(ALLOWED_GEMINI_MODELS)
     else:
         choices = list(ALLOWED_CLAUDE_MODELS)
     numbered = {str(i + 1): m for i, m in enumerate(choices)}
@@ -941,8 +913,8 @@ def prompt_worker_model_select(label: str, default: str, mode: str) -> str:
 
 def print_menu_header() -> None:
     running = running_pid()
-    restart_workers = resolve_max_workers(None, restart=True)
-    restart_model = resolve_worker_model(None, restart=True)
+    effective_workers = resolve_max_workers()
+    effective_model = resolve_worker_model()
     mode = saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
     notify_enabled = saved_notify() or False
     print()
@@ -951,8 +923,8 @@ def print_menu_header() -> None:
     print(f"State: {STATE_DIR}")
     print(f"Running: {'yes (pid ' + str(running) + ')' if running else 'no'}")
     print(
-        "Restart defaults: "
-        f"workers={restart_workers.value} model={restart_model.value} mode={mode} notify={notify_enabled}"
+        "Saved config: "
+        f"workers={effective_workers.value} model={effective_model.value} mode={mode} notify={notify_enabled}"
     )
     print()
     print("  1. Start dispatcher")
@@ -972,8 +944,8 @@ def print_menu_header() -> None:
 
 
 def run_start_or_restart(*, restart: bool) -> int:
-    workers_default = resolve_max_workers(None, restart=restart).value
-    model_default = resolve_worker_model(None, restart=restart).value
+    workers_default = resolve_max_workers().value
+    model_default = resolve_worker_model().value
     mode_default = saved_worker_mode() or os.environ.get("CENTRAL_WORKER_MODE", "codex")
     audit_default = saved_audit_model() or model_default
     notify_default = saved_notify() or False
@@ -983,14 +955,15 @@ def run_start_or_restart(*, restart: bool) -> int:
     worker_model = prompt_worker_model_select("Implementor model", model_default, worker_mode)
     audit_model = prompt_worker_model_select("Audit model", audit_default, worker_mode)
     notify = prompt_yes_no("Enable notifications", notify_default)
-    save_config(audit_model=audit_model)
-    return start_dispatcher(
-        restart=restart,
+    # Save ALL config before starting — config is the single source of truth
+    save_config(
         max_workers=max_workers,
         worker_model=worker_model,
         worker_mode=worker_mode,
         notify=notify,
+        audit_model=audit_model,
     )
+    return start_dispatcher(restart=restart)
 
 
 def run_config_update() -> int:
@@ -1105,21 +1078,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CENTRAL dispatcher operator wrapper")
     subparsers = parser.add_subparsers(dest="command")
 
-    start_parser = subparsers.add_parser("start", help="Start the dispatcher daemon")
-    start_parser.add_argument("--max-workers", type=argparse_positive_int)
-    start_parser.add_argument("--codex-model", help="(deprecated, use --worker-model)")
-    start_parser.add_argument("--worker-model")
-    start_parser.add_argument("--worker-mode", choices=["codex", "claude", "stub"])
-    start_parser.add_argument("--notify", action="store_true", default=None)
-    start_parser.add_argument("--no-notify", dest="notify", action="store_false")
-
-    restart_parser = subparsers.add_parser("restart", help="Restart the dispatcher daemon")
-    restart_parser.add_argument("--max-workers", type=argparse_positive_int)
-    restart_parser.add_argument("--codex-model", help="(deprecated, use --worker-model)")
-    restart_parser.add_argument("--worker-model")
-    restart_parser.add_argument("--worker-mode", choices=["codex", "claude", "stub"])
-    restart_parser.add_argument("--notify", action="store_true", default=None)
-    restart_parser.add_argument("--no-notify", dest="notify", action="store_false")
+    subparsers.add_parser("start", help="Start the dispatcher daemon (uses saved config)")
+    subparsers.add_parser("restart", help="Stop and restart the dispatcher (applies saved config)")
 
     subparsers.add_parser("stop", help="Stop the dispatcher daemon")
     subparsers.add_parser("status", help="Show dispatcher status")
@@ -1146,7 +1106,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_parser.add_argument("--codex-model", help="(deprecated, use --worker-model)")
     config_parser.add_argument("--worker-model")
     config_parser.add_argument("--audit-model", help="Separate model for audit tasks (cross-model auditing)")
-    config_parser.add_argument("--worker-mode", choices=["codex", "claude", "stub"])
+    config_parser.add_argument("--worker-mode", choices=["codex", "claude", "gemini", "stub"])
     config_parser.add_argument("--notify", action="store_true", default=None)
     config_parser.add_argument("--no-notify", dest="notify", action="store_false")
 
@@ -1168,23 +1128,9 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv[1:])
     cmd = args.command or "start"
     if cmd == "start":
-        return start_dispatcher(
-            restart=False,
-            max_workers=getattr(args, "max_workers", None),
-            codex_model=getattr(args, "codex_model", None),
-            worker_model=getattr(args, "worker_model", None),
-            worker_mode=getattr(args, "worker_mode", None),
-            notify=getattr(args, "notify", None),
-        )
+        return start_dispatcher(restart=False)
     if cmd == "restart":
-        return start_dispatcher(
-            restart=True,
-            max_workers=getattr(args, "max_workers", None),
-            codex_model=getattr(args, "codex_model", None),
-            worker_model=getattr(args, "worker_model", None),
-            worker_mode=getattr(args, "worker_mode", None),
-            notify=getattr(args, "notify", None),
-        )
+        return start_dispatcher(restart=True)
     if cmd == "stop":
         return stop_dispatcher()
     if cmd == "status":
