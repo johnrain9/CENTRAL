@@ -568,7 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--stale-recovery-seconds", type=float, default=10.0)
         sub.add_argument(
             "--worker-mode",
-            choices=["codex", "claude", "stub"],
+            choices=["codex", "claude", "grok", "gemini", "stub"],
             default=os.environ.get("CENTRAL_WORKER_MODE", "codex"),
         )
         sub.add_argument("--default-codex-model")
