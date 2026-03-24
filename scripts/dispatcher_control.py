@@ -20,13 +20,15 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import central_runtime_v2 as central_runtime
-from central_runtime_v2.config import ALLOWED_CODEX_MODELS, ALLOWED_GEMINI_MODELS, ALLOWED_REASONING_EFFORTS
+from central_runtime_v2.config import ALLOWED_CODEX_MODELS, ALLOWED_GEMINI_MODELS, ALLOWED_GROK_MODELS, ALLOWED_REASONING_EFFORTS
 
 ALLOWED_CLAUDE_MODELS: list[str] = [
     "claude-sonnet-4-6",
     "claude-opus-4-6",
     "claude-haiku-4-5-20251001",
 ]
+
+ALLOWED_GROK_MODELS_LIST: list[str] = sorted(ALLOWED_GROK_MODELS)
 
 REPO_DIR = Path(os.environ.get("CENTRAL_DISPATCHER_REPO_DIR", str(Path(__file__).resolve().parents[1]))).expanduser().resolve()
 RUNTIME_SCRIPT = Path(os.environ.get("CENTRAL_DISPATCHER_RUNTIME_SCRIPT", str(REPO_DIR / "scripts" / "central_runtime_v2" / "__main__.py")))
@@ -86,6 +88,11 @@ def validate_model_for_mode(model: str, mode: str) -> None:
         die(
             f"invalid gemini model: {model!r}\n"
             f"Allowed: {', '.join(sorted(ALLOWED_GEMINI_MODELS))}"
+        )
+    if mode == "grok" and model not in ALLOWED_GROK_MODELS:
+        die(
+            f"invalid grok model: {model!r}\n"
+            f"Allowed: {', '.join(sorted(ALLOWED_GROK_MODELS))}"
         )
 
 
@@ -367,7 +374,7 @@ def save_config(*, max_workers: int | None = None, codex_model: str | None = Non
     elif codex_model is not None:
         payload["default_worker_model"] = central_runtime.normalize_codex_model(codex_model, label="codex model")
     if worker_mode is not None:
-        if worker_mode not in ("codex", "claude", "gemini", "stub"):
+        if worker_mode not in ("codex", "claude", "gemini", "grok", "stub"):
             die(f"invalid worker mode: {worker_mode}")
         payload["worker_mode"] = worker_mode
     if notify is not None:
@@ -870,7 +877,7 @@ def prompt_yes_no(label: str, default: bool) -> bool:
 
 
 def prompt_worker_mode(default: str) -> str:
-    options = {"1": "codex", "2": "claude", "3": "gemini", "4": "stub"}
+    options = {"1": "codex", "2": "claude", "3": "gemini", "4": "grok", "5": "stub"}
     reverse = {value: key for key, value in options.items()}
     default_key = reverse.get(default, "1")
     while True:
@@ -878,7 +885,8 @@ def prompt_worker_mode(default: str) -> str:
         print("  1. codex")
         print("  2. claude")
         print("  3. gemini")
-        print("  4. stub")
+        print("  4. grok")
+        print("  5. stub")
         raw = prompt_line(f"Select mode [{default_key}]: ")
         key = default_key if raw == "" else raw
         selected = options.get(key)
@@ -892,6 +900,8 @@ def prompt_worker_model_select(label: str, default: str, mode: str) -> str:
         choices = sorted(ALLOWED_CODEX_MODELS)
     elif mode == "gemini":
         choices = sorted(ALLOWED_GEMINI_MODELS)
+    elif mode == "grok":
+        choices = ALLOWED_GROK_MODELS_LIST
     else:
         choices = list(ALLOWED_CLAUDE_MODELS)
     numbered = {str(i + 1): m for i, m in enumerate(choices)}
@@ -1106,7 +1116,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_parser.add_argument("--codex-model", help="(deprecated, use --worker-model)")
     config_parser.add_argument("--worker-model")
     config_parser.add_argument("--audit-model", help="Separate model for audit tasks (cross-model auditing)")
-    config_parser.add_argument("--worker-mode", choices=["codex", "claude", "gemini", "stub"])
+    config_parser.add_argument("--worker-mode", choices=["codex", "claude", "gemini", "grok", "stub"])
     config_parser.add_argument("--notify", action="store_true", default=None)
     config_parser.add_argument("--no-notify", dest="notify", action="store_false")
 

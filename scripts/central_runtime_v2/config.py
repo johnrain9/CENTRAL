@@ -43,6 +43,9 @@ DEFAULT_CLAUDE_MODEL_ENV = "CENTRAL_DISPATCHER_CLAUDE_MODEL"
 DEFAULT_GEMINI_MODEL = "gemini-3-pro-preview"
 DEFAULT_GEMINI_MODEL_ENV = "CENTRAL_DISPATCHER_GEMINI_MODEL"
 
+DEFAULT_GROK_MODEL = "grok-4-1-fast-non-reasoning"
+DEFAULT_GROK_MODEL_ENV = "CENTRAL_DISPATCHER_GROK_MODEL"
+
 DEFAULT_WORKER_MODEL_ENV = "CENTRAL_DISPATCHER_WORKER_MODEL"
 
 # Model policy tiers.
@@ -57,6 +60,9 @@ HIGH_TIER_CODEX_MODEL: str = os.environ.get(
 HIGH_TIER_GEMINI_MODEL: str = os.environ.get(
     "CENTRAL_DISPATCHER_HIGH_TIER_GEMINI_MODEL", "gemini-3-pro-preview"
 )
+HIGH_TIER_GROK_MODEL: str = os.environ.get(
+    "CENTRAL_DISPATCHER_HIGH_TIER_GROK_MODEL", "grok-4.20-0309-reasoning"
+)
 MEDIUM_TIER_CLAUDE_MODEL: str = os.environ.get(
     "CENTRAL_DISPATCHER_MEDIUM_TIER_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL
 )
@@ -66,12 +72,26 @@ MEDIUM_TIER_CODEX_MODEL: str = os.environ.get(
 MEDIUM_TIER_GEMINI_MODEL: str = os.environ.get(
     "CENTRAL_DISPATCHER_MEDIUM_TIER_GEMINI_MODEL", "gemini-3-flash-preview"
 )
+MEDIUM_TIER_GROK_MODEL: str = os.environ.get(
+    "CENTRAL_DISPATCHER_MEDIUM_TIER_GROK_MODEL", DEFAULT_GROK_MODEL
+)
 
 # Task classes that trigger high-tier model selection.
 HIGH_TIER_TAGS: frozenset[str] = frozenset({"design", "architecture", "planning", "spec"})
 
 # Allowed codex worker models (operator-facing allowlist).
 ALLOWED_CODEX_MODELS: frozenset[str] = frozenset({"gpt-5.4", "gpt-5.3-codex", "gpt-5.3-codex-spark"})
+
+# Allowed grok worker models.
+ALLOWED_GROK_MODELS: frozenset[str] = frozenset({
+    "grok-4.20-0309-reasoning",
+    "grok-4.20-0309-non-reasoning",
+    "grok-4.20-multi-agent-0309",
+    "grok-4-1-fast-reasoning",
+    "grok-4-1-fast-non-reasoning",
+    "grok-3-beta",
+    "grok-3-mini-beta",
+})
 
 # Allowed gemini worker models.
 ALLOWED_GEMINI_MODELS: frozenset[str] = frozenset({

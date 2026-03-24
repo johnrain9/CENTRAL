@@ -19,15 +19,19 @@ from central_runtime_v2.config import (
     DEFAULT_CODEX_MODEL_ENV,
     DEFAULT_GEMINI_MODEL,
     DEFAULT_GEMINI_MODEL_ENV,
+    DEFAULT_GROK_MODEL,
+    DEFAULT_GROK_MODEL_ENV,
     DEFAULT_WORKER_EFFORT,
     DEFAULT_WORKER_MODEL_ENV,
     HIGH_TIER_CLAUDE_MODEL,
     HIGH_TIER_CODEX_MODEL,
     HIGH_TIER_GEMINI_MODEL,
+    HIGH_TIER_GROK_MODEL,
     HIGH_TIER_TAGS,
     MEDIUM_TIER_CLAUDE_MODEL,
     MEDIUM_TIER_CODEX_MODEL,
     MEDIUM_TIER_GEMINI_MODEL,
+    MEDIUM_TIER_GROK_MODEL,
     ModelSelection,
 )
 
@@ -151,6 +155,8 @@ def resolve_policy_model(task_class: str, backend: str) -> tuple[str, str]:
             model = HIGH_TIER_CLAUDE_MODEL
         elif backend == "gemini":
             model = HIGH_TIER_GEMINI_MODEL
+        elif backend == "grok":
+            model = HIGH_TIER_GROK_MODEL
         else:
             model = HIGH_TIER_CODEX_MODEL
     else:
@@ -158,6 +164,8 @@ def resolve_policy_model(task_class: str, backend: str) -> tuple[str, str]:
             model = MEDIUM_TIER_CLAUDE_MODEL
         elif backend == "gemini":
             model = MEDIUM_TIER_GEMINI_MODEL
+        elif backend == "grok":
+            model = MEDIUM_TIER_GROK_MODEL
         else:
             model = MEDIUM_TIER_CODEX_MODEL
     return model, "policy_default"
@@ -172,6 +180,15 @@ def resolve_default_gemini_model(explicit: str | None) -> str:
     return DEFAULT_GEMINI_MODEL
 
 
+def resolve_default_grok_model(explicit: str | None) -> str:
+    if explicit is not None:
+        return normalize_codex_model(explicit, label="default grok model")
+    env_value = normalize_optional_string(os.environ.get(DEFAULT_GROK_MODEL_ENV))
+    if env_value is not None:
+        return env_value
+    return DEFAULT_GROK_MODEL
+
+
 def resolve_default_worker_model(worker_mode: str, explicit: str | None) -> str:
     """Resolve the default model for whatever backend is configured."""
     generic_env = normalize_optional_string(os.environ.get(DEFAULT_WORKER_MODEL_ENV))
@@ -183,6 +200,8 @@ def resolve_default_worker_model(worker_mode: str, explicit: str | None) -> str:
         return resolve_default_claude_model(None)
     if worker_mode == "gemini":
         return resolve_default_gemini_model(None)
+    if worker_mode == "grok":
+        return resolve_default_grok_model(None)
     return resolve_default_codex_model(None)
 
 
@@ -191,7 +210,7 @@ def resolve_task_worker_backend(snapshot: dict[str, Any], dispatcher_default: st
     execution = snapshot.get("execution") or {}
     execution_metadata = execution.get("metadata") or {}
     override = normalize_optional_string(execution_metadata.get("worker_backend"))
-    if override is not None and override in ("codex", "claude", "gemini", "stub"):
+    if override is not None and override in ("codex", "claude", "gemini", "grok", "stub"):
         return override
     return dispatcher_default
 
@@ -210,6 +229,7 @@ def build_worker_task(
     _backend_default = dispatcher_default_worker_model or {
         "claude": resolve_default_claude_model(None),
         "gemini": resolve_default_gemini_model(None),
+        "grok": resolve_default_grok_model(None),
     }.get(effective_backend, dispatcher_default_codex_model)
     resolved_model = resolve_worker_model(snapshot, _backend_default, effective_backend)
     deliverables = extract_markdown_items(snapshot.get("deliverables_md", "")) or [
