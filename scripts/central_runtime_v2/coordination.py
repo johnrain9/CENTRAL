@@ -291,6 +291,17 @@ class CoordinationServer:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _matches_worker(req_worker_id: str, lease_owner_id: object) -> bool:
+        """Accept current and legacy worker-id forms for lease ownership checks."""
+        owner = str(lease_owner_id or "")
+        if owner == req_worker_id:
+            return True
+        if owner.startswith("remote:"):
+            return owner.startswith(f"remote:{req_worker_id}:")
+        return False
+
+
     def _open_db(self):
         conn = task_db.connect(self._bridge.db_path)
         task_db.require_initialized_db(conn, self._bridge.db_path)
@@ -329,6 +340,7 @@ class CoordinationServer:
         bridge = self._bridge
         disp_config = bridge.dispatcher_config
         lease_seconds = self._lease_seconds()
+        lease_worker_id = req.worker_id
         remote_worker_id = f"remote:{req.worker_id}:{int(time.time())}"
 
         with bridge.active_lock:
@@ -368,7 +380,7 @@ class CoordinationServer:
             try:
                 claimed_snapshot = task_db.runtime_claim(
                     claim_conn,
-                    worker_id=remote_worker_id,
+                    worker_id=lease_worker_id,
                     queue_name=self._config.queue_name,
                     lease_seconds=lease_seconds,
                     task_id=candidate["task_id"],
@@ -437,7 +449,7 @@ class CoordinationServer:
             # --- Register in _active (lock still held) ---
             state = ActiveWorker(
                 task=snapshot,
-                worker_id=remote_worker_id,
+                worker_id=lease_worker_id,
                 run_id=run_id,
                 pid=-1,
                 proc=None,
@@ -531,18 +543,19 @@ class CoordinationServer:
             if runtime_row and runtime_row["runtime_status"] in _CANCELLED_STATUSES:
                 raise HTTPException(status_code=410, detail="task is done or cancelled")
 
-            if str(lease["lease_owner_id"]) != req.worker_id:
+            if not self._matches_worker(req.worker_id, lease["lease_owner_id"]):
                 raise HTTPException(status_code=410, detail="lease reassigned to different worker")
 
             # Renew lease
             heartbeat_at = utc_now()
             lease_expires_at = self._future_utc(lease_seconds)
+            lease_owner_id = str(lease["lease_owner_id"])
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "UPDATE task_active_leases"
                 " SET lease_expires_at = ?, last_heartbeat_at = ?"
                 " WHERE task_id = ? AND lease_owner_id = ?",
-                (lease_expires_at, heartbeat_at, req.task_id, req.worker_id),
+                (lease_expires_at, heartbeat_at, req.task_id, lease_owner_id),
             )
             task_db.insert_event(
                 conn,
