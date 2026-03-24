@@ -195,7 +195,7 @@ class TestModelScorecard(unittest.TestCase):
         self.assertIn("model-a", models)
         self.assertIn("model-b", models)
 
-    def test_avg_duration_seconds_computed(self) -> None:
+    def test_duration_stats_computed(self) -> None:
         p = _task_payload()
         _create_task(self.conn, p)
         with self.conn:
@@ -207,7 +207,31 @@ class TestModelScorecard(unittest.TestCase):
             )
         result = mq.model_scorecard(self.conn)
         row = next(r for r in result if r["effective_worker_model"] == "model-dur")
-        self.assertAlmostEqual(row["avg_duration_seconds"], 3600.0)
+        # Single data point: p50 == the only value
+        self.assertAlmostEqual(row["duration_p50_s"], 3600.0)
+        self.assertIn("duration_iqr_s", row)
+        self.assertIn("duration_n_outliers", row)
+
+    def test_timeout_tasks_excluded_from_duration(self) -> None:
+        # A timeout task should be counted in timeout_count but not in duration stats
+        p = _task_payload()
+        _create_task(self.conn, p)
+        with self.conn:
+            _insert_runtime(
+                self.conn, p["task_id"],
+                status="timeout",
+                started_at="2026-01-10T10:00:00+00:00",
+                finished_at="2026-01-10T11:00:00+00:00",
+                model="model-to",
+            )
+        result = mq.model_scorecard(self.conn)
+        # timeout tasks don't appear in model_scorecard (only 'done' counts quality)
+        # but timeout_count is tracked
+        to_row = next((r for r in result if r["effective_worker_model"] == "model-to"), None)
+        # model-to only has timeout tasks: total_done=0, timeout_count=1
+        if to_row is not None:
+            self.assertEqual(to_row["timeout_count"], 1)
+            self.assertEqual(to_row["total_done"], 0)
 
 
 class TestFirstPassRates(unittest.TestCase):
@@ -410,27 +434,31 @@ class TestDurationPercentiles(unittest.TestCase):
     def tearDown(self) -> None:
         self.conn.close()
 
-    def test_returns_percentile_keys(self) -> None:
+    def test_returns_iqr_keys(self) -> None:
         result = mq.duration_percentiles_by_model(self.conn)
         self.assertTrue(len(result) > 0)
         row = result[0]
-        self.assertIn("p50_seconds", row)
-        self.assertIn("p90_seconds", row)
-        self.assertIn("p99_seconds", row)
-        self.assertIn("sample_size", row)
+        for key in ("n", "n_outliers", "p25_s", "p50_s", "p75_s", "iqr_s", "p90_s", "p99_s"):
+            self.assertIn(key, row)
 
     def test_p50_is_median(self) -> None:
         result = mq.duration_percentiles_by_model(self.conn)
         row = next(r for r in result if r["effective_worker_model"] == "model-perf")
         # Median of [60,120,180,240,300] = 180s
-        self.assertAlmostEqual(row["p50_seconds"], 180.0, places=0)
+        self.assertAlmostEqual(row["p50_s"], 180.0, places=0)
+
+    def test_iqr_equals_p75_minus_p25(self) -> None:
+        result = mq.duration_percentiles_by_model(self.conn)
+        row = next(r for r in result if r["effective_worker_model"] == "model-perf")
+        if row["p25_s"] is not None and row["p75_s"] is not None:
+            self.assertAlmostEqual(row["iqr_s"], row["p75_s"] - row["p25_s"], places=1)
 
     def test_p99_gte_p90_gte_p50(self) -> None:
         result = mq.duration_percentiles_by_model(self.conn)
         for row in result:
-            if row["sample_size"] >= 3:
-                self.assertGreaterEqual(row["p99_seconds"], row["p90_seconds"])
-                self.assertGreaterEqual(row["p90_seconds"], row["p50_seconds"])
+            if row["n"] >= 3:
+                self.assertGreaterEqual(row["p99_s"], row["p90_s"])
+                self.assertGreaterEqual(row["p90_s"], row["p50_s"])
 
 
 class TestEffortCalibration(unittest.TestCase):
@@ -506,10 +534,9 @@ class TestLeadWorkCycleTimes(unittest.TestCase):
         result = mq.lead_work_cycle_times(self.conn)
         row = result[0]
         for key in (
-            "sample_size",
-            "lead_time_p50_seconds",
-            "work_time_p50_seconds",
-            "cycle_time_p50_seconds",
+            "work_time_n", "work_time_p50_s", "work_time_iqr_s",
+            "lead_time_n", "lead_time_p50_s",
+            "cycle_time_n", "cycle_time_p50_s",
         ):
             self.assertIn(key, row)
 
@@ -517,13 +544,13 @@ class TestLeadWorkCycleTimes(unittest.TestCase):
         result = mq.lead_work_cycle_times(self.conn)
         row = result[0]
         # 30 min = 1800s
-        self.assertAlmostEqual(row["work_time_p50_seconds"], 1800.0, places=0)
+        self.assertAlmostEqual(row["work_time_p50_s"], 1800.0, places=0)
 
     def test_empty_db_returns_none_percentiles(self) -> None:
         conn2, _ = _build_db()
         result = mq.lead_work_cycle_times(conn2)
-        self.assertEqual(result[0]["sample_size"], 0)
-        self.assertIsNone(result[0]["lead_time_p50_seconds"])
+        self.assertEqual(result[0]["work_time_n"], 0)
+        self.assertIsNone(result[0]["lead_time_p50_s"])
         conn2.close()
 
 

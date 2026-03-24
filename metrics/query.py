@@ -45,6 +45,55 @@ def _percentile(values: list[float], pct: float) -> float | None:
     return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (k - lo)
 
 
+def _duration_stats(values: list[float]) -> dict[str, float | int | None]:
+    """Return robust duration statistics for a list of second values.
+
+    Uses median and IQR (P25–P75) as the primary summary — not mean — so that
+    timeout-ceiling hits and random hangs don't distort the picture.
+
+    Outlier fence: values above P75 + 3×IQR are flagged and excluded from the
+    'clean' stats (they are kept in raw percentiles).  This is a loose fence
+    (3× rather than the standard 1.5×) so genuine long tasks are preserved.
+
+    Returns:
+        n               — sample size (all values)
+        n_outliers      — values above the outlier fence
+        p25, p50, p75   — quartiles (all values, including outliers)
+        iqr             — P75 - P25
+        p90, p99        — upper tail (all values)
+        median_clean    — P50 after removing outliers (None if none removed)
+    """
+    if not values:
+        return {
+            "n": 0, "n_outliers": 0,
+            "p25": None, "p50": None, "p75": None, "iqr": None,
+            "p90": None, "p99": None, "median_clean": None,
+        }
+    p25 = _percentile(values, 25)
+    p50 = _percentile(values, 50)
+    p75 = _percentile(values, 75)
+    p90 = _percentile(values, 90)
+    p99 = _percentile(values, 99)
+    iqr = (p75 - p25) if (p75 is not None and p25 is not None) else None
+    fence = (p75 + 3 * iqr) if iqr is not None else None
+
+    outliers = [v for v in values if fence is not None and v > fence]
+    clean = [v for v in values if fence is None or v <= fence]
+    median_clean = _percentile(clean, 50) if outliers else None
+
+    return {
+        "n": len(values),
+        "n_outliers": len(outliers),
+        "p25": round(p25, 1) if p25 is not None else None,
+        "p50": round(p50, 1) if p50 is not None else None,
+        "p75": round(p75, 1) if p75 is not None else None,
+        "iqr": round(iqr, 1) if iqr is not None else None,
+        "p90": round(p90, 1) if p90 is not None else None,
+        "p99": round(p99, 1) if p99 is not None else None,
+        "median_clean": round(median_clean, 1) if median_clean is not None else None,
+    }
+
+
 def _duration_seconds(start: str | None, end: str | None) -> float | None:
     """Return seconds between two ISO-8601 timestamps, or None if either is missing."""
     if not start or not end:
@@ -85,16 +134,19 @@ def model_scorecard(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         first_pass_rate, avg_rework_cycles, max_rework_cycles,
         avg_duration_seconds
     """
-    # Join impl tasks (non-AUDIT) with runtime state and metadata
+    # Join impl tasks (non-AUDIT) with runtime state and metadata.
+    # Include both 'done' and 'timeout' so we can count timeouts separately,
+    # but only 'done' tasks count toward quality and clean duration stats.
     sql = """
         SELECT
             trs.effective_worker_model,
+            trs.runtime_status,
             t.metadata_json,
             trs.started_at,
             trs.finished_at
         FROM tasks t
         JOIN task_runtime_state trs ON trs.task_id = t.task_id
-        WHERE trs.runtime_status = 'done'
+        WHERE trs.runtime_status IN ('done', 'timeout')
           AND t.task_id NOT LIKE '%-AUDIT'
     """
     raw = _rows(conn, sql)
@@ -107,29 +159,44 @@ def model_scorecard(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
     result = []
     for model, rows in sorted(buckets.items()):
-        total = len(rows)
+        done_rows = [r for r in rows if r["runtime_status"] == "done"]
+        timeout_count = sum(1 for r in rows if r["runtime_status"] == "timeout")
+        total = len(done_rows)
+
         rework_counts: list[int] = []
-        for r in rows:
+        for r in done_rows:
             try:
                 meta = json.loads(r["metadata_json"] or "{}")
             except (json.JSONDecodeError, TypeError):
                 meta = {}
             rework_counts.append(int(meta.get("rework_count") or 0))
         tasks_reworked = sum(1 for rc in rework_counts if rc > 0)
+
+        # Duration from 'done' tasks only — timeouts hit the ceiling and are excluded
         durations = [
             d for d in (
-                _duration_seconds(r["started_at"], r["finished_at"]) for r in rows
-            ) if d is not None
+                _duration_seconds(r["started_at"], r["finished_at"]) for r in done_rows
+            ) if d is not None and d >= 0
         ]
+        dur = _duration_stats(durations)
+
         result.append({
             "effective_worker_model": model,
             "total_done": total,
+            "timeout_count": timeout_count,
             "tasks_reworked": tasks_reworked,
             "rework_rate": round(tasks_reworked / total, 4) if total else None,
             "first_pass_rate": round((total - tasks_reworked) / total, 4) if total else None,
             "avg_rework_cycles": round(sum(rework_counts) / len(rework_counts), 3) if rework_counts else None,
             "max_rework_cycles": max(rework_counts) if rework_counts else None,
-            "avg_duration_seconds": round(sum(durations) / len(durations), 1) if durations else None,
+            # Duration: median + IQR; timeouts excluded; outlier count surfaced
+            "duration_p50_s": dur["p50"],
+            "duration_p25_s": dur["p25"],
+            "duration_p75_s": dur["p75"],
+            "duration_iqr_s": dur["iqr"],
+            "duration_p90_s": dur["p90"],
+            "duration_n_outliers": dur["n_outliers"],
+            "duration_median_clean_s": dur["median_clean"],
         })
     return result
 
@@ -348,13 +415,18 @@ def retry_heatmap(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def duration_percentiles_by_model(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """Work duration P50/P90/P99 by effective_worker_model.
+    """Work duration distribution by effective_worker_model.
 
     Duration is measured as finished_at − started_at (seconds).
-    Only 'done' tasks are included (excludes failures which may be truncated).
+    Only 'done' tasks are included — 'timeout' tasks hit the ceiling value by
+    definition and would inflate upper percentiles unfairly.
+
+    Reports median + IQR (P25/P50/P75) as the primary summary, plus P90/P99
+    for the upper tail, plus an outlier count (values above P75 + 3×IQR).
 
     Returns list of dicts with keys:
-        effective_worker_model, sample_size, p50_seconds, p90_seconds, p99_seconds.
+        effective_worker_model, n, n_outliers,
+        p25_s, p50_s, p75_s, iqr_s, p90_s, p99_s, median_clean_s.
     """
     sql = """
         SELECT
@@ -378,12 +450,18 @@ def duration_percentiles_by_model(conn: sqlite3.Connection) -> list[dict[str, An
 
     result = []
     for model, durations in sorted(buckets.items()):
+        s = _duration_stats(durations)
         result.append({
             "effective_worker_model": model,
-            "sample_size": len(durations),
-            "p50_seconds": _percentile(durations, 50),
-            "p90_seconds": _percentile(durations, 90),
-            "p99_seconds": _percentile(durations, 99),
+            "n": s["n"],
+            "n_outliers": s["n_outliers"],
+            "p25_s": s["p25"],
+            "p50_s": s["p50"],
+            "p75_s": s["p75"],
+            "iqr_s": s["iqr"],
+            "p90_s": s["p90"],
+            "p99_s": s["p99"],
+            "median_clean_s": s["median_clean"],
         })
     return result
 
@@ -468,13 +546,17 @@ def lead_work_cycle_times(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         work_time_{p50,p90,p99}_seconds,
         cycle_time_{p50,p90,p99}_seconds.
     """
+    # Work time excludes 'timeout' — those hit the ceiling and aren't real durations.
+    # Lead and cycle times include all terminal statuses since they measure
+    # calendar time (queueing + end-to-end), not execution quality.
     sql = """
         SELECT
             t.created_at,
             t.closed_at,
             trs.claimed_at,
             trs.started_at,
-            trs.finished_at
+            trs.finished_at,
+            trs.runtime_status
         FROM tasks t
         JOIN task_runtime_state trs ON t.task_id = trs.task_id
         WHERE trs.runtime_status IN ('done', 'failed', 'timeout', 'canceled')
@@ -487,37 +569,37 @@ def lead_work_cycle_times(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
     for r in raw:
         lt = _duration_seconds(r["created_at"], r["claimed_at"])
-        wt = _duration_seconds(r["started_at"], r["finished_at"])
         ct = _duration_seconds(r["created_at"], r["closed_at"])
         if lt is not None and lt >= 0:
             lead_times.append(lt)
-        if wt is not None and wt >= 0:
-            work_times.append(wt)
         if ct is not None and ct >= 0:
             cycle_times.append(ct)
+        # Work time: only 'done' — timeouts hit the ceiling
+        if r["runtime_status"] == "done":
+            wt = _duration_seconds(r["started_at"], r["finished_at"])
+            if wt is not None and wt >= 0:
+                work_times.append(wt)
 
-    def _pcts(vals: list[float]) -> dict[str, float | None]:
+    ls = _duration_stats(lead_times)
+    ws = _duration_stats(work_times)
+    cs = _duration_stats(cycle_times)
+
+    def _flatten(prefix: str, s: dict) -> dict:
         return {
-            "p50": _percentile(vals, 50),
-            "p90": _percentile(vals, 90),
-            "p99": _percentile(vals, 99),
+            f"{prefix}_n": s["n"],
+            f"{prefix}_n_outliers": s["n_outliers"],
+            f"{prefix}_p25_s": s["p25"],
+            f"{prefix}_p50_s": s["p50"],
+            f"{prefix}_p75_s": s["p75"],
+            f"{prefix}_iqr_s": s["iqr"],
+            f"{prefix}_p90_s": s["p90"],
+            f"{prefix}_median_clean_s": s["median_clean"],
         }
 
-    lp = _pcts(lead_times)
-    wp = _pcts(work_times)
-    cp = _pcts(cycle_times)
-
     return [{
-        "sample_size": len(raw),
-        "lead_time_p50_seconds": lp["p50"],
-        "lead_time_p90_seconds": lp["p90"],
-        "lead_time_p99_seconds": lp["p99"],
-        "work_time_p50_seconds": wp["p50"],
-        "work_time_p90_seconds": wp["p90"],
-        "work_time_p99_seconds": wp["p99"],
-        "cycle_time_p50_seconds": cp["p50"],
-        "cycle_time_p90_seconds": cp["p90"],
-        "cycle_time_p99_seconds": cp["p99"],
+        **_flatten("lead_time", ls),
+        **_flatten("work_time", ws),
+        **_flatten("cycle_time", cs),
     }]
 
 
