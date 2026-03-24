@@ -2198,7 +2198,8 @@ function renderMetrics(m) {
   renderInitiativeHealth(m.initiative_health || []);
   renderDailyThroughput(m.daily_throughput || []);
   renderRetryHeatmap(m.retry_heatmap || []);
-  renderFailureTaxonomy(m.failure_taxonomy || []);
+  renderFailureTaxonomy(m.ops_failure_taxonomy || []);
+  renderAuditVerdicts(m.audit_verdicts || []);
   renderWorkerRichness(m.worker_richness || {});
 }
 
@@ -2208,24 +2209,31 @@ function renderModelScorecard(rows) {
   if (cnt) cnt.textContent = rows.length;
   if (!rows.length) { el.innerHTML = '<div class="empty-state">No completed tasks recorded yet.</div>'; return; }
   const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+  const dur = (p50, iqr, n_out) => {
+    if (p50 == null) return '—';
+    let s = fmtSeconds(p50) + ' p50';
+    if (iqr != null) s += ' ±' + fmtSeconds(iqr/2) + ' IQR';
+    if (n_out > 0) s += ' <span class="badge badge-amber" title="outliers excluded from IQR">' + n_out + ' outliers</span>';
+    return s;
+  };
   el.innerHTML = '<div class="task-table-wrap"><table>' +
     '<thead><tr>' +
-    '<th>Model</th><th>Total</th><th>Done</th><th>Failed</th><th>Timeout</th>' +
-    '<th>Success %</th><th>Avg Duration</th><th>Rework %</th><th>First-pass %</th>' +
+    '<th>Model</th><th>Done</th><th>Timeouts</th>' +
+    '<th>First-pass %</th><th>Rework %</th><th>Avg reworks</th><th>Duration (p50 ± IQR)</th>' +
     '</tr></thead><tbody>' +
-    rows.map(r =>
-      '<tr>' +
-      '<td style="white-space:nowrap">' + esc(r.effective_worker_model) + '</td>' +
-      '<td>' + r.total + '</td>' +
-      '<td><span class="badge badge-green">' + r.done + '</span></td>' +
-      '<td><span class="badge badge-red">' + r.failed + '</span></td>' +
-      '<td><span class="badge badge-amber">' + r.timeout + '</span></td>' +
-      '<td>' + pct(r.success_rate) + '</td>' +
-      '<td>' + fmtSeconds(r.avg_duration_seconds) + '</td>' +
-      '<td>' + pct(r.rework_rate) + '</td>' +
-      '<td>' + pct(r.first_pass_success_rate) + '</td>' +
-      '</tr>'
-    ).join('') +
+    rows.map(r => {
+      const fp = r.first_pass_rate;
+      const fpcls = fp == null ? 'badge-gray' : fp >= 0.95 ? 'badge-green' : fp >= 0.85 ? 'badge-amber' : 'badge-red';
+      return '<tr>' +
+        '<td style="white-space:nowrap">' + esc(r.effective_worker_model) + '</td>' +
+        '<td><span class="badge badge-green">' + (r.total_done ?? '—') + '</span></td>' +
+        '<td>' + (r.timeout_count > 0 ? '<span class="badge badge-amber">' + r.timeout_count + '</span>' : '—') + '</td>' +
+        '<td><span class="badge ' + fpcls + '">' + pct(fp) + '</span></td>' +
+        '<td>' + pct(r.rework_rate) + '</td>' +
+        '<td>' + (r.avg_rework_cycles != null ? r.avg_rework_cycles.toFixed(2) : '—') + '</td>' +
+        '<td style="white-space:nowrap">' + dur(r.duration_p50_s, r.duration_iqr_s, r.duration_n_outliers) + '</td>' +
+        '</tr>';
+    }).join('') +
     '</tbody></table></div>';
 }
 
@@ -2236,16 +2244,17 @@ function renderEffortCalibration(rows) {
   if (!rows.length) { el.innerHTML = '<div class="empty-state">No effort data available.</div>'; return; }
   const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
   el.innerHTML = '<div class="task-table-wrap"><table>' +
-    '<thead><tr><th>Effort</th><th>Model</th><th>Total</th><th>Done</th><th>Success %</th></tr></thead><tbody>' +
+    '<thead><tr><th>Effort</th><th>Model</th><th>Done</th><th>Reworked</th><th>First-pass %</th><th>Rework %</th></tr></thead><tbody>' +
     rows.map(r => {
-      const rate = r.success_rate;
-      const cls = rate == null ? 'badge-gray' : rate >= 0.7 ? 'badge-green' : rate >= 0.4 ? 'badge-amber' : 'badge-red';
+      const fp = r.first_pass_rate;
+      const cls = fp == null ? 'badge-gray' : fp >= 0.95 ? 'badge-green' : fp >= 0.85 ? 'badge-amber' : 'badge-red';
       return '<tr>' +
         '<td><span class="badge badge-gray">' + esc(r.worker_effort) + '</span></td>' +
         '<td style="white-space:nowrap">' + esc(r.effective_worker_model) + '</td>' +
-        '<td>' + r.total + '</td>' +
-        '<td>' + r.done + '</td>' +
-        '<td><span class="badge ' + cls + '">' + pct(rate) + '</span></td>' +
+        '<td>' + (r.total_done ?? '—') + '</td>' +
+        '<td>' + (r.tasks_reworked ?? '—') + '</td>' +
+        '<td><span class="badge ' + cls + '">' + pct(fp) + '</span></td>' +
+        '<td>' + pct(r.rework_rate) + '</td>' +
         '</tr>';
     }).join('') +
     '</tbody></table></div>';
@@ -2257,24 +2266,47 @@ function renderInitiativeHealth(rows) {
   if (cnt) cnt.textContent = rows.length;
   if (!rows.length) { el.innerHTML = '<div class="empty-state">No initiative data available.</div>'; return; }
   const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
-  const bar = (done, total) => {
-    const p = total > 0 ? Math.min(100, done / total * 100) : 0;
-    const col = p >= 100 ? 'green' : 'blue';
+  const bar = (reworked, total) => {
+    const p = total > 0 ? Math.min(100, (1 - reworked/total) * 100) : 100;
+    const col = p >= 97 ? 'green' : p >= 90 ? 'blue' : 'amber';
     return '<div class="progress-track" style="min-width:80px">' +
       '<div class="progress-fill ' + col + '" style="width:' + p.toFixed(1) + '%"></div>' +
       '</div>';
   };
   el.innerHTML = '<div class="task-table-wrap"><table>' +
-    '<thead><tr><th>Initiative</th><th>Total</th><th>Done</th><th>Success %</th><th>Progress</th></tr></thead><tbody>' +
+    '<thead><tr><th>Initiative</th><th>Done</th><th>Reworked</th><th>First-pass %</th><th>Quality</th></tr></thead><tbody>' +
     rows.map(r =>
       '<tr>' +
       '<td>' + esc(r.initiative) + '</td>' +
-      '<td>' + r.total + '</td>' +
-      '<td>' + r.done + '</td>' +
-      '<td>' + pct(r.success_rate) + '</td>' +
-      '<td>' + bar(r.done, r.total) + '</td>' +
+      '<td>' + (r.total_done ?? '—') + '</td>' +
+      '<td>' + (r.tasks_reworked > 0 ? '<span class="badge badge-amber">' + r.tasks_reworked + '</span>' : '—') + '</td>' +
+      '<td>' + pct(r.first_pass_rate) + '</td>' +
+      '<td>' + bar(r.tasks_reworked || 0, r.total_done || 0) + '</td>' +
       '</tr>'
     ).join('') +
+    '</tbody></table></div>';
+}
+
+function renderAuditVerdicts(rows) {
+  const el = document.getElementById('metrics-audit-verdicts');
+  if (!el) return;
+  const cnt = document.getElementById('msec-audit-verdicts-cnt');
+  if (cnt) cnt.textContent = rows.length;
+  if (!rows.length) { el.innerHTML = '<div class="empty-state">No audit verdict data available.</div>'; return; }
+  const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+  el.innerHTML = '<div class="task-table-wrap"><table>' +
+    '<thead><tr><th>Audit Model</th><th>Total Audits</th><th>Accepted</th><th>Rework Required</th><th>Acceptance %</th></tr></thead><tbody>' +
+    rows.map(r => {
+      const ap = r.acceptance_rate;
+      const cls = ap == null ? 'badge-gray' : ap >= 0.95 ? 'badge-green' : ap >= 0.85 ? 'badge-amber' : 'badge-red';
+      return '<tr>' +
+        '<td style="white-space:nowrap">' + esc(r.model || r.group || '—') + '</td>' +
+        '<td>' + (r.total_audits ?? '—') + '</td>' +
+        '<td><span class="badge badge-green">' + (r.accepted ?? '—') + '</span></td>' +
+        '<td>' + (r.rework_required > 0 ? '<span class="badge badge-red">' + r.rework_required + '</span>' : '—') + '</td>' +
+        '<td><span class="badge ' + cls + '">' + pct(ap) + '</span></td>' +
+        '</tr>';
+    }).join('') +
     '</tbody></table></div>';
 }
 
