@@ -259,6 +259,8 @@ class CentralDispatcher:
         self._notify_batch_seconds: float = 300.0  # max one notification per 5 min
         self._started_at: float = time.time()
         self._coordination_server: CoordinationServer | None = None
+        self._cycle_count: int = 0
+        self._worker_prev_log_sizes: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # DispatcherBridge protocol (used by CoordinationServer)
@@ -502,7 +504,7 @@ class CentralDispatcher:
         remaining = len(task_ids) - limit
         return f"{shown},+{remaining}_more"
 
-    def _emit_status_heartbeat(self, *, force: bool = False) -> None:
+    def _emit_status_heartbeat(self, *, force: bool = False, elapsed_ms: int | None = None) -> None:
         now = time.monotonic()
         if not force and now - self._last_status_heartbeat_monotonic < self.config.status_heartbeat_seconds:
             return
@@ -511,23 +513,28 @@ class CentralDispatcher:
         idle_slots = max(0, self.config.max_workers - len(active_ids))
         backoff_remaining = max(0.0, self._capacity_backoff_until - time.monotonic())
         backoff_str = f" quota_backoff={backoff_remaining:.0f}s" if backoff_remaining > 0 else ""
+        elapsed_str = f" elapsed_ms={elapsed_ms}" if elapsed_ms is not None else ""
+        done_tasks = snapshot["runtime_counts"].get("done", 0)
         self.logger.emit(
             "INF",
             "central.dispatcher",
             (
                 "heartbeat "
+                f"cycle={self._cycle_count} "
                 f"state={'stopping' if self._stop_requested else 'running'} "
                 f"workers={len(active_ids)}/{self.config.max_workers} "
                 f"idle_slots={idle_slots} "
                 f"running_tasks={self._format_task_ids(active_ids)} "
                 f"eligible={snapshot['eligible_count']} "
+                f"done={done_tasks} "
                 f"next={snapshot['next_eligible_task_id'] or '-'} "
                 f"leases={snapshot['active_leases']} "
                 f"parked={snapshot['runtime_counts'].get('parked', 0)} "
                 f"review={snapshot['runtime_counts'].get('pending_review', 0)} "
                 f"failed={snapshot['actionable_failed']} "
-                f"mismatch={self._format_task_ids(snapshot['mismatch_ids'])}"
+                f"mismatch={snapshot['mismatch_count']}"
                 f"{backoff_str}"
+                f"{elapsed_str}"
             ),
         )
         # Notify if dispatcher is fully stalled: backoff active, no running workers, tasks waiting
@@ -1389,6 +1396,7 @@ class CentralDispatcher:
                     )
                     with self._active_lock:
                         self._active.pop(task_id, None)
+                    self._worker_prev_log_sizes.pop(task_id, None)
                     self._finalize_worker(state, timed_out=True)
                     self._close_worker_state(state)
                     self._emit_status_heartbeat(force=True)
@@ -1401,12 +1409,28 @@ class CentralDispatcher:
                 self._close_worker_state(state)
                 with self._active_lock:
                     self._active.pop(task_id, None)
+                self._worker_prev_log_sizes.pop(task_id, None)
                 self._emit_status_heartbeat(force=True)
                 continue
 
             if time.monotonic() - state.last_heartbeat_monotonic >= self.config.heartbeat_seconds:
                 try:
                     self._heartbeat_worker(state)
+                    elapsed = self._worker_elapsed_seconds(state)
+                    try:
+                        log_bytes = state.log_path.stat().st_size
+                    except Exception:
+                        log_bytes = 0
+                    prev_bytes = self._worker_prev_log_sizes.get(task_id, 0)
+                    growing = log_bytes > prev_bytes
+                    self._worker_prev_log_sizes[task_id] = log_bytes
+                    self.logger.emit(
+                        "INF",
+                        "central.dispatcher",
+                        f"worker_heartbeat task={task_id} run={state.run_id} "
+                        f"elapsed_s={elapsed:.0f} log_bytes={log_bytes} growing={growing}"
+                        f"{_title_kv(state.task)}",
+                    )
                 except Exception as exc:
                     self.logger.emit(
                         "INF",
@@ -1419,6 +1443,7 @@ class CentralDispatcher:
                 self._close_worker_state(state)
                 with self._active_lock:
                     self._active.pop(task_id, None)
+                self._worker_prev_log_sizes.pop(task_id, None)
                 self._emit_status_heartbeat(force=True)
 
     def _run_stale_recovery(self) -> None:
@@ -1562,6 +1587,7 @@ class CentralDispatcher:
         self._emit_status_heartbeat(force=True)
         try:
             while True:
+                _cycle_start = time.monotonic()
                 self._process_active()
                 if self._force_stop:
                     for state in self._active.values():
@@ -1590,7 +1616,9 @@ class CentralDispatcher:
                 self._run_stale_recovery()
                 if not self._stop_requested:
                     self._fill_workers()
-                self._emit_status_heartbeat()
+                self._cycle_count += 1
+                _elapsed_ms = int((time.monotonic() - _cycle_start) * 1000)
+                self._emit_status_heartbeat(elapsed_ms=_elapsed_ms)
                 self._flush_notify_if_due()
                 time.sleep(max(0.2, self.config.poll_interval))
         finally:

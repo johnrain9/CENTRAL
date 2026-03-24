@@ -110,16 +110,22 @@ class DaemonLog:
             mismatch = fields.get('mismatch', '0')
             review = fields.get('review', '0')
             next_task = fields.get('next', '-')
+            cycle = fields.get('cycle', '')
+            done = fields.get('done', '')
+            elapsed_ms = fields.get('elapsed_ms', '')
             return (
                 f"{self._style(timestamp, self.DIM)} "
-                f"{self._style('♥', self.BOLD, self.BLUE)} "
+                + (f"{self._style('#' + cycle, self.DIM)} " if cycle else "")
+                + f"{self._style('♥', self.BOLD, self.BLUE)} "
                 f"{self._style(fields.get('workers', '-'), self.BOLD, self.CYAN)} "
                 f"tasks={self._style(fields.get('running_tasks', '-'), self.GREEN)} "
                 f"eligible={self._style(fields.get('eligible', '-'), self.CYAN)}"
+                + (f" done={self._style(done, self.GREEN)}" if done else "")
                 + (f" next={self._style(next_task, self.GREEN)}" if next_task != '-' else "")
                 + (f" review={self._style(review, self.YELLOW)}" if review != '0' else "")
                 + (f" failed={self._style(failed, self.RED)}" if failed != '0' else "")
-                + (f" mismatch={self._style(mismatch, self.RED)}" if mismatch != '0' else "")
+                + (f" mismatch={self._style(mismatch, self.RED)}" if mismatch not in ('0', '-', '') else "")
+                + (f" {self._style(f'({elapsed_ms}ms)', self.DIM)}" if elapsed_ms and elapsed_ms != '0' else "")
             )
         if message.startswith("worker_spawned "):
             mode = fields.get("mode", "-")
@@ -151,7 +157,20 @@ class DaemonLog:
             status = fields.get("planner_status", "-")
             return task_line("✓", "RECONC", self.GREEN, status, self.GREEN)
         if message.startswith("worker_heartbeat "):
-            return task_line("·", "HBEAT", self.CYAN)
+            elapsed_s = fields.get('elapsed_s', '')
+            log_bytes = fields.get('log_bytes', '0')
+            growing = fields.get('growing', '')
+            extra = ""
+            if elapsed_s:
+                extra = f"{elapsed_s}s"
+                try:
+                    kb = int(log_bytes) / 1024
+                    extra += f", {kb:.0f}K"
+                except Exception:
+                    pass
+                if growing == 'True':
+                    extra += ", growing"
+            return task_line("·", "HBEAT", self.CYAN, extra, self.DIM)
         if message.startswith("worker_capacity_requeued "):
             return task_line("·", "REQUEUE", self.YELLOW, "capacity", self.YELLOW)
         if message.startswith("stale_recovery "):
