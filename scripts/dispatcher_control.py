@@ -78,13 +78,25 @@ def die(message: str, code: int = 1) -> "None":
     raise SystemExit(code)
 
 
+# Keys that are safe to load from shell profiles into the dispatcher env.
+# Explicitly NOT included: ANTHROPIC_API_KEY, OPENAI_API_KEY — those override
+# Claude Max OAuth / Codex auth in worker subprocesses, causing credit errors.
+# See eco-insights cross-cutting.md §15.
+_SAFE_SHELL_KEYS: frozenset[str] = frozenset({
+    "GROK_API_KEY",
+    "XAI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+})
+
+
 def _load_shell_api_keys() -> None:
-    """Source API keys from the user's shell profile into os.environ.
+    """Source allowlisted API keys from the user's shell profile into os.environ.
 
     Workers spawned by the dispatcher inherit our env.  Keys like
     GROK_API_KEY that live only in ~/.zprofile won't be present when the
     dispatcher is started from a non-login shell.  We source the profile
-    once at launch and merge any *_API_KEY / *_TOKEN vars we find.
+    once at launch and merge allowlisted keys we find.
     """
     for profile in ("~/.zprofile", "~/.zshrc", "~/.bash_profile", "~/.bashrc"):
         path = Path(profile).expanduser()
@@ -101,9 +113,8 @@ def _load_shell_api_keys() -> None:
                 if "=" not in line:
                     continue
                 key, _, value = line.partition("=")
-                if key.endswith("_API_KEY") or key.endswith("_TOKEN"):
-                    if key not in os.environ and value:
-                        os.environ[key] = value
+                if key in _SAFE_SHELL_KEYS and key not in os.environ and value:
+                    os.environ[key] = value
         except Exception:
             continue
 
