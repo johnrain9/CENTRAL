@@ -113,8 +113,15 @@ def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: 
         "    else:\n"
         "        _vi = _sl.find('verdict')\n"
         "        if _vi >= 0 and ('fail' in _sl[_vi:_vi+80] or '\\u274c' in summary[_vi:_vi+80]): _verdict = 'rework_required'\n"
+        "_usage = claude_result.get('usage') or {}\n"
+        "_inp = int(_usage.get('input_tokens') or 0)\n"
+        "_out = int(_usage.get('output_tokens') or 0)\n"
+        "_cache_read = int(_usage.get('cache_read_input_tokens') or 0)\n"
+        "_cache_write = int(_usage.get('cache_creation_input_tokens') or 0)\n"
+        "_tokens_used = (_inp + _out + _cache_read + _cache_write) or None\n"
+        "_tokens_cost = claude_result.get('total_cost_usd') or claude_result.get('cost_usd') or None\n"
         "payload = {\n"
-        "    'schema_version': 1,\n"
+        "    'schema_version': 2,\n"
         f"    'task_id': {task_id!r},\n"
         f"    'run_id': {run_id!r},\n"
         "    'status': 'FAILED' if is_error or proc.returncode != 0 else 'COMPLETED',\n"
@@ -132,6 +139,8 @@ def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: 
         "    'files_changed': _structured.get('files_changed', []),\n"
         "    'warnings': _structured.get('warnings', []),\n"
         "    'artifacts': _structured.get('artifacts', []),\n"
+        "    'tokens_used': _tokens_used,\n"
+        "    'tokens_cost_usd': _tokens_cost,\n"
         "    'claude_raw': claude_result,\n"
         "}\n"
         "from pathlib import Path\n"
@@ -241,9 +250,16 @@ def normalize_claude_result(log_path: Path, result_path: Path, task_id: str, run
     is_error = bool(claude_result.get("is_error"))
     raw_result = str(claude_result.get("result") or "")
     status = "FAILED" if is_error else "COMPLETED"
+    _usage = claude_result.get("usage") or {}
+    _inp = int(_usage.get("input_tokens") or 0)
+    _out = int(_usage.get("output_tokens") or 0)
+    _cache_read = int(_usage.get("cache_read_input_tokens") or 0)
+    _cache_write = int(_usage.get("cache_creation_input_tokens") or 0)
+    tokens_used: int | None = (_inp + _out + _cache_read + _cache_write) or None
+    tokens_cost_usd: float | None = claude_result.get("total_cost_usd") or claude_result.get("cost_usd") or None
     payload: dict[str, Any] = {
         "status": status,
-        "schema_version": 1,
+        "schema_version": 2,
         "task_id": task_id,
         "run_id": run_id,
         "summary": raw_result[:2000]
@@ -261,11 +277,13 @@ def normalize_claude_result(log_path: Path, result_path: Path, task_id: str, run
         "files_changed": [],
         "warnings": [],
         "artifacts": [],
+        "tokens_used": tokens_used,
+        "tokens_cost_usd": tokens_cost_usd,
         "_claude_meta": {
             "subtype": claude_result.get("subtype"),
             "session_id": claude_result.get("session_id"),
             "num_turns": claude_result.get("num_turns"),
-            "cost_usd": claude_result.get("cost_usd"),
+            "cost_usd": tokens_cost_usd,
             "duration_ms": claude_result.get("duration_ms"),
         },
     }
@@ -429,6 +447,32 @@ class GeminiBackend(WorkerBackend):
         return prompt_text, command, subprocess.PIPE
 
 
+class GrokBackend(WorkerBackend):
+    """Calls xAI Grok API via OpenAI SDK (standalone subprocess script)."""
+
+    def prepare(
+        self,
+        snapshot: dict[str, Any],
+        worker_task: dict[str, Any],
+        run_id: str,
+        result_path: Path,
+    ) -> tuple[str, list[str], Any]:
+        prompt_text = worker_task["prompt_body"]
+        task_id = worker_task.get("id") or worker_task.get("task_id") or "unknown"
+        model = worker_task["worker_model"]
+        script_path = Path(__file__).parent / "grok_worker.py"
+        command = [
+            sys.executable,
+            str(script_path),
+            model,
+            task_id,
+            run_id,
+            str(result_path),
+            str(AUTONOMY_SCHEMA_PATH),
+        ]
+        return prompt_text, command, subprocess.PIPE
+
+
 class StubBackend(WorkerBackend):
     def prepare(
         self,
@@ -450,6 +494,7 @@ _WORKER_BACKENDS: dict[str, WorkerBackend] = {
     "codex": CodexBackend(),
     "claude": ClaudeBackend(),
     "gemini": GeminiBackend(),
+    "grok": GrokBackend(),
     "stub": StubBackend(),
 }
 
