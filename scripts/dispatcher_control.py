@@ -20,7 +20,15 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import central_runtime_v2 as central_runtime
-from central_runtime_v2.config import ALLOWED_CODEX_MODELS, ALLOWED_GEMINI_MODELS, ALLOWED_GROK_MODELS, ALLOWED_REASONING_EFFORTS
+from central_runtime_v2.config import (
+    ALLOWED_CODEX_MODELS,
+    ALLOWED_GEMINI_MODELS,
+    ALLOWED_GROK_MODELS,
+    ALLOWED_REASONING_EFFORTS,
+    DEFAULT_COORDINATION_PORT,
+    DEFAULT_MAX_REMOTE_WORKERS,
+    DEFAULT_MAX_REPO_WORKERS,
+)
 
 ALLOWED_CLAUDE_MODELS: list[str] = [
     "claude-sonnet-4-6",
@@ -87,6 +95,7 @@ _SAFE_SHELL_KEYS: frozenset[str] = frozenset({
     "XAI_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
+    "CENTRAL_COORDINATION_TOKEN",
 })
 
 
@@ -346,6 +355,15 @@ def load_saved_config() -> dict[str, object]:
                 default_codex_model,
                 label=f"{CONFIG_PATH} default_codex_model",
             )
+    # Remote worker fields — backward-compat defaults applied on read
+    if "remote_workers_enabled" not in payload:
+        payload["remote_workers_enabled"] = False
+    if "coordination_port" not in payload:
+        payload["coordination_port"] = DEFAULT_COORDINATION_PORT
+    if "max_remote_workers" not in payload:
+        payload["max_remote_workers"] = DEFAULT_MAX_REMOTE_WORKERS
+    if "max_repo_workers" not in payload:
+        payload["max_repo_workers"] = DEFAULT_MAX_REPO_WORKERS
     return payload
 
 
@@ -405,7 +423,27 @@ def saved_audit_model() -> str | None:
     return payload.get("audit_worker_model")
 
 
-def save_config(*, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None, notify: bool | None = None, audit_model: str | None = None) -> None:
+def saved_remote_workers_enabled() -> bool:
+    payload = load_saved_config()
+    return bool(payload.get("remote_workers_enabled", False))
+
+
+def saved_coordination_port() -> int:
+    payload = load_saved_config()
+    return int(payload.get("coordination_port", DEFAULT_COORDINATION_PORT))
+
+
+def saved_max_remote_workers() -> int:
+    payload = load_saved_config()
+    return int(payload.get("max_remote_workers", DEFAULT_MAX_REMOTE_WORKERS))
+
+
+def saved_max_repo_workers() -> int:
+    payload = load_saved_config()
+    return int(payload.get("max_repo_workers", DEFAULT_MAX_REPO_WORKERS))
+
+
+def save_config(*, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None, notify: bool | None = None, audit_model: str | None = None, remote_workers_enabled: bool | None = None, coordination_port: int | None = None, max_remote_workers: int | None = None, max_repo_workers: int | None = None) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     payload = load_saved_config()
     if max_workers is not None:
@@ -422,6 +460,14 @@ def save_config(*, max_workers: int | None = None, codex_model: str | None = Non
         payload["notify"] = notify
     if audit_model is not None:
         payload["audit_worker_model"] = central_runtime.normalize_codex_model(audit_model, label="audit model")
+    if remote_workers_enabled is not None:
+        payload["remote_workers_enabled"] = remote_workers_enabled
+    if coordination_port is not None:
+        payload["coordination_port"] = coordination_port
+    if max_remote_workers is not None:
+        payload["max_remote_workers"] = max_remote_workers
+    if max_repo_workers is not None:
+        payload["max_repo_workers"] = max_repo_workers
     payload["updated_at"] = utc_now()
     CONFIG_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -482,6 +528,8 @@ def launcher_status_payload() -> dict[str, object]:
     payload = runtime_status_payload()
     effective = resolve_max_workers()
     effective_model = resolve_worker_model()
+    remote_enabled = saved_remote_workers_enabled()
+    coord_port = saved_coordination_port()
     payload.update(
         {
             "launcher_config_path": str(CONFIG_PATH),
@@ -491,6 +539,12 @@ def launcher_status_payload() -> dict[str, object]:
             "saved_default_codex_model": saved_codex_model(),
             "saved_audit_worker_model": saved_audit_model(),
             "env_default_worker_model": env_worker_model() or env_codex_model(),
+            # remote workers
+            "remote_workers_enabled": remote_enabled,
+            "coordination_port": coord_port,
+            "max_remote_workers": saved_max_remote_workers(),
+            "max_repo_workers": saved_max_repo_workers(),
+            "coordination_api_url": f"http://0.0.0.0:{coord_port}" if remote_enabled else None,
             # effective = what start/restart will use
             "effective_start_max_workers": effective.value,
             "effective_start_source": effective.source,
@@ -527,6 +581,10 @@ def start_dispatcher(*, restart: bool = False) -> int:
         stop_dispatcher(quiet=True)
 
     effective_audit_model = saved_audit_model()
+    effective_remote_workers = saved_remote_workers_enabled()
+    effective_coordination_port = saved_coordination_port()
+    effective_max_remote_workers = saved_max_remote_workers()
+    effective_max_repo_workers = saved_max_repo_workers()
     # Ensure API keys are available to the daemon subprocess.  The daemon
     # inherits our env, but keys defined only in ~/.zprofile or ~/.zshrc
     # won't be present when the dispatcher is launched from a non-login
@@ -543,6 +601,11 @@ def start_dispatcher(*, restart: bool = False) -> int:
             daemon_args.extend(["--audit-worker-model", effective_audit_model])
         if effective_notify:
             daemon_args.append("--notify")
+        if effective_remote_workers:
+            daemon_args.append("--remote-workers")
+        daemon_args.extend(["--coordination-port", str(effective_coordination_port)])
+        daemon_args.extend(["--max-remote-workers", str(effective_max_remote_workers)])
+        daemon_args.extend(["--max-repo-workers", str(effective_max_repo_workers)])
         proc = subprocess.Popen(
             runtime_cmd(*daemon_args),
             cwd=str(REPO_DIR),
@@ -678,10 +741,10 @@ def show_workers(*, as_json: bool, task_id: str | None, limit: int, recent_hours
     return 0
 
 
-def show_config(*, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None, notify: bool | None = None, audit_model: str | None = None) -> int:
+def show_config(*, max_workers: int | None = None, codex_model: str | None = None, worker_model: str | None = None, worker_mode: str | None = None, notify: bool | None = None, audit_model: str | None = None, remote_workers_enabled: bool | None = None, coordination_port: int | None = None, max_remote_workers: int | None = None, max_repo_workers: int | None = None) -> int:
     ensure_runtime()
-    if max_workers is not None or codex_model is not None or worker_model is not None or worker_mode is not None or notify is not None or audit_model is not None:
-        save_config(max_workers=max_workers, codex_model=codex_model, worker_model=worker_model, worker_mode=worker_mode, notify=notify, audit_model=audit_model)
+    if any(v is not None for v in [max_workers, codex_model, worker_model, worker_mode, notify, audit_model, remote_workers_enabled, coordination_port, max_remote_workers, max_repo_workers]):
+        save_config(max_workers=max_workers, codex_model=codex_model, worker_model=worker_model, worker_mode=worker_mode, notify=notify, audit_model=audit_model, remote_workers_enabled=remote_workers_enabled, coordination_port=coordination_port, max_remote_workers=max_remote_workers, max_repo_workers=max_repo_workers)
     payload = load_saved_config()
     effective = resolve_max_workers()
     effective_model = resolve_worker_model()
@@ -695,6 +758,10 @@ def show_config(*, max_workers: int | None = None, codex_model: str | None = Non
                 "saved_audit_worker_model": payload.get("audit_worker_model"),
                 "saved_worker_mode": payload.get("worker_mode"),
                 "saved_notify": payload.get("notify"),
+                "saved_remote_workers_enabled": payload.get("remote_workers_enabled"),
+                "saved_coordination_port": payload.get("coordination_port"),
+                "saved_max_remote_workers": payload.get("max_remote_workers"),
+                "saved_max_repo_workers": payload.get("max_repo_workers"),
                 "updated_at": payload.get("updated_at"),
                 "env_max_workers": env_max_workers(),
                 "env_default_worker_model": env_worker_model() or env_codex_model(),
@@ -1165,6 +1232,11 @@ def build_parser() -> argparse.ArgumentParser:
     config_parser.add_argument("--worker-mode", choices=["codex", "claude", "gemini", "grok", "stub"])
     config_parser.add_argument("--notify", action="store_true", default=None)
     config_parser.add_argument("--no-notify", dest="notify", action="store_false")
+    config_parser.add_argument("--remote-workers", dest="remote_workers_enabled", action="store_true", default=None, help="Enable remote worker coordination API")
+    config_parser.add_argument("--no-remote-workers", dest="remote_workers_enabled", action="store_false", help="Disable remote worker coordination API")
+    config_parser.add_argument("--coordination-port", type=int, default=None, help=f"Coordination API port (default {DEFAULT_COORDINATION_PORT})")
+    config_parser.add_argument("--max-remote-workers", type=argparse_positive_int, default=None, help=f"Max concurrent remote workers (default {DEFAULT_MAX_REMOTE_WORKERS})")
+    config_parser.add_argument("--max-repo-workers", type=argparse_positive_int, default=None, help=f"Max concurrent workers per repo across local+remote (default {DEFAULT_MAX_REPO_WORKERS})")
 
     kill_parser = subparsers.add_parser("kill-task", help="Fail a task by operator request and terminate its worker if present")
     kill_parser.add_argument("task_id")
@@ -1216,6 +1288,10 @@ def main(argv: list[str]) -> int:
             worker_mode=getattr(args, "worker_mode", None),
             notify=getattr(args, "notify", None),
             audit_model=getattr(args, "audit_model", None),
+            remote_workers_enabled=getattr(args, "remote_workers_enabled", None),
+            coordination_port=getattr(args, "coordination_port", None),
+            max_remote_workers=getattr(args, "max_remote_workers", None),
+            max_repo_workers=getattr(args, "max_repo_workers", None),
         )
     if cmd == "kill-task":
         return kill_task(task_id=args.task_id, reason=args.reason, as_json=getattr(args, "json", False))

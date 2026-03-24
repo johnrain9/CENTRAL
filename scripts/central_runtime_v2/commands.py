@@ -21,6 +21,9 @@ from typing import Any
 
 from central_runtime_v2.config import (
     DEFAULT_CODEX_MODEL,
+    DEFAULT_COORDINATION_PORT,
+    DEFAULT_MAX_REMOTE_WORKERS,
+    DEFAULT_MAX_REPO_WORKERS,
     DispatcherConfig,
     REPO_ROOT,
 )
@@ -404,6 +407,10 @@ def build_dispatcher_config(args: argparse.Namespace) -> DispatcherConfig:
         default_worker_model=resolve_default_worker_model(args.worker_mode, explicit_default_model),
         notify=getattr(args, "notify", False),
         audit_worker_model=getattr(args, "audit_worker_model", None),
+        remote_workers_enabled=getattr(args, "remote_workers", False),
+        coordination_port=getattr(args, "coordination_port", DEFAULT_COORDINATION_PORT),
+        max_remote_workers=getattr(args, "max_remote_workers", DEFAULT_MAX_REMOTE_WORKERS),
+        max_repo_workers=getattr(args, "max_repo_workers", DEFAULT_MAX_REPO_WORKERS),
     )
 
 
@@ -568,6 +575,10 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--default-worker-model", "--worker-model")
         sub.add_argument("--audit-worker-model", default=None, help="Separate model for audit tasks")
         sub.add_argument("--notify", action="store_true", default=False)
+        sub.add_argument("--remote-workers", action="store_true", default=False, help="Enable remote worker coordination API")
+        sub.add_argument("--coordination-port", type=int, default=DEFAULT_COORDINATION_PORT, help=f"Coordination API port (default {DEFAULT_COORDINATION_PORT})")
+        sub.add_argument("--max-remote-workers", type=int, default=DEFAULT_MAX_REMOTE_WORKERS, help=f"Max concurrent remote workers (default {DEFAULT_MAX_REMOTE_WORKERS})")
+        sub.add_argument("--max-repo-workers", type=int, default=DEFAULT_MAX_REPO_WORKERS, help=f"Max concurrent workers per repo (default {DEFAULT_MAX_REPO_WORKERS})")
         sub.set_defaults(func=func)
 
     self_check_parser = subparsers.add_parser(

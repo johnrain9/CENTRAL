@@ -1,0 +1,144 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AutonomyWorkerResult",
+  "type": "object",
+  "required": [
+    "status",
+    "schema_version",
+    "task_id",
+    "run_id",
+    "summary",
+    "verdict",
+    "completed_items",
+    "remaining_items",
+    "decisions",
+    "discoveries",
+    "blockers",
+    "validation",
+    "requirements_assessment",
+    "system_fit_assessment",
+    "files_changed",
+    "warnings",
+    "artifacts"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["COMPLETED", "PARTIAL", "BLOCKED", "FAILED"]
+    },
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["accepted", "rework_required", "blocked", "failed"]
+    },
+    "completed_items": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "remaining_items": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "decisions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "discoveries": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "blockers": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "validation": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "passed", "notes"],
+        "properties": {
+          "name": { "type": "string" },
+          "passed": { "type": "boolean" },
+          "notes": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "requirements_assessment": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["requirement", "verdict", "notes"],
+        "properties": {
+          "requirement": { "type": "string" },
+          "verdict": {
+            "type": "string",
+            "enum": ["met", "partially_met", "not_met", "not_applicable"]
+          },
+          "notes": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "system_fit_assessment": {
+      "type": "object",
+      "required": ["verdict", "notes", "local_optimization_risk"],
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": ["fit", "partial_fit", "not_fit"]
+        },
+        "notes": { "type": "string" },
+        "local_optimization_risk": {
+          "type": "string",
+          "enum": ["low", "medium", "high"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "path", "notes"],
+        "properties": {
+          "type": { "type": "string" },
+          "path": { "type": "string" },
+          "notes": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "tokens_used": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total tokens consumed by this worker run (input + output). Optional; populated by backends that expose usage data."
+    },
+    "tokens_cost_usd": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "Estimated cost in USD for this worker run. Optional; populated by backends that expose cost data."
+    }
+  },
+  "additionalProperties": false
+}

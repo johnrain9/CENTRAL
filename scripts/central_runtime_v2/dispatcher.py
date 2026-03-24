@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import signal
 import socket
 import subprocess
@@ -26,6 +27,7 @@ from central_runtime_v2.config import (
     RuntimePaths,
     snapshot_retry_count,
 )
+from central_runtime_v2.coordination import CoordinationConfig, CoordinationServer
 from central_runtime_v2.paths import (
     acquire_lock,
     build_runtime_paths,
@@ -255,6 +257,44 @@ class CentralDispatcher:
         self._notify_queue: list[dict] = []
         self._notify_last_sent: float = 0.0
         self._notify_batch_seconds: float = 300.0  # max one notification per 5 min
+        self._started_at: float = time.time()
+        self._coordination_server: CoordinationServer | None = None
+
+    # ------------------------------------------------------------------
+    # DispatcherBridge protocol (used by CoordinationServer)
+    # ------------------------------------------------------------------
+
+    @property
+    def db_path(self) -> Path:
+        return self.config.db_path
+
+    @property
+    def dispatcher_config(self) -> DispatcherConfig:
+        return self.config
+
+    @property
+    def active_workers(self) -> dict[str, ActiveWorker]:
+        return self._active
+
+    @property
+    def active_lock(self) -> threading.Lock:
+        return self._active_lock
+
+    def dispatcher_version(self) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(Path(__file__).resolve().parent.parent.parent), "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.stdout.strip() if result.returncode == 0 else "unknown"
+        except Exception:
+            return "unknown"
+
+    def dispatcher_id(self) -> str:
+        return socket.gethostname()
+
+    def started_at(self) -> float:
+        return self._started_at
 
     def _capacity_backoff_active(self) -> bool:
         """Return True if the dispatcher is currently in a capacity backoff window."""
@@ -1310,9 +1350,50 @@ class CentralDispatcher:
             conn.close()
 
     def _process_active(self) -> None:
+        # Drain finalization queue from remote worker results submitted via HTTP
+        if self._coordination_server is not None:
+            fq = self._coordination_server.finalization_queue
+            while True:
+                try:
+                    task_id, _run_id = fq.get_nowait()
+                except queue.Empty:
+                    break
+                with self._active_lock:
+                    state = self._active.pop(task_id, None)
+                if state is not None:
+                    self._finalize_worker(state, timed_out=False)
+                    self._close_worker_state(state)
+                    self._emit_status_heartbeat(force=True)
+
+        HEARTBEAT_LIVENESS_MULTIPLIER = 3
+        heartbeat_liveness_window = self.config.heartbeat_seconds * HEARTBEAT_LIVENESS_MULTIPLIER
+
         with self._active_lock:
             active_snapshot = list(self._active.items())
         for task_id, state in active_snapshot:
+            if state.is_remote:
+                # Remote workers: use heartbeat liveness window for crash detection.
+                # The HTTP heartbeat handler updates last_heartbeat_monotonic in-memory.
+                heartbeat_age = time.monotonic() - state.last_heartbeat_monotonic
+                timed_out = heartbeat_age > heartbeat_liveness_window
+                # Also enforce total task execution timeout
+                if not timed_out:
+                    elapsed = self._worker_elapsed_seconds(state)
+                    timed_out = elapsed > state.timeout_seconds
+                if timed_out:
+                    self.logger.emit(
+                        "WRN",
+                        "central.dispatcher",
+                        f"remote_worker_timeout task={task_id} run={state.run_id} "
+                        f"heartbeat_age={heartbeat_age:.0f}s liveness_window={heartbeat_liveness_window:.0f}s{_title_kv(state.task)}",
+                    )
+                    with self._active_lock:
+                        self._active.pop(task_id, None)
+                    self._finalize_worker(state, timed_out=True)
+                    self._close_worker_state(state)
+                    self._emit_status_heartbeat(force=True)
+                continue
+
             elapsed = self._worker_elapsed_seconds(state)
             if elapsed > state.timeout_seconds:
                 terminate_process(state.pid, state.proc, pgid=state.pgid)
@@ -1445,6 +1526,27 @@ class CentralDispatcher:
         acquire_lock(self.paths, self.config)
         self._setup_signals()
         self._running = True
+        self._started_at = time.time()
+
+        # Start coordination server for remote workers if enabled
+        if self.config.remote_workers_enabled:
+            token = os.environ.get("CENTRAL_COORDINATION_TOKEN", "")
+            coord_config = CoordinationConfig(
+                port=self.config.coordination_port,
+                token=token,
+                max_remote_workers=self.config.max_remote_workers,
+                heartbeat_seconds=self.config.heartbeat_seconds,
+            )
+            self._coordination_server = CoordinationServer(self, coord_config)
+            self._coordination_server.start()
+            self.logger.emit(
+                "INF",
+                "central.dispatcher",
+                f"coordination_server_started port={self.config.coordination_port} "
+                f"max_remote_workers={self.config.max_remote_workers} "
+                f"auth={'enabled' if token else 'WARNING:no_token'}",
+            )
+
         adopted = self._adopt_active_workers()
         self.logger.emit(
             "INF",
@@ -1453,6 +1555,7 @@ class CentralDispatcher:
                 f"dispatcher_started max_workers={self.config.max_workers} "
                 f"worker_mode={self.config.worker_mode} "
                 f"default_worker_model={self.config.default_worker_model} "
+                f"remote_workers_enabled={self.config.remote_workers_enabled} "
                 f"adopted_workers={adopted}"
             ),
         )
@@ -1493,6 +1596,8 @@ class CentralDispatcher:
         finally:
             for state in list(self._active.values()):
                 self._close_worker_state(state)
+            if self._coordination_server is not None:
+                self._coordination_server.stop()
             release_lock(self.paths)
             self.logger.emit("INF", "central.dispatcher", "dispatcher_stopped")
         return 0

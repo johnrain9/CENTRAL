@@ -48,6 +48,17 @@ DEFAULT_GROK_MODEL_ENV = "CENTRAL_DISPATCHER_GROK_MODEL"
 
 DEFAULT_WORKER_MODEL_ENV = "CENTRAL_DISPATCHER_WORKER_MODEL"
 
+# ---------------------------------------------------------------------------
+# Remote worker coordination
+# ---------------------------------------------------------------------------
+
+REMOTE_WORKERS_ENABLED_ENV = "CENTRAL_REMOTE_WORKERS"
+COORDINATION_PORT_ENV = "CENTRAL_COORDINATION_PORT"
+COORDINATION_TOKEN_ENV = "CENTRAL_COORDINATION_TOKEN"
+DEFAULT_COORDINATION_PORT = 7429
+DEFAULT_MAX_REMOTE_WORKERS = 3
+DEFAULT_MAX_REPO_WORKERS = 3  # per-repo cap across local + remote
+
 # Model policy tiers.
 # High tier is used for design/architecture tasks; medium is the routine default.
 # These can be overridden via environment variables.
@@ -166,6 +177,10 @@ class DispatcherConfig:
     max_retries: int = 5
     notify: bool = False
     audit_worker_model: str | None = None
+    remote_workers_enabled: bool = False
+    coordination_port: int = DEFAULT_COORDINATION_PORT
+    max_remote_workers: int = DEFAULT_MAX_REMOTE_WORKERS
+    max_repo_workers: int = DEFAULT_MAX_REPO_WORKERS
 
 
 @dataclass(frozen=True)
