@@ -1327,6 +1327,19 @@ tr.selected td { background: #1a2540; }
     </div>
   </div>
 
+  <!-- Audit Verdicts -->
+  <div class="section" id="msec-audit-verdicts">
+    <div class="section-header" onclick="toggleSection('msec-audit-verdicts')">
+      <span class="section-title">Audit Verdicts</span>
+      <span class="section-count" id="msec-audit-verdicts-cnt">—</span>
+      <span class="collapse-arrow">▾</span>
+    </div>
+    <div class="section-body">
+      <div class="metrics-note">Accepted vs rework_required verdicts from audit workers — the primary quality signal.</div>
+      <div id="metrics-audit-verdicts"><div class="empty-state">Loading…</div></div>
+    </div>
+  </div>
+
   <!-- Effort Calibration -->
   <div class="section" id="msec-effort">
     <div class="section-header" onclick="toggleSection('msec-effort')">
