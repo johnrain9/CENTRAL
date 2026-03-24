@@ -607,6 +607,137 @@ def lead_work_cycle_times(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 # 8. Failure mode grouping
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 9. Audit pass rate over time (trend by ISO week × model)
+# ---------------------------------------------------------------------------
+
+def audit_pass_rate_over_time(
+    conn: sqlite3.Connection,
+    *,
+    weeks: int = 12,
+) -> list[dict[str, Any]]:
+    """Audit first-pass rate per ISO week and effective_worker_model.
+
+    Groups completed impl tasks (excluding AUDIT tasks) by ISO week and model,
+    then derives first_pass_rate from rework_count in metadata_json — the same
+    quality signal used in model_scorecard().
+
+    Only rows where at least one task completed in that week+model bucket are
+    returned.
+
+    Returns list of dicts with keys:
+        week (str, YYYY-WW), model (str), total_done (int),
+        tasks_reworked (int), first_pass_rate (float 0–1 or None).
+    Sorted ascending by week, then by model.
+    """
+    sql = """
+        SELECT
+            STRFTIME('%Y-%W', trs.finished_at) AS week,
+            trs.effective_worker_model,
+            t.metadata_json
+        FROM tasks t
+        JOIN task_runtime_state trs ON trs.task_id = t.task_id
+        WHERE trs.runtime_status = 'done'
+          AND t.task_id NOT LIKE '%-AUDIT'
+          AND trs.finished_at >= DATE('now', ?)
+    """
+    raw = _rows(conn, sql, (f"-{weeks * 7} days",))
+
+    from collections import defaultdict
+    buckets: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for r in raw:
+        week = r["week"] or "unknown"
+        model = r["effective_worker_model"] or "unknown"
+        try:
+            meta = json.loads(r["metadata_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+        rework_count = int(meta.get("rework_count") or 0)
+        buckets[(week, model)].append(rework_count)
+
+    result = []
+    for (week, model), rework_counts in sorted(buckets.items()):
+        total = len(rework_counts)
+        reworked = sum(1 for rc in rework_counts if rc > 0)
+        result.append({
+            "week": week,
+            "model": model,
+            "total_done": total,
+            "tasks_reworked": reworked,
+            "first_pass_rate": round((total - reworked) / total, 4) if total else None,
+        })
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 10. Duration and cost over time (trend by ISO week × model)
+# ---------------------------------------------------------------------------
+
+def duration_cost_over_time(
+    conn: sqlite3.Connection,
+    *,
+    weeks: int = 12,
+) -> list[dict[str, Any]]:
+    """Duration (P50) and average cost per ISO week and effective_worker_model.
+
+    Groups completed impl tasks by ISO week and model.  Duration is
+    finished_at − started_at in seconds; cost comes from tokens_cost_usd.
+    Rows where both p50_duration_s and avg_cost_usd are None are excluded.
+
+    Returns list of dicts with keys:
+        week (str, YYYY-WW), model (str), task_count (int),
+        p50_duration_s (float or None), avg_cost_usd (float or None).
+    Sorted ascending by week, then by model.
+    """
+    sql = """
+        SELECT
+            STRFTIME('%Y-%W', trs.finished_at) AS week,
+            trs.effective_worker_model,
+            trs.started_at,
+            trs.finished_at,
+            trs.tokens_cost_usd
+        FROM task_runtime_state trs
+        WHERE trs.runtime_status = 'done'
+          AND trs.finished_at >= DATE('now', ?)
+    """
+    raw = _rows(conn, sql, (f"-{weeks * 7} days",))
+
+    from collections import defaultdict
+    durations_map: dict[tuple[str, str], list[float]] = defaultdict(list)
+    costs_map: dict[tuple[str, str], list[float]] = defaultdict(list)
+    counts_map: dict[tuple[str, str], int] = defaultdict(int)
+
+    for r in raw:
+        week = r["week"] or "unknown"
+        model = r["effective_worker_model"] or "unknown"
+        key = (week, model)
+        counts_map[key] += 1
+        d = _duration_seconds(r["started_at"], r["finished_at"])
+        if d is not None and d >= 0:
+            durations_map[key].append(d)
+        if r["tokens_cost_usd"] is not None:
+            costs_map[key].append(float(r["tokens_cost_usd"]))
+
+    result = []
+    for key in sorted(counts_map.keys()):
+        week, model = key
+        durs = durations_map[key]
+        costs = costs_map[key]
+        p50 = _percentile(durs, 50)
+        avg_cost = (sum(costs) / len(costs)) if costs else None
+
+        if p50 is None and avg_cost is None:
+            continue
+
+        result.append({
+            "week": week,
+            "model": model,
+            "task_count": counts_map[key],
+            "p50_duration_s": round(p50, 1) if p50 is not None else None,
+            "avg_cost_usd": round(avg_cost, 6) if avg_cost is not None else None,
+        })
+    return result
+
 def failure_mode_groups(
     conn: sqlite3.Connection,
     *,

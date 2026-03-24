@@ -727,5 +727,235 @@ class TestRetryHeatmap(unittest.TestCase):
         self.assertAlmostEqual(result[0]["avg_retries"], 0.333, places=3)
 
 
+class TestAuditPassRateOverTime(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn, _ = _build_db()
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def test_empty_db_returns_empty_list(self) -> None:
+        result = mq.audit_pass_rate_over_time(self.conn)
+        self.assertEqual(result, [])
+
+    def test_returns_expected_keys(self) -> None:
+        p = _task_payload()
+        _create_task(self.conn, p)
+        with self.conn:
+            _insert_runtime(self.conn, p["task_id"], status="done",
+                            finished_at="2026-03-20T10:00:00+00:00")
+        result = mq.audit_pass_rate_over_time(self.conn, weeks=52)
+        self.assertTrue(len(result) > 0)
+        row = result[0]
+        for key in ("week", "model", "total_done", "tasks_reworked", "first_pass_rate"):
+            self.assertIn(key, row)
+
+    def test_first_pass_rate_no_rework(self) -> None:
+        p = _task_payload()
+        _create_task(self.conn, p)
+        with self.conn:
+            _insert_runtime(self.conn, p["task_id"], status="done",
+                            model="model-a", finished_at="2026-03-20T10:00:00+00:00")
+        result = mq.audit_pass_rate_over_time(self.conn, weeks=52)
+        row = next(r for r in result if r["model"] == "model-a")
+        self.assertEqual(row["total_done"], 1)
+        self.assertEqual(row["tasks_reworked"], 0)
+        self.assertEqual(row["first_pass_rate"], 1.0)
+
+    def test_first_pass_rate_with_rework(self) -> None:
+        p1 = _task_payload()
+        p2 = _task_payload()
+        _create_task(self.conn, p1, metadata={"rework_count": 1})
+        _create_task(self.conn, p2)
+        with self.conn:
+            _insert_runtime(self.conn, p1["task_id"], status="done",
+                            model="model-b", finished_at="2026-03-20T10:00:00+00:00")
+            _insert_runtime(self.conn, p2["task_id"], status="done",
+                            model="model-b", finished_at="2026-03-20T11:00:00+00:00")
+        result = mq.audit_pass_rate_over_time(self.conn, weeks=52)
+        row = next(r for r in result if r["model"] == "model-b")
+        self.assertEqual(row["total_done"], 2)
+        self.assertEqual(row["tasks_reworked"], 1)
+        self.assertAlmostEqual(row["first_pass_rate"], 0.5)
+
+    def test_audit_tasks_excluded(self) -> None:
+        p = _task_payload(task_id="ECO-500-AUDIT")
+        _create_task(self.conn, p)
+        with self.conn:
+            _insert_runtime(self.conn, p["task_id"], status="done",
+                            model="model-c", finished_at="2026-03-20T10:00:00+00:00")
+        result = mq.audit_pass_rate_over_time(self.conn, weeks=52)
+        self.assertEqual([r for r in result if r["model"] == "model-c"], [])
+
+    def test_different_weeks_returned_separately(self) -> None:
+        for finished_at in ("2026-03-10T10:00:00+00:00", "2026-03-20T10:00:00+00:00"):
+            p = _task_payload()
+            _create_task(self.conn, p)
+            with self.conn:
+                _insert_runtime(self.conn, p["task_id"], status="done",
+                                model="model-d", finished_at=finished_at)
+        result = mq.audit_pass_rate_over_time(self.conn, weeks=52)
+        model_d_rows = [r for r in result if r["model"] == "model-d"]
+        weeks = {r["week"] for r in model_d_rows}
+        self.assertEqual(len(weeks), 2)
+
+    def test_weeks_window_filters_old_tasks(self) -> None:
+        p = _task_payload()
+        _create_task(self.conn, p)
+        with self.conn:
+            # Very old task — outside any reasonable window
+            _insert_runtime(self.conn, p["task_id"], status="done",
+                            model="model-old", finished_at="2020-01-01T10:00:00+00:00")
+        result = mq.audit_pass_rate_over_time(self.conn, weeks=4)
+        self.assertEqual([r for r in result if r["model"] == "model-old"], [])
+
+    def test_sorted_ascending_by_week_then_model(self) -> None:
+        data = [
+            ("2026-03-20T10:00:00+00:00", "model-z"),
+            ("2026-03-10T10:00:00+00:00", "model-a"),
+            ("2026-03-10T10:00:00+00:00", "model-b"),
+        ]
+        for finished_at, model in data:
+            p = _task_payload()
+            _create_task(self.conn, p)
+            with self.conn:
+                _insert_runtime(self.conn, p["task_id"], status="done",
+                                model=model, finished_at=finished_at)
+        result = mq.audit_pass_rate_over_time(self.conn, weeks=52)
+        keys = [(r["week"], r["model"]) for r in result]
+        self.assertEqual(keys, sorted(keys))
+
+
+class TestDurationCostOverTime(unittest.TestCase):
+    def setUp(self) -> None:
+        self.conn, _ = _build_db()
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def test_empty_db_returns_empty_list(self) -> None:
+        result = mq.duration_cost_over_time(self.conn)
+        self.assertEqual(result, [])
+
+    def test_returns_expected_keys(self) -> None:
+        p = _task_payload()
+        _create_task(self.conn, p)
+        with self.conn:
+            _insert_runtime(self.conn, p["task_id"], status="done",
+                            model="model-e",
+                            started_at="2026-03-20T10:00:00+00:00",
+                            finished_at="2026-03-20T10:30:00+00:00")
+        result = mq.duration_cost_over_time(self.conn, weeks=52)
+        self.assertTrue(len(result) > 0)
+        row = result[0]
+        for key in ("week", "model", "task_count", "p50_duration_s", "avg_cost_usd"):
+            self.assertIn(key, row)
+
+    def test_p50_duration_computed(self) -> None:
+        # Two tasks: 30m and 60m → median = 45m = 2700s
+        p1 = _task_payload()
+        p2 = _task_payload()
+        _create_task(self.conn, p1)
+        _create_task(self.conn, p2)
+        with self.conn:
+            _insert_runtime(self.conn, p1["task_id"], status="done",
+                            model="model-f",
+                            started_at="2026-03-20T10:00:00+00:00",
+                            finished_at="2026-03-20T10:30:00+00:00")
+            _insert_runtime(self.conn, p2["task_id"], status="done",
+                            model="model-f",
+                            started_at="2026-03-20T10:00:00+00:00",
+                            finished_at="2026-03-20T11:00:00+00:00")
+        result = mq.duration_cost_over_time(self.conn, weeks=52)
+        row = next(r for r in result if r["model"] == "model-f")
+        self.assertEqual(row["task_count"], 2)
+        self.assertAlmostEqual(row["p50_duration_s"], 2700.0, places=0)
+
+    def test_avg_cost_usd_computed(self) -> None:
+        p1 = _task_payload()
+        p2 = _task_payload()
+        _create_task(self.conn, p1)
+        _create_task(self.conn, p2)
+        with self.conn:
+            _insert_runtime(self.conn, p1["task_id"], status="done",
+                            model="model-g",
+                            started_at="2026-03-20T10:00:00+00:00",
+                            finished_at="2026-03-20T10:30:00+00:00")
+            _insert_runtime(self.conn, p2["task_id"], status="done",
+                            model="model-g",
+                            started_at="2026-03-20T10:00:00+00:00",
+                            finished_at="2026-03-20T11:00:00+00:00")
+            self.conn.execute(
+                "UPDATE task_runtime_state SET tokens_cost_usd = ? WHERE task_id = ?",
+                (0.10, p1["task_id"]),
+            )
+            self.conn.execute(
+                "UPDATE task_runtime_state SET tokens_cost_usd = ? WHERE task_id = ?",
+                (0.20, p2["task_id"]),
+            )
+        result = mq.duration_cost_over_time(self.conn, weeks=52)
+        row = next(r for r in result if r["model"] == "model-g")
+        self.assertAlmostEqual(row["avg_cost_usd"], 0.15, places=4)
+
+    def test_row_excluded_when_both_null(self) -> None:
+        # Task with no timestamps and no cost → should be excluded
+        p = _task_payload()
+        _create_task(self.conn, p)
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO task_runtime_state
+                       (task_id, runtime_status, effective_worker_model, worker_model_source,
+                        retry_count, finished_at, last_transition_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (p["task_id"], "done", "model-null", "dispatcher_default",
+                 0, "2026-03-20T10:00:00+00:00", "2026-03-20T10:00:00+00:00"),
+            )
+        result = mq.duration_cost_over_time(self.conn, weeks=52)
+        # model-null has no started_at → p50 is None, no cost → avg_cost is None → excluded
+        self.assertEqual([r for r in result if r["model"] == "model-null"], [])
+
+    def test_different_weeks_returned_separately(self) -> None:
+        for finished_at in ("2026-03-10T10:00:00+00:00", "2026-03-20T10:00:00+00:00"):
+            p = _task_payload()
+            _create_task(self.conn, p)
+            with self.conn:
+                _insert_runtime(self.conn, p["task_id"], status="done",
+                                model="model-h",
+                                started_at=finished_at,
+                                finished_at=finished_at)
+        result = mq.duration_cost_over_time(self.conn, weeks=52)
+        model_h_rows = [r for r in result if r["model"] == "model-h"]
+        weeks = {r["week"] for r in model_h_rows}
+        self.assertEqual(len(weeks), 2)
+
+    def test_weeks_window_filters_old_tasks(self) -> None:
+        p = _task_payload()
+        _create_task(self.conn, p)
+        with self.conn:
+            _insert_runtime(self.conn, p["task_id"], status="done",
+                            model="model-ancient",
+                            started_at="2020-01-01T10:00:00+00:00",
+                            finished_at="2020-01-01T10:30:00+00:00")
+        result = mq.duration_cost_over_time(self.conn, weeks=4)
+        self.assertEqual([r for r in result if r["model"] == "model-ancient"], [])
+
+    def test_sorted_ascending_by_week_then_model(self) -> None:
+        data = [
+            ("2026-03-20T10:00:00+00:00", "model-z2"),
+            ("2026-03-10T10:00:00+00:00", "model-a2"),
+        ]
+        for finished_at, model in data:
+            p = _task_payload()
+            _create_task(self.conn, p)
+            with self.conn:
+                _insert_runtime(self.conn, p["task_id"], status="done",
+                                model=model,
+                                started_at=finished_at,
+                                finished_at=finished_at)
+        result = mq.duration_cost_over_time(self.conn, weeks=52)
+        keys = [(r["week"], r["model"]) for r in result]
+        self.assertEqual(keys, sorted(keys))
+
+
 if __name__ == "__main__":
     unittest.main()
