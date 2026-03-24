@@ -19,6 +19,7 @@ Deferred controls (v2+):
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -29,6 +30,8 @@ from flask import Flask, jsonify, request
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 DB_SCRIPT = os.path.join(SCRIPT_DIR, "central_task_db.py")
 DISP_SCRIPT = os.path.join(SCRIPT_DIR, "dispatcher_control.py")
 
@@ -74,6 +77,19 @@ def _disp(*args) -> tuple[dict | list, str | None]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _open_db() -> sqlite3.Connection | None:
+    """Open a read-only connection to the CENTRAL task DB, or None if absent."""
+    db_path = os.environ.get(
+        "CENTRAL_TASK_DB_PATH",
+        os.path.join(REPO_ROOT, "state", "central_tasks.db"),
+    )
+    if not os.path.exists(db_path):
+        return None
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def _run_text(cmd: list[str], timeout: int = 15, cwd: str | None = None) -> tuple[str | None, str | None]:
@@ -459,6 +475,71 @@ def api_task(task_id: str):
         "audit_required": meta.get("audit_required"),
     }
     return jsonify(data)
+
+
+@app.route("/api/metrics/all")
+def api_metrics_all():
+    """Return all metrics dashboard data in a single response."""
+    from metrics.query import (
+        model_scorecard,
+        effort_calibration_crosstab,
+        first_pass_rates_by_initiative,
+        throughput_daily,
+        failure_mode_groups,
+        retry_heatmap,
+    )
+
+    conn = _open_db()
+    if conn is None:
+        return jsonify({"error": "database not found"}), 503
+
+    try:
+        payload: dict[str, Any] = {
+            "generated_at": _now_iso(),
+            # Quality: audit-rejection based, not runtime-failure based
+            "model_scorecard": model_scorecard(conn),
+            "effort_calibration": effort_calibration_crosstab(conn),
+            "initiative_health": first_pass_rates_by_initiative(conn),
+            # Throughput
+            "daily_throughput": throughput_daily(conn, days=30),
+            # Ops diagnostics (process failures: quota, timeout, crashes)
+            "ops_failure_taxonomy": failure_mode_groups(conn, top_n=20),
+            "retry_heatmap": retry_heatmap(conn),
+        }
+    finally:
+        conn.close()
+
+    # Worker richness + audit verdicts from result files (best-effort)
+    try:
+        from metrics.worker_results import (
+            load_results,
+            correlate_with_db,
+            discovery_density,
+            files_changed_stats,
+            audit_verdict_distribution,
+        )
+        results_dir = os.path.join(
+            REPO_ROOT, "state", "central_runtime", ".worker-results"
+        )
+        results = load_results(results_dir, latest_only=True)
+        if results:
+            conn2 = _open_db()
+            if conn2:
+                try:
+                    results = correlate_with_db(results, conn2)
+                finally:
+                    conn2.close()
+        payload["worker_richness"] = {
+            "discovery_density": discovery_density(results, group_by="model"),
+            "files_changed_stats": files_changed_stats(results, group_by="model"),
+        }
+        # Audit verdicts are the primary quality signal
+        payload["audit_verdicts"] = audit_verdict_distribution(results, group_by="model")
+    except Exception:
+        payload["worker_richness"] = {"discovery_density": [], "files_changed_stats": []}
+        payload["audit_verdicts"] = []
+
+    return jsonify(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +1071,49 @@ tr.selected td { background: #1a2540; }
 
 /* scroll wrapper for large sections */
 .scroll-wrap { max-height: 480px; overflow-y: auto; }
+
+/* ── Tab navigation ──────────────────────────────────────────────────── */
+#tab-nav {
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  padding: 0 16px;
+  display: flex;
+  gap: 0;
+}
+.tab-btn {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  font-family: var(--font);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 8px 14px;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  transition: color 0.1s, border-color 0.1s;
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
+
+/* ── Metrics panel ───────────────────────────────────────────────────── */
+#metrics-panel {
+  max-width: 1600px;
+  margin: 0 auto;
+  padding: 12px 12px 40px;
+}
+.metrics-note {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+#metrics-refresh-ts {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+  padding: 0 2px;
+}
 </style>
 </head>
 <body>
@@ -1019,6 +1143,12 @@ tr.selected td { background: #1a2540; }
   <span>claim-policy: <span class="setting-val" id="cfg-claim">—</span></span>
   <span>started: <span class="setting-val" id="cfg-started">—</span></span>
   <span>next-claim: <span class="setting-val" id="cfg-next-claim">—</span></span>
+</div>
+
+<!-- Tab navigation -->
+<div id="tab-nav">
+  <button class="tab-btn active" id="tab-dashboard" onclick="switchTab('dashboard')">Dashboard</button>
+  <button class="tab-btn" id="tab-metrics" onclick="switchTab('metrics')">Metrics</button>
 </div>
 
 <div id="error-bar"></div>
@@ -1180,6 +1310,101 @@ tr.selected td { background: #1a2540; }
   </div>
 
 </div><!-- /main -->
+
+<!-- Metrics Tab Panel -->
+<div id="metrics-panel" style="display:none">
+  <div id="metrics-refresh-ts">Not yet loaded.</div>
+
+  <!-- Model Scorecard -->
+  <div class="section" id="msec-scorecard">
+    <div class="section-header" onclick="toggleSection('msec-scorecard')">
+      <span class="section-title">Model Scorecard</span>
+      <span class="section-count" id="msec-scorecard-cnt">—</span>
+      <span class="collapse-arrow">▾</span>
+    </div>
+    <div class="section-body">
+      <div id="metrics-scorecard"><div class="empty-state">Loading…</div></div>
+    </div>
+  </div>
+
+  <!-- Effort Calibration -->
+  <div class="section" id="msec-effort">
+    <div class="section-header" onclick="toggleSection('msec-effort')">
+      <span class="section-title">Effort Calibration</span>
+      <span class="section-count" id="msec-effort-cnt">—</span>
+      <span class="collapse-arrow">▾</span>
+    </div>
+    <div class="section-body">
+      <div class="metrics-note">Is high effort worth it? Success rate by effort level × model.</div>
+      <div id="metrics-effort"><div class="empty-state">Loading…</div></div>
+    </div>
+  </div>
+
+  <!-- Initiative Health -->
+  <div class="section" id="msec-initiative">
+    <div class="section-header" onclick="toggleSection('msec-initiative')">
+      <span class="section-title">Initiative Health</span>
+      <span class="section-count" id="msec-initiative-cnt">—</span>
+      <span class="collapse-arrow">▾</span>
+    </div>
+    <div class="section-body">
+      <div id="metrics-initiative"><div class="empty-state">Loading…</div></div>
+    </div>
+  </div>
+
+  <!-- Daily Throughput -->
+  <div class="section" id="msec-throughput">
+    <div class="section-header" onclick="toggleSection('msec-throughput')">
+      <span class="section-title">Daily Throughput</span>
+      <span class="section-count" id="msec-throughput-cnt">—</span>
+      <span class="collapse-arrow">▾</span>
+    </div>
+    <div class="section-body">
+      <div class="metrics-note">Completed tasks per day by repo (last 30 days).</div>
+      <div id="metrics-throughput"><div class="empty-state">Loading…</div></div>
+    </div>
+  </div>
+
+  <!-- Retry Heatmap -->
+  <div class="section" id="msec-retry">
+    <div class="section-header" onclick="toggleSection('msec-retry')">
+      <span class="section-title">Retry Heatmap</span>
+      <span class="section-count" id="msec-retry-cnt">—</span>
+      <span class="collapse-arrow">▾</span>
+    </div>
+    <div class="section-body">
+      <div class="metrics-note">Model × task type retry frequency.</div>
+      <div id="metrics-retry-heatmap"><div class="empty-state">Loading…</div></div>
+    </div>
+  </div>
+
+  <!-- Failure Taxonomy -->
+  <div class="section" id="msec-failures">
+    <div class="section-header" onclick="toggleSection('msec-failures')">
+      <span class="section-title">Failure Taxonomy</span>
+      <span class="section-count" id="msec-failures-cnt">—</span>
+      <span class="collapse-arrow">▾</span>
+    </div>
+    <div class="section-body">
+      <div class="metrics-note">Top error patterns from failed/timeout tasks.</div>
+      <div id="metrics-failures"><div class="empty-state">Loading…</div></div>
+    </div>
+  </div>
+
+  <!-- Worker Richness -->
+  <div class="section" id="msec-richness">
+    <div class="section-header" onclick="toggleSection('msec-richness')">
+      <span class="section-title">Worker Richness</span>
+      <span class="section-count" id="msec-richness-cnt">—</span>
+      <span class="collapse-arrow">▾</span>
+    </div>
+    <div class="section-body">
+      <div class="metrics-note">Discovery and file-change density per task by model.</div>
+      <div id="metrics-richness"><div class="empty-state">Loading…</div></div>
+    </div>
+  </div>
+
+</div><!-- /metrics-panel -->
 
 <!-- Detail Drawer -->
 <div id="drawer">
@@ -1936,6 +2161,226 @@ function relAge(isoStr) {
 function fmtRelTs(isoStr) {
   if (!isoStr) return '—';
   return relAge(isoStr) + ' ago';
+}
+
+// ─── Metrics Tab ─────────────────────────────────────────────────────────────
+let METRICS_DATA = null;
+let activeTab = 'dashboard';
+
+function switchTab(tab) {
+  activeTab = tab;
+  const dash = document.getElementById('main');
+  const mets = document.getElementById('metrics-panel');
+  if (dash) dash.style.display = tab === 'dashboard' ? '' : 'none';
+  if (mets) mets.style.display = tab === 'metrics' ? '' : 'none';
+  document.getElementById('tab-dashboard').classList.toggle('active', tab === 'dashboard');
+  document.getElementById('tab-metrics').classList.toggle('active', tab === 'metrics');
+  if (tab === 'metrics' && !METRICS_DATA) fetchMetrics();
+}
+
+async function fetchMetrics() {
+  const infoEl = document.getElementById('metrics-refresh-ts');
+  if (infoEl) infoEl.textContent = 'Loading metrics…';
+  try {
+    const resp = await fetch('/api/metrics/all');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    METRICS_DATA = await resp.json();
+    renderMetrics(METRICS_DATA);
+    if (infoEl) infoEl.textContent = 'Metrics as of ' + fmtTime(new Date());
+  } catch(e) {
+    if (infoEl) infoEl.textContent = 'Metrics load failed: ' + esc(e.message);
+  }
+}
+
+function renderMetrics(m) {
+  renderModelScorecard(m.model_scorecard || []);
+  renderEffortCalibration(m.effort_calibration || []);
+  renderInitiativeHealth(m.initiative_health || []);
+  renderDailyThroughput(m.daily_throughput || []);
+  renderRetryHeatmap(m.retry_heatmap || []);
+  renderFailureTaxonomy(m.failure_taxonomy || []);
+  renderWorkerRichness(m.worker_richness || {});
+}
+
+function renderModelScorecard(rows) {
+  const el = document.getElementById('metrics-scorecard');
+  const cnt = document.getElementById('msec-scorecard-cnt');
+  if (cnt) cnt.textContent = rows.length;
+  if (!rows.length) { el.innerHTML = '<div class="empty-state">No completed tasks recorded yet.</div>'; return; }
+  const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+  el.innerHTML = '<div class="task-table-wrap"><table>' +
+    '<thead><tr>' +
+    '<th>Model</th><th>Total</th><th>Done</th><th>Failed</th><th>Timeout</th>' +
+    '<th>Success %</th><th>Avg Duration</th><th>Rework %</th><th>First-pass %</th>' +
+    '</tr></thead><tbody>' +
+    rows.map(r =>
+      '<tr>' +
+      '<td style="white-space:nowrap">' + esc(r.effective_worker_model) + '</td>' +
+      '<td>' + r.total + '</td>' +
+      '<td><span class="badge badge-green">' + r.done + '</span></td>' +
+      '<td><span class="badge badge-red">' + r.failed + '</span></td>' +
+      '<td><span class="badge badge-amber">' + r.timeout + '</span></td>' +
+      '<td>' + pct(r.success_rate) + '</td>' +
+      '<td>' + fmtSeconds(r.avg_duration_seconds) + '</td>' +
+      '<td>' + pct(r.rework_rate) + '</td>' +
+      '<td>' + pct(r.first_pass_success_rate) + '</td>' +
+      '</tr>'
+    ).join('') +
+    '</tbody></table></div>';
+}
+
+function renderEffortCalibration(rows) {
+  const el = document.getElementById('metrics-effort');
+  const cnt = document.getElementById('msec-effort-cnt');
+  if (cnt) cnt.textContent = rows.length;
+  if (!rows.length) { el.innerHTML = '<div class="empty-state">No effort data available.</div>'; return; }
+  const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+  el.innerHTML = '<div class="task-table-wrap"><table>' +
+    '<thead><tr><th>Effort</th><th>Model</th><th>Total</th><th>Done</th><th>Success %</th></tr></thead><tbody>' +
+    rows.map(r => {
+      const rate = r.success_rate;
+      const cls = rate == null ? 'badge-gray' : rate >= 0.7 ? 'badge-green' : rate >= 0.4 ? 'badge-amber' : 'badge-red';
+      return '<tr>' +
+        '<td><span class="badge badge-gray">' + esc(r.worker_effort) + '</span></td>' +
+        '<td style="white-space:nowrap">' + esc(r.effective_worker_model) + '</td>' +
+        '<td>' + r.total + '</td>' +
+        '<td>' + r.done + '</td>' +
+        '<td><span class="badge ' + cls + '">' + pct(rate) + '</span></td>' +
+        '</tr>';
+    }).join('') +
+    '</tbody></table></div>';
+}
+
+function renderInitiativeHealth(rows) {
+  const el = document.getElementById('metrics-initiative');
+  const cnt = document.getElementById('msec-initiative-cnt');
+  if (cnt) cnt.textContent = rows.length;
+  if (!rows.length) { el.innerHTML = '<div class="empty-state">No initiative data available.</div>'; return; }
+  const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+  const bar = (done, total) => {
+    const p = total > 0 ? Math.min(100, done / total * 100) : 0;
+    const col = p >= 100 ? 'green' : 'blue';
+    return '<div class="progress-track" style="min-width:80px">' +
+      '<div class="progress-fill ' + col + '" style="width:' + p.toFixed(1) + '%"></div>' +
+      '</div>';
+  };
+  el.innerHTML = '<div class="task-table-wrap"><table>' +
+    '<thead><tr><th>Initiative</th><th>Total</th><th>Done</th><th>Success %</th><th>Progress</th></tr></thead><tbody>' +
+    rows.map(r =>
+      '<tr>' +
+      '<td>' + esc(r.initiative) + '</td>' +
+      '<td>' + r.total + '</td>' +
+      '<td>' + r.done + '</td>' +
+      '<td>' + pct(r.success_rate) + '</td>' +
+      '<td>' + bar(r.done, r.total) + '</td>' +
+      '</tr>'
+    ).join('') +
+    '</tbody></table></div>';
+}
+
+function renderDailyThroughput(rows) {
+  const el = document.getElementById('metrics-throughput');
+  const cnt = document.getElementById('msec-throughput-cnt');
+  if (cnt) cnt.textContent = rows.length;
+  if (!rows.length) { el.innerHTML = '<div class="empty-state">No completions in the last 30 days.</div>'; return; }
+  el.innerHTML = '<div class="task-table-wrap scroll-wrap"><table>' +
+    '<thead><tr><th>Date</th><th>Repo</th><th>Completed</th></tr></thead><tbody>' +
+    rows.map(r =>
+      '<tr>' +
+      '<td>' + esc(r.date) + '</td>' +
+      '<td>' + repoBadge(r.target_repo_id) + '</td>' +
+      '<td>' + r.completed + '</td>' +
+      '</tr>'
+    ).join('') +
+    '</tbody></table></div>';
+}
+
+function renderRetryHeatmap(rows) {
+  const el = document.getElementById('metrics-retry-heatmap');
+  const cnt = document.getElementById('msec-retry-cnt');
+  if (cnt) cnt.textContent = rows.length;
+  if (!rows.length) { el.innerHTML = '<div class="empty-state">No retry data available.</div>'; return; }
+  el.innerHTML = '<div class="task-table-wrap"><table>' +
+    '<thead><tr><th>Model</th><th>Task Type</th><th>Total</th><th>Avg Retries</th><th>Max Retries</th></tr></thead><tbody>' +
+    rows.map(r => {
+      const avg = r.avg_retries || 0;
+      const heat = avg > 1 ? 'badge-red' : avg > 0.3 ? 'badge-amber' : 'badge-green';
+      return '<tr>' +
+        '<td style="white-space:nowrap">' + esc(r.effective_worker_model) + '</td>' +
+        '<td>' + typeBadge(r.task_type) + '</td>' +
+        '<td>' + r.total + '</td>' +
+        '<td><span class="badge ' + heat + '">' + avg + '</span></td>' +
+        '<td>' + r.max_retries + '</td>' +
+        '</tr>';
+    }).join('') +
+    '</tbody></table></div>';
+}
+
+function renderFailureTaxonomy(rows) {
+  const el = document.getElementById('metrics-failures');
+  const cnt = document.getElementById('msec-failures-cnt');
+  if (cnt) cnt.textContent = rows.length;
+  if (!rows.length) { el.innerHTML = '<div class="empty-state">No failures recorded.</div>'; return; }
+  el.innerHTML = '<div class="task-table-wrap scroll-wrap"><table>' +
+    '<thead><tr><th>Error Pattern</th><th>Count</th><th>Example Tasks</th></tr></thead><tbody>' +
+    rows.map(r => {
+      const examples = (r.example_task_ids || []).map(id =>
+        '<span style="cursor:pointer;color:var(--blue)" onclick="openTaskDrawer(\'' + esc(id) + '\')">' + esc(id) + '</span>'
+      ).join(', ');
+      return '<tr>' +
+        '<td style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(r.error_prefix) + '">' + esc(r.error_prefix) + '</td>' +
+        '<td><span class="badge badge-red">' + r.count + '</span></td>' +
+        '<td style="font-size:9px;color:var(--text-muted)">' + examples + '</td>' +
+        '</tr>';
+    }).join('') +
+    '</tbody></table></div>';
+}
+
+function renderWorkerRichness(data) {
+  const el = document.getElementById('metrics-richness');
+  const cnt = document.getElementById('msec-richness-cnt');
+  const dd = (data && data.discovery_density) || [];
+  const fc = (data && data.files_changed_stats) || [];
+  if (cnt) cnt.textContent = dd.length || '—';
+  if (!dd.length && !fc.length) {
+    el.innerHTML = '<div class="empty-state">No worker result files found.</div>';
+    return;
+  }
+  let html = '';
+  if (dd.length) {
+    html += '<div style="margin-bottom:16px">' +
+      '<div style="font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);font-weight:700;margin-bottom:6px">Discovery Density</div>' +
+      '<div class="task-table-wrap"><table>' +
+      '<thead><tr><th>Model</th><th>Tasks</th><th>Avg Discoveries</th><th>Total</th><th>P50</th><th>P90</th></tr></thead><tbody>' +
+      dd.map(r =>
+        '<tr>' +
+        '<td>' + esc(r.model || r.group || '—') + '</td>' +
+        '<td>' + r.task_count + '</td>' +
+        '<td>' + (r.avg_discoveries != null ? r.avg_discoveries.toFixed(2) : '—') + '</td>' +
+        '<td>' + r.total_discoveries + '</td>' +
+        '<td>' + (r.p50_discoveries != null ? r.p50_discoveries.toFixed(1) : '—') + '</td>' +
+        '<td>' + (r.p90_discoveries != null ? r.p90_discoveries.toFixed(1) : '—') + '</td>' +
+        '</tr>'
+      ).join('') +
+      '</tbody></table></div></div>';
+  }
+  if (fc.length) {
+    html += '<div>' +
+      '<div style="font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);font-weight:700;margin-bottom:6px">Files Changed</div>' +
+      '<div class="task-table-wrap"><table>' +
+      '<thead><tr><th>Model</th><th>Tasks</th><th>Total Files</th><th>Avg Files</th><th>P90</th></tr></thead><tbody>' +
+      fc.map(r =>
+        '<tr>' +
+        '<td>' + esc(r.model || r.group || '—') + '</td>' +
+        '<td>' + r.task_count + '</td>' +
+        '<td>' + r.total_files_changed + '</td>' +
+        '<td>' + (r.avg_files_changed != null ? r.avg_files_changed.toFixed(1) : '—') + '</td>' +
+        '<td>' + (r.p90_files_changed != null ? r.p90_files_changed.toFixed(0) : '—') + '</td>' +
+        '</tr>'
+      ).join('') +
+      '</tbody></table></div></div>';
+  }
+  el.innerHTML = html;
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────

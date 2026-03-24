@@ -5760,6 +5760,10 @@ def runtime_transition(
     actor_id: str,
     effective_worker_model: str | None = None,
     worker_model_source: str | None = None,
+    exit_code: int | None = None,
+    exit_category: str | None = None,
+    tokens_used: int | None = None,
+    tokens_cost_usd: float | None = None,
 ) -> dict[str, Any]:
     if status not in RUNTIME_STATUSES:
         die(f"invalid runtime status: {status}")
@@ -5803,6 +5807,11 @@ def runtime_transition(
     existing_source = current.get("worker_model_source")
     resolved_model = effective_worker_model if effective_worker_model is not None else existing_model
     resolved_source = worker_model_source if worker_model_source is not None else existing_source
+    # Preserve existing exit_code/tokens unless caller provides new values.
+    resolved_exit_code = exit_code if exit_code is not None else current.get("exit_code")
+    resolved_exit_category = exit_category if exit_category is not None else current.get("exit_category")
+    resolved_tokens_used = tokens_used if tokens_used is not None else current.get("tokens_used")
+    resolved_tokens_cost_usd = tokens_cost_usd if tokens_cost_usd is not None else current.get("tokens_cost_usd")
     conn.execute(
         """
         UPDATE task_runtime_state
@@ -5818,7 +5827,11 @@ def runtime_transition(
             last_transition_at = ?,
             runtime_metadata_json = ?,
             effective_worker_model = ?,
-            worker_model_source = ?
+            worker_model_source = ?,
+            exit_code = ?,
+            exit_category = ?,
+            tokens_used = ?,
+            tokens_cost_usd = ?
         WHERE task_id = ?
         """,
         (
@@ -5835,6 +5848,10 @@ def runtime_transition(
             compact_json({"notes": notes} if notes else {}),
             resolved_model,
             resolved_source,
+            resolved_exit_code,
+            resolved_exit_category,
+            resolved_tokens_used,
+            resolved_tokens_cost_usd,
             task_id,
         ),
     )

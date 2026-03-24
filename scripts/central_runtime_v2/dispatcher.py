@@ -190,6 +190,35 @@ def _kill_orphan_pgid(pgid: int | None, logger: Any, task_id: str) -> None:
     threading.Thread(target=_deferred, args=(pgid,), daemon=True).start()
 
 
+def classify_exit_code(
+    returncode: int | None,
+    *,
+    timed_out: bool = False,
+    error_text: str | None = None,
+) -> tuple[int | None, str | None]:
+    """Return (exit_code, exit_category) for storage in task_runtime_state.
+
+    Categories:
+      success      - clean exit (returncode 0) with result written
+      timeout      - dispatcher killed the worker for exceeding timeout_seconds
+      quota        - quota / rate-limit exhaustion detected from exit code or error text
+      operator_kill - SIGKILL from the dispatcher or operator (returncode -9 / 137)
+      code_error   - any other non-zero exit
+    """
+    if timed_out:
+        return returncode, "timeout"
+    if returncode is None:
+        return None, None
+    if returncode == 0:
+        return 0, "success"
+    if returncode in (-9, 137):
+        return returncode, "operator_kill"
+    err_lower = (error_text or "").lower()
+    if any(kw in err_lower for kw in ("quota", "rate_limit", "rate limit", "overloaded", "529")):
+        return returncode, "quota"
+    return returncode, "code_error"
+
+
 def connect_initialized(db_path: Path):
     conn = task_db.connect(db_path)
     task_db.require_initialized_db(conn, db_path)
@@ -474,6 +503,27 @@ class CentralDispatcher:
         elif backoff_remaining == 0:
             self._quota_stall_notified = False
         self._last_status_heartbeat_monotonic = now
+        # Persist heartbeat snapshot to DB for time-series metrics.
+        try:
+            hb_conn = self._connect()
+            try:
+                with hb_conn:
+                    hb_conn.execute(
+                        "INSERT INTO dispatcher_heartbeat_history"
+                        " (captured_at, active_workers, max_workers, queued_count, running_tasks)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (
+                            utc_now(),
+                            len(active_ids),
+                            self.config.max_workers,
+                            snapshot["eligible_count"],
+                            json.dumps(active_ids),
+                        ),
+                    )
+            finally:
+                hb_conn.close()
+        except Exception as _hb_exc:
+            self.logger.emit("WRN", "central.dispatcher", f"heartbeat_db_write_failed error={_hb_exc}")
 
     def _claim_next(self) -> dict[str, Any] | None:
         conn = self._connect()
@@ -1176,9 +1226,12 @@ class CentralDispatcher:
     ) -> None:
         task_id = state.task["task_id"]
         terminal_artifacts = [str(state.prompt_path), str(state.log_path)]
+        # Capture raw exit code before any result parsing so it's always available.
+        raw_exit_code: int | None = state.proc.returncode if state.proc is not None else None
         conn = self._connect()
         try:
             if timed_out:
+                _exit_code, _exit_category = classify_exit_code(raw_exit_code, timed_out=True)
                 with conn:
                     task_db.runtime_transition(
                         conn,
@@ -1189,6 +1242,8 @@ class CentralDispatcher:
                         notes="process exceeded timeout_seconds",
                         artifacts=terminal_artifacts,
                         actor_id="central.dispatcher",
+                        exit_code=_exit_code,
+                        exit_category=_exit_category,
                     )
                 self.logger.emit("INF", "central.dispatcher", f"worker_timeout task={task_id} run={state.run_id}{_title_kv(state.task)}")
                 self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status="timeout", summary="hard timeout exceeded", task_id=task_id)
@@ -1199,6 +1254,14 @@ class CentralDispatcher:
                     state, terminal_artifacts=terminal_artifacts, interrupted_by_restart=interrupted_by_restart
                 )
             )
+
+            _exit_code, _exit_category = classify_exit_code(raw_exit_code, error_text=error_text)
+            # Extract token/cost from result payload (schema_version 2+).
+            _tokens_used: int | None = None
+            _tokens_cost_usd: float | None = None
+            if isinstance(raw_result_payload, dict):
+                _tokens_used = raw_result_payload.get("tokens_used") or None
+                _tokens_cost_usd = raw_result_payload.get("tokens_cost_usd") or None
 
             if not self._handle_capacity_limit(state, runtime_status):
                 with conn:
@@ -1211,6 +1274,10 @@ class CentralDispatcher:
                         notes=notes,
                         artifacts=result_artifacts,
                         actor_id="central.dispatcher",
+                        exit_code=_exit_code,
+                        exit_category=_exit_category,
+                        tokens_used=_tokens_used,
+                        tokens_cost_usd=_tokens_cost_usd,
                     )
                 self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status=runtime_status, summary=notes or error_text, task_id=task_id)
                 if runtime_status == "done":

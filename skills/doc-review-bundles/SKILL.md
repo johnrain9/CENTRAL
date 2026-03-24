@@ -117,6 +117,29 @@ Rereview output is written under `<doc>.rereviews.<preset>/`.
   - `Needs Prototype`
   - `Resolved`
 
+## Reduced Codex Mode (temporary — until 2026-03-25 22:24 MT)
+
+Codex quota is constrained. Run only 1 Codex + 1 Opus reviewer per preset (drop the 2nd Codex lane). Use `--reviewer` to select:
+
+```bash
+# design-ui: keep visual_design_critique + implementation_system_reality
+python3 scripts/review_doc.py --input doc.md --bundle-preset design-ui \
+  --reviewer visual_design_critique \
+  --reviewer implementation_system_reality ...
+
+# frontend-hld: keep client_architecture_shape + system_contracts_and_delivery
+python3 scripts/review_doc.py --input doc.md --bundle-preset frontend-hld \
+  --reviewer client_architecture_shape \
+  --reviewer system_contracts_and_delivery ...
+
+# frontend-lld: keep client_contracts_and_state_machine + integration_and_delivery_reality
+python3 scripts/review_doc.py --input doc.md --bundle-preset frontend-lld \
+  --reviewer client_contracts_and_state_machine \
+  --reviewer integration_and_delivery_reality ...
+```
+
+**Remove this section once Codex quota recovers.**
+
 ## Notes
 
 - Bundle mode uses only the target doc plus explicit context artifacts. It should not roam the repo.
