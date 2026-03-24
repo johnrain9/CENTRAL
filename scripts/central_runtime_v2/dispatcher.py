@@ -222,6 +222,7 @@ def classify_exit_code(
 def connect_initialized(db_path: Path):
     conn = task_db.connect(db_path)
     task_db.require_initialized_db(conn, db_path)
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -245,6 +246,7 @@ class CentralDispatcher:
         self._stop_requested = False
         self._force_stop = False
         self._active: dict[str, ActiveWorker] = {}
+        self._active_lock = threading.Lock()
         self._last_recovery_monotonic = 0.0
         self._last_status_heartbeat_monotonic = 0.0
         self._capacity_backoff_until: float = 0.0
@@ -437,7 +439,7 @@ class CentralDispatcher:
                 " WHERE trs.runtime_status = 'failed'"
                 " AND t.planner_status NOT IN ('done', 'cancelled')"
             ).fetchone()["c"])
-            mismatch_count = sum(1 for snapshot in snapshots if snapshot.get("status_mismatch"))
+            mismatch_ids = [s["task_id"] for s in snapshots if s.get("status_mismatch")]
         finally:
             conn.close()
         return {
@@ -446,7 +448,8 @@ class CentralDispatcher:
             "runtime_counts": counts,
             "actionable_failed": actionable_failed,
             "active_leases": active_leases,
-            "mismatch_count": mismatch_count,
+            "mismatch_count": len(mismatch_ids),
+            "mismatch_ids": mismatch_ids,
         }
 
     @staticmethod
@@ -483,7 +486,7 @@ class CentralDispatcher:
                 f"parked={snapshot['runtime_counts'].get('parked', 0)} "
                 f"review={snapshot['runtime_counts'].get('pending_review', 0)} "
                 f"failed={snapshot['actionable_failed']} "
-                f"mismatch={snapshot['mismatch_count']}"
+                f"mismatch={self._format_task_ids(snapshot['mismatch_ids'])}"
                 f"{backoff_str}"
             ),
         )
@@ -606,6 +609,8 @@ class CentralDispatcher:
         # Strip ANTHROPIC_API_KEY so claude workers use the OAuth session (Claude Max)
         # rather than a bare API key that may have no credits (e.g. ecosystem test key).
         worker_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+        # Apply backend-specific env overrides (e.g. GrokBackend sets OPENAI_API_KEY from XAI_API_KEY)
+        worker_env.update(backend.env_overrides())
         proc = subprocess.Popen(
             command,
             cwd=worker_task["repo_root"],
@@ -662,7 +667,8 @@ class CentralDispatcher:
             log_parts.append(f"impl_model={self.config.default_worker_model}")
             log_parts.append(f"audit_model={self.config.audit_worker_model}")
         self.logger.emit("INF", "central.dispatcher", " ".join(p for p in log_parts if p))
-        self._active[snapshot["task_id"]] = state
+        with self._active_lock:
+            self._active[snapshot["task_id"]] = state
         self._emit_status_heartbeat(force=True)
 
     def _adopt_active_workers(self) -> int:
@@ -748,7 +754,8 @@ class CentralDispatcher:
                 event_payload={"run_id": state.run_id, "worker_id": state.worker_id, "worker_pid": state.pid},
             )
             self._heartbeat_worker(state, actor_id="central.dispatcher.adopt")
-            self._active[snapshot["task_id"]] = state
+            with self._active_lock:
+                self._active[snapshot["task_id"]] = state
             adopted += 1
             self.logger.emit(
                 "INF",
@@ -1232,21 +1239,25 @@ class CentralDispatcher:
         try:
             if timed_out:
                 _exit_code, _exit_category = classify_exit_code(raw_exit_code, timed_out=True)
+                # Use "failed" instead of "timeout" so the task is NOT automatically
+                # retried.  Timeouts almost never succeed on retry — the task likely
+                # needs a scope/prompt fix before re-dispatch.  Operators can manually
+                # requeue with `runtime-requeue-task` if they disagree.
                 with conn:
                     task_db.runtime_transition(
                         conn,
                         task_id=task_id,
-                        status="timeout",
+                        status="failed",
                         worker_id=state.worker_id,
-                        error_text="worker timeout",
-                        notes="process exceeded timeout_seconds",
+                        error_text="worker timeout (no auto-retry)",
+                        notes="process exceeded timeout_seconds; timed-out tasks are not retried automatically",
                         artifacts=terminal_artifacts,
                         actor_id="central.dispatcher",
                         exit_code=_exit_code,
                         exit_category=_exit_category,
                     )
-                self.logger.emit("INF", "central.dispatcher", f"worker_timeout task={task_id} run={state.run_id}{_title_kv(state.task)}")
-                self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status="timeout", summary="hard timeout exceeded", task_id=task_id)
+                self.logger.emit("WRN", "central.dispatcher", f"worker_timeout_failed task={task_id} run={state.run_id}{_title_kv(state.task)}")
+                self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status="failed", summary="hard timeout exceeded (no auto-retry)", task_id=task_id)
                 return
 
             runtime_status, notes, error_text, tests, result, raw_result_payload, result_artifacts, extra_artifacts = (
@@ -1299,13 +1310,16 @@ class CentralDispatcher:
             conn.close()
 
     def _process_active(self) -> None:
-        for task_id, state in list(self._active.items()):
+        with self._active_lock:
+            active_snapshot = list(self._active.items())
+        for task_id, state in active_snapshot:
             elapsed = self._worker_elapsed_seconds(state)
             if elapsed > state.timeout_seconds:
                 terminate_process(state.pid, state.proc, pgid=state.pgid)
                 self._finalize_worker(state, timed_out=True)
                 self._close_worker_state(state)
-                self._active.pop(task_id, None)
+                with self._active_lock:
+                    self._active.pop(task_id, None)
                 self._emit_status_heartbeat(force=True)
                 continue
 
@@ -1322,7 +1336,8 @@ class CentralDispatcher:
             if not self._worker_is_running(state):
                 self._finalize_worker(state, timed_out=False)
                 self._close_worker_state(state)
-                self._active.pop(task_id, None)
+                with self._active_lock:
+                    self._active.pop(task_id, None)
                 self._emit_status_heartbeat(force=True)
 
     def _run_stale_recovery(self) -> None:
@@ -1375,11 +1390,15 @@ class CentralDispatcher:
         return True
 
     def _fill_workers(self) -> None:
-        while len(self._active) < self.config.max_workers and not self._stop_requested:
+        with self._active_lock:
+            active_count = len(self._active)
+        while active_count < self.config.max_workers and not self._stop_requested:
             snapshot = self._claim_next()
             if snapshot is None:
                 break
             if self._abort_if_max_retries(snapshot):
+                with self._active_lock:
+                    active_count = len(self._active)
                 continue
             try:
                 self._spawn_worker(snapshot)
@@ -1400,6 +1419,8 @@ class CentralDispatcher:
                         )
                 finally:
                     conn.close()
+            with self._active_lock:
+                active_count = len(self._active)
 
     def run_once(self, *, emit_result: bool = True) -> int:
         self._run_stale_recovery()

@@ -337,6 +337,11 @@ def build_worker_task(
         result["codex_model_source"] = resolved_model.source
         _spark_default = "high" if resolved_model.value == "gpt-5.3-codex-spark" else DEFAULT_WORKER_EFFORT
         result["codex_effort"] = _effort if _effort else _spark_default
+    elif effective_backend == "grok":
+        # Grok uses the codex CLI pointed at api.x.ai/v1 — needs the same codex_ fields
+        result["codex_model"] = resolved_model.value
+        result["codex_model_source"] = resolved_model.source
+        result["codex_effort"] = _effort if _effort else DEFAULT_WORKER_EFFORT
     elif effective_backend == "claude":
         result["worker_effort"] = _effort if _effort else DEFAULT_WORKER_EFFORT
     elif effective_backend not in ("gemini", "stub"):

@@ -501,7 +501,7 @@ def api_metrics_all():
             "effort_calibration": effort_calibration_crosstab(conn),
             "initiative_health": first_pass_rates_by_initiative(conn),
             # Throughput
-            "daily_throughput": throughput_daily(conn, days=30),
+            "daily_throughput": throughput_daily(conn, days=84),
             # Ops diagnostics (process failures: quota, timeout, crashes)
             "ops_failure_taxonomy": failure_mode_groups(conn, top_n=20),
             "retry_heatmap": retry_heatmap(conn),
@@ -2216,23 +2216,45 @@ function renderMetrics(m) {
   renderWorkerRichness(m.worker_richness || {});
 }
 
+function renderBoxPlot(p25, p50, p75, p90, n_outliers, max_scale) {
+  if (p50 == null) return '—';
+  const mx = max_scale || Math.max(p90 != null ? p90 * 1.1 : 0, p75 != null ? p75 * 1.5 : 0, p50 * 2, 1);
+  const pc = v => v == null ? 0 : Math.round(Math.min(100, Math.max(0, v / mx * 100)));
+  const lp = pc(p25);
+  const mp = pc(p50);
+  const hp = pc(p75);
+  const rp = pc(p90);
+  const bw = Math.max(hp - lp, 1);
+  const wr = Math.max(rp - hp, 0);
+  const rem = Math.max(100 - rp, 0);
+  const title = 'p25=' + fmtSeconds(p25||0) + ' p50=' + fmtSeconds(p50) + ' p75=' + fmtSeconds(p75||0) + ' p90=' + fmtSeconds(p90||0);
+  let html = '<div style="display:inline-flex;align-items:center;width:150px;height:14px;cursor:default;vertical-align:middle" title="' + title + '">';
+  if (lp > 0) html += '<div style="flex:' + lp + ';border-top:2px solid var(--text-dim);align-self:center;min-width:1px"></div>';
+  html += '<div style="flex:' + bw + ';background:rgba(66,153,225,0.3);border:1px solid var(--blue);height:100%;position:relative;min-width:4px">';
+  const tickPct = Math.round((mp - lp) / bw * 100);
+  html += '<div style="position:absolute;left:' + tickPct + '%;top:0;bottom:0;width:2px;background:var(--blue);transform:translateX(-50%)"></div>';
+  html += '</div>';
+  if (wr > 0) html += '<div style="flex:' + wr + ';border-top:2px solid var(--text-dim);align-self:center;min-width:1px"></div>';
+  if (rem > 0) html += '<div style="flex:' + rem + '"></div>';
+  html += '</div>';
+  if (n_outliers > 0) {
+    const dots = Math.min(n_outliers, 3);
+    html += '<span style="margin-left:3px;color:var(--amber);font-size:9px;vertical-align:middle" title="' + n_outliers + ' outlier' + (n_outliers > 1 ? 's' : '') + ' excluded from IQR">' + '●'.repeat(dots) + (n_outliers > 3 ? '+' : '') + '</span>';
+  }
+  return html;
+}
+
 function renderModelScorecard(rows) {
   const el = document.getElementById('metrics-scorecard');
   const cnt = document.getElementById('msec-scorecard-cnt');
   if (cnt) cnt.textContent = rows.length;
   if (!rows.length) { el.innerHTML = '<div class="empty-state">No completed tasks recorded yet.</div>'; return; }
   const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
-  const dur = (p50, iqr, n_out) => {
-    if (p50 == null) return '—';
-    let s = fmtSeconds(p50) + ' p50';
-    if (iqr != null) s += ' ±' + fmtSeconds(iqr/2) + ' IQR';
-    if (n_out > 0) s += ' <span class="badge badge-amber" title="outliers excluded from IQR">' + n_out + ' outliers</span>';
-    return s;
-  };
+  const maxScale = Math.max(...rows.map(r => r.duration_p90_s || 0), 1);
   el.innerHTML = '<div class="task-table-wrap"><table>' +
     '<thead><tr>' +
     '<th>Model</th><th>Done</th><th>Timeouts</th>' +
-    '<th>First-pass %</th><th>Rework %</th><th>Avg reworks</th><th>Duration (p50 ± IQR)</th>' +
+    '<th>First-pass %</th><th>Rework %</th><th>Avg reworks</th><th>Duration</th>' +
     '</tr></thead><tbody>' +
     rows.map(r => {
       const fp = r.first_pass_rate;
@@ -2244,7 +2266,7 @@ function renderModelScorecard(rows) {
         '<td><span class="badge ' + fpcls + '">' + pct(fp) + '</span></td>' +
         '<td>' + pct(r.rework_rate) + '</td>' +
         '<td>' + (r.avg_rework_cycles != null ? r.avg_rework_cycles.toFixed(2) : '—') + '</td>' +
-        '<td style="white-space:nowrap">' + dur(r.duration_p50_s, r.duration_iqr_s, r.duration_n_outliers) + '</td>' +
+        '<td style="white-space:nowrap">' + renderBoxPlot(r.duration_p25_s, r.duration_p50_s, r.duration_p75_s, r.duration_p90_s, r.duration_n_outliers, maxScale) + '</td>' +
         '</tr>';
     }).join('') +
     '</tbody></table></div>';
@@ -2276,28 +2298,29 @@ function renderEffortCalibration(rows) {
 function renderInitiativeHealth(rows) {
   const el = document.getElementById('metrics-initiative');
   const cnt = document.getElementById('msec-initiative-cnt');
-  if (cnt) cnt.textContent = rows.length;
-  if (!rows.length) { el.innerHTML = '<div class="empty-state">No initiative data available.</div>'; return; }
+  // Skip initiatives with total_done < 3 (too small to be meaningful)
+  const filtered = (rows || []).filter(r => (r.total_done || 0) >= 3);
+  // Sort by rework_rate descending (worst first)
+  const sorted = [...filtered].sort((a, b) => (b.rework_rate || 0) - (a.rework_rate || 0));
+  if (cnt) cnt.textContent = sorted.length;
+  if (!sorted.length) { el.innerHTML = '<div class="empty-state">No initiative data available.</div>'; return; }
   const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
-  const bar = (reworked, total) => {
-    const p = total > 0 ? Math.min(100, (1 - reworked/total) * 100) : 100;
-    const col = p >= 97 ? 'green' : p >= 90 ? 'blue' : 'amber';
-    return '<div class="progress-track" style="min-width:80px">' +
-      '<div class="progress-fill ' + col + '" style="width:' + p.toFixed(1) + '%"></div>' +
-      '</div>';
-  };
-  el.innerHTML = '<div class="task-table-wrap"><table>' +
-    '<thead><tr><th>Initiative</th><th>Done</th><th>Reworked</th><th>First-pass %</th><th>Quality</th></tr></thead><tbody>' +
-    rows.map(r =>
-      '<tr>' +
-      '<td>' + esc(r.initiative) + '</td>' +
-      '<td>' + (r.total_done ?? '—') + '</td>' +
-      '<td>' + (r.tasks_reworked > 0 ? '<span class="badge badge-amber">' + r.tasks_reworked + '</span>' : '—') + '</td>' +
-      '<td>' + pct(r.first_pass_rate) + '</td>' +
-      '<td>' + bar(r.tasks_reworked || 0, r.total_done || 0) + '</td>' +
-      '</tr>'
-    ).join('') +
-    '</tbody></table></div>';
+  function dotColor(fpr) {
+    if (fpr == null) return 'var(--text-dim)';
+    if (fpr >= 0.97) return '#48bb78';
+    if (fpr >= 0.90) return '#ecc94b';
+    return '#fc8181';
+  }
+  el.innerHTML = '<div style="display:flex;flex-direction:column;gap:2px">' +
+    sorted.map(r => {
+      const tip = 'rework_rate: ' + pct(r.rework_rate) + (r.avg_rework_cycles != null ? ' | avg_rework_cycles: ' + r.avg_rework_cycles.toFixed(2) : '');
+      return '<div style="display:flex;align-items:center;height:28px;gap:8px;padding:0 4px" title="' + esc(tip) + '">' +
+        '<div style="width:10px;height:10px;border-radius:50%;background:' + dotColor(r.first_pass_rate) + ';flex-shrink:0"></div>' +
+        '<span style="color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(r.initiative) + '</span>' +
+        '<span style="color:var(--text-muted);font-size:12px;white-space:nowrap">' + (r.total_done ?? '—') + ' done \xb7 ' + (r.tasks_reworked ?? '—') + ' reworked</span>' +
+        '</div>';
+    }).join('') +
+    '</div>';
 }
 
 function renderAuditVerdicts(rows) {
@@ -2326,18 +2349,106 @@ function renderAuditVerdicts(rows) {
 function renderDailyThroughput(rows) {
   const el = document.getElementById('metrics-throughput');
   const cnt = document.getElementById('msec-throughput-cnt');
-  if (cnt) cnt.textContent = rows.length;
-  if (!rows.length) { el.innerHTML = '<div class="empty-state">No completions in the last 30 days.</div>'; return; }
-  el.innerHTML = '<div class="task-table-wrap scroll-wrap"><table>' +
-    '<thead><tr><th>Date</th><th>Repo</th><th>Completed</th></tr></thead><tbody>' +
-    rows.map(r =>
-      '<tr>' +
-      '<td>' + esc(r.date) + '</td>' +
-      '<td>' + repoBadge(r.target_repo_id) + '</td>' +
-      '<td>' + r.completed + '</td>' +
-      '</tr>'
-    ).join('') +
-    '</tbody></table></div>';
+  if (!rows.length) { if (cnt) cnt.textContent = '0'; el.innerHTML = '<div class="empty-state">No completions in the last 84 days.</div>'; return; }
+
+  // Aggregate by date across repos
+  const byDate = {};
+  rows.forEach(r => { byDate[r.date] = (byDate[r.date] || 0) + r.completed; });
+  if (cnt) cnt.textContent = Object.keys(byDate).length;
+
+  // Build 84-day grid: 12 cols (weeks) × 7 rows (Mon=0 … Sun=6)
+  // Anchor end to today (Sunday-aligned end of current week)
+  const DAYS = 84;
+  const today = new Date();
+  // End on the Sunday of the current week (day 0=Sun, so shift Mon-start)
+  const dayOfWeek = today.getDay(); // 0=Sun
+  const endDate = new Date(today);
+  endDate.setDate(today.getDate() + (6 - ((dayOfWeek + 6) % 7))); // end on Sunday
+  const startDate = new Date(endDate);
+  startDate.setDate(endDate.getDate() - (DAYS - 1));
+
+  // Map date string → count
+  function fmtDate(d) {
+    return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+  }
+
+  // Cell color: 0=var(--bg2), 1-2=hsl(210,50%,20%), 3-5=hsl(210,60%,30%), 6-10=hsl(210,70%,40%), 11+=hsl(210,80%,55%)
+  function cellColor(n) {
+    if (!n) return 'var(--bg2)';
+    if (n <= 2) return 'hsl(210,50%,20%)';
+    if (n <= 5) return 'hsl(210,60%,30%)';
+    if (n <= 10) return 'hsl(210,70%,40%)';
+    return 'hsl(210,80%,55%)';
+  }
+
+  // Build grid columns (each col = one week, Mon-Sun)
+  // startDate is a Monday (since we anchor end to Sunday and span 84 days = 12 weeks exactly)
+  const COLS = 12, ROWS = 7;
+  const DAY_NAMES = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+  const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+  const CELL = 12, GAP = 2;
+  const colW = CELL + GAP;
+  const rowH = CELL + GAP;
+  const labelW = 28; // width for day-of-week labels
+
+  let monthLabels = new Array(COLS).fill('');
+  for (let col = 0; col < COLS; col++) {
+    const d = new Date(startDate);
+    d.setDate(startDate.getDate() + col * 7);
+    const firstDayOfMonth = new Date(d.getFullYear(), d.getMonth(), 1);
+    // Show label if first day of month falls in this week column
+    const colEnd = new Date(d); colEnd.setDate(d.getDate() + 6);
+    if (d.getDate() <= 7 || (firstDayOfMonth >= d && firstDayOfMonth <= colEnd)) {
+      monthLabels[col] = MONTH_NAMES[d.getMonth()];
+    }
+  }
+
+  let html = '<div style="display:inline-block;font-size:0">';
+
+  // Month label row
+  html += '<div style="display:flex;margin-left:' + labelW + 'px;margin-bottom:3px">';
+  for (let col = 0; col < COLS; col++) {
+    html += '<div style="width:' + colW + 'px;font-size:9px;color:var(--text-dim);overflow:hidden;white-space:nowrap">' + (monthLabels[col] || '') + '</div>';
+  }
+  html += '</div>';
+
+  // Grid rows (Mon=row 0 … Sun=row 6)
+  for (let row = 0; row < ROWS; row++) {
+    html += '<div style="display:flex;margin-bottom:' + GAP + 'px;align-items:center">';
+    // Day label (show Mon, Wed, Fri)
+    const showLabel = row === 0 || row === 2 || row === 4 || row === 6;
+    html += '<div style="width:' + labelW + 'px;font-size:9px;color:var(--text-dim);text-align:right;padding-right:4px">' + (showLabel ? DAY_NAMES[row] : '') + '</div>';
+    for (let col = 0; col < COLS; col++) {
+      const d = new Date(startDate);
+      d.setDate(startDate.getDate() + col * 7 + row);
+      const ds = fmtDate(d);
+      const count = byDate[ds] || 0;
+      const bg = cellColor(count);
+      const title = ds + ': ' + count + (count === 1 ? ' task' : ' tasks');
+      html += '<div style="width:' + CELL + 'px;height:' + CELL + 'px;background:' + bg + ';border-radius:2px;margin-right:' + GAP + 'px;cursor:default" title="' + esc(title) + '"></div>';
+    }
+    html += '</div>';
+  }
+
+  // Legend
+  const legendSteps = [
+    {label: '0', color: 'var(--bg2)'},
+    {label: '1-2', color: 'hsl(210,50%,20%)'},
+    {label: '3-5', color: 'hsl(210,60%,30%)'},
+    {label: '6-10', color: 'hsl(210,70%,40%)'},
+    {label: '11+', color: 'hsl(210,80%,55%)'},
+  ];
+  html += '<div style="display:flex;align-items:center;margin-top:6px;margin-left:' + labelW + 'px;gap:4px">';
+  html += '<span style="font-size:9px;color:var(--text-dim);margin-right:2px">Less</span>';
+  legendSteps.forEach(s => {
+    html += '<div style="width:' + CELL + 'px;height:' + CELL + 'px;background:' + s.color + ';border-radius:2px" title="' + esc(s.label) + '"></div>';
+  });
+  html += '<span style="font-size:9px;color:var(--text-dim);margin-left:2px">More</span>';
+  html += '</div>';
+
+  html += '</div>';
+  el.innerHTML = html;
 }
 
 function interpHsl(v) {

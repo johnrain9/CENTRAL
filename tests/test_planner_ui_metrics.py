@@ -260,5 +260,70 @@ class TestMetricsEndpointWithData(unittest.TestCase):
         self.assertTrue(body["generated_at"])
 
 
+class TestDailyThroughputWindow(unittest.TestCase):
+    """daily_throughput API uses 84-day window for heatmap coverage."""
+
+    def setUp(self) -> None:
+        from datetime import datetime, timezone, timedelta
+        ui.app.config["TESTING"] = True
+        self.client = ui.app.test_client()
+        self.conn, self.db_path = _build_db()
+        self._orig_env = os.environ.get("CENTRAL_TASK_DB_PATH")
+        os.environ["CENTRAL_TASK_DB_PATH"] = self.db_path
+
+        # Insert a 'done' task finished 80 days ago (within 84-day window)
+        now = datetime.now(timezone.utc)
+        old_ts = (now - timedelta(days=80)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        old_date = (now - timedelta(days=80)).strftime("%Y-%m-%d")
+        self._old_date = old_date
+        p = _task_payload()
+        with self.conn:
+            task_db.create_task(self.conn, p, actor_kind="test", actor_id="test")
+        with self.conn:
+            _insert_runtime(self.conn, p["task_id"], status="done",
+                            started_at=old_ts, finished_at=old_ts)
+
+        # Insert a task finished 95 days ago (outside 84-day window)
+        very_old_ts = (now - timedelta(days=95)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        p2 = _task_payload()
+        with self.conn:
+            task_db.create_task(self.conn, p2, actor_kind="test", actor_id="test")
+        with self.conn:
+            _insert_runtime(self.conn, p2["task_id"], status="done",
+                            started_at=very_old_ts, finished_at=very_old_ts)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        if self._orig_env is None:
+            os.environ.pop("CENTRAL_TASK_DB_PATH", None)
+        else:
+            os.environ["CENTRAL_TASK_DB_PATH"] = self._orig_env
+
+    def test_daily_throughput_includes_84_day_old_task(self) -> None:
+        """Task from 80 days ago appears in daily_throughput."""
+        resp = self.client.get("/api/metrics/all")
+        body = json.loads(resp.data)
+        dates = [r["date"] for r in body["daily_throughput"]]
+        self.assertIn(self._old_date, dates)
+
+    def test_daily_throughput_excludes_95_day_old_task(self) -> None:
+        """Task from 95 days ago is excluded (outside 84-day window)."""
+        from datetime import datetime, timezone, timedelta
+        very_old_date = (datetime.now(timezone.utc) - timedelta(days=95)).strftime("%Y-%m-%d")
+        resp = self.client.get("/api/metrics/all")
+        body = json.loads(resp.data)
+        dates = [r["date"] for r in body["daily_throughput"]]
+        self.assertNotIn(very_old_date, dates)
+
+    def test_daily_throughput_has_required_fields(self) -> None:
+        resp = self.client.get("/api/metrics/all")
+        body = json.loads(resp.data)
+        self.assertGreater(len(body["daily_throughput"]), 0)
+        row = body["daily_throughput"][0]
+        self.assertIn("date", row)
+        self.assertIn("target_repo_id", row)
+        self.assertIn("completed", row)
+
+
 if __name__ == "__main__":
     unittest.main()

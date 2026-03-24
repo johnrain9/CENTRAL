@@ -615,7 +615,10 @@ def parse_iso_datetime(value: str | None) -> datetime | None:
     normalized = str(value).strip()
     if normalized.endswith("Z"):
         normalized = normalized[:-1] + "+00:00"
-    return datetime.fromisoformat(normalized)
+    dt = datetime.fromisoformat(normalized)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def sorted_unique_strings(values: Any) -> list[str]:

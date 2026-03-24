@@ -312,6 +312,10 @@ class WorkerBackend(abc.ABC):
     ) -> tuple[str, list[str], Any]:
         """Return (prompt_text, command, stdin_mode) for subprocess.Popen."""
 
+    def env_overrides(self) -> dict[str, str]:
+        """Return extra env vars to inject into the worker subprocess environment."""
+        return {}
+
 
 class CodexBackend(WorkerBackend):
     def prepare(
@@ -448,7 +452,12 @@ class GeminiBackend(WorkerBackend):
 
 
 class GrokBackend(WorkerBackend):
-    """Calls xAI Grok API via OpenAI SDK (standalone subprocess script)."""
+    """Calls xAI Grok API via a custom tool-use loop (grok_worker.py).
+
+    xAI only implements Chat Completions (/v1/chat/completions), not the
+    OpenAI Responses API that the codex CLI requires, so we run our own
+    agentic loop with read_file/write_file/bash tools.
+    """
 
     def prepare(
         self,
@@ -459,7 +468,8 @@ class GrokBackend(WorkerBackend):
     ) -> tuple[str, list[str], Any]:
         prompt_text = worker_task["prompt_body"]
         task_id = worker_task.get("id") or worker_task.get("task_id") or "unknown"
-        model = worker_task["worker_model"]
+        model = worker_task.get("worker_model") or "grok-4-1-fast-reasoning"
+        repo_root = worker_task.get("repo_root", ".")
         script_path = Path(__file__).parent / "grok_worker.py"
         command = [
             sys.executable,
@@ -469,8 +479,12 @@ class GrokBackend(WorkerBackend):
             run_id,
             str(result_path),
             str(AUTONOMY_SCHEMA_PATH),
+            repo_root,
         ]
         return prompt_text, command, subprocess.PIPE
+
+    def env_overrides(self) -> dict[str, str]:
+        return {}  # GROK_API_KEY passes through from dispatcher env unchanged
 
 
 class StubBackend(WorkerBackend):
