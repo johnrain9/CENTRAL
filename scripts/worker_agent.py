@@ -31,6 +31,7 @@ import sys
 import shutil
 import threading
 import time
+import importlib.util
 from pathlib import Path
 from typing import Any
 
@@ -99,13 +100,18 @@ def _load_shell_api_keys() -> None:
 
 
 def _require_backend_keys(worker_backends: list[str]) -> None:
-    """Fail fast if selected backends require unavailable credentials."""
+    """Fail fast if selected backends require unavailable credentials or deps."""
     needs_grok = "grok" in worker_backends
     needs_gemini = "gemini" in worker_backends
 
     if needs_grok and not (os.environ.get("GROK_API_KEY") or os.environ.get("XAI_API_KEY")):
         raise RuntimeError(
             "GROK_API_KEY or XAI_API_KEY is required for grok backend; export one and restart worker."
+        )
+
+    if needs_grok and importlib.util.find_spec("openai") is None:
+        raise RuntimeError(
+            "Python package 'openai' is required for grok backend; install with: pip install openai"
         )
 
     if needs_gemini and not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
