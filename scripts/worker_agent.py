@@ -98,6 +98,22 @@ def _load_shell_api_keys() -> None:
             continue
 
 
+def _require_backend_keys(worker_backends: list[str]) -> None:
+    """Fail fast if selected backends require unavailable credentials."""
+    needs_grok = "grok" in worker_backends
+    needs_gemini = "gemini" in worker_backends
+
+    if needs_grok and not (os.environ.get("GROK_API_KEY") or os.environ.get("XAI_API_KEY")):
+        raise RuntimeError(
+            "GROK_API_KEY or XAI_API_KEY is required for grok backend; export one and restart worker."
+        )
+
+    if needs_gemini and not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+        raise RuntimeError(
+            "GEMINI_API_KEY or GOOGLE_API_KEY is required for gemini backend; export one and restart worker."
+        )
+
+
 # ---------------------------------------------------------------------------
 # CENTRAL path setup for backend imports
 # ---------------------------------------------------------------------------
@@ -656,6 +672,11 @@ class WorkerAgent:
 
         log.info("Loading API keys from shell profile…")
         _load_shell_api_keys()
+        try:
+            _require_backend_keys(self.backends)
+        except RuntimeError as exc:
+            log.error("%s", exc)
+            return
 
         log.info("Syncing CENTRAL at %s…", CENTRAL_ROOT)
         self._central_version = self._sync_central()
