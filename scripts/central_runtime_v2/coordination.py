@@ -341,7 +341,7 @@ class CoordinationServer:
             read_conn = self._open_db()
             try:
                 snapshots = task_db.fetch_task_snapshots(read_conn)
-                eligible = task_db.order_eligible_snapshots(snapshots)
+                eligible = task_db.order_eligible_snapshots(snapshots, remote_only=True)
                 active_counts = task_db.active_repo_worker_counts(read_conn)
             finally:
                 read_conn.close()
@@ -372,6 +372,7 @@ class CoordinationServer:
                     queue_name=self._config.queue_name,
                     lease_seconds=lease_seconds,
                     task_id=candidate["task_id"],
+                    remote_only=True,
                     actor_id="central.coordination",
                     raise_on_empty=False,
                 )

@@ -3815,8 +3815,36 @@ def fetch_task_snapshots(
     return snapshots
 
 
-def task_is_eligible(snapshot: dict[str, Any]) -> bool:
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    return False
+
+
+def _is_remote_only_task(snapshot: dict[str, Any]) -> bool:
+    metadata = snapshot.get("metadata") or {}
+    if "remote_only" in metadata:
+        return _coerce_bool(metadata.get("remote_only"))
+    if "remote" in metadata:
+        return _coerce_bool(metadata.get("remote"))
+    return False
+
+
+def task_is_eligible(snapshot: dict[str, Any], *, remote_only: bool | None = None) -> bool:
     if snapshot["planner_status"] not in {"todo", "in_progress"}:
+        return False
+    is_remote_only = _is_remote_only_task(snapshot)
+    if remote_only is True and not is_remote_only:
+        return False
+    if remote_only is False and is_remote_only:
         return False
     if not snapshot["target_repo_is_active"]:
         return False
@@ -3836,8 +3864,10 @@ def task_is_eligible(snapshot: dict[str, Any]) -> bool:
     return True
 
 
-def order_eligible_snapshots(snapshots: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    eligible = [snapshot for snapshot in snapshots if task_is_eligible(snapshot)]
+def order_eligible_snapshots(
+    snapshots: list[dict[str, Any]], *, remote_only: bool | None = None
+) -> list[dict[str, Any]]:
+    eligible = [snapshot for snapshot in snapshots if task_is_eligible(snapshot, remote_only=remote_only)]
     buckets: dict[int, dict[str, deque[dict[str, Any]]]] = defaultdict(lambda: defaultdict(deque))
     for snapshot in eligible:
         buckets[int(snapshot["priority"])][snapshot["target_repo_id"]].append(snapshot)
@@ -5602,11 +5632,12 @@ def runtime_claim(
     lease_seconds: int,
     task_id: str | None,
     actor_id: str,
+    remote_only: bool | None = None,
     raise_on_empty: bool = True,
 ) -> dict[str, Any] | None:
     begin_immediate(conn)
     snapshots = fetch_task_snapshots(conn, task_id=task_id) if task_id else fetch_task_snapshots(conn)
-    ordered = order_eligible_snapshots(snapshots)
+    ordered = order_eligible_snapshots(snapshots, remote_only=remote_only)
     if task_id is not None:
         ordered = [snapshot for snapshot in ordered if snapshot["task_id"] == task_id]
     active_counts = active_repo_worker_counts(conn)

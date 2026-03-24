@@ -585,6 +585,7 @@ class CentralDispatcher:
                 lease_seconds=max(5, int(self.config.heartbeat_seconds * 3)),
                 task_id=None,
                 actor_id="central.dispatcher",
+                remote_only=False,
                 raise_on_empty=False,
             )
         finally:

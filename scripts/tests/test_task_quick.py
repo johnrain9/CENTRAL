@@ -134,6 +134,39 @@ class TaskQuickPlannerSmokeTest(unittest.TestCase):
         self.assertIn("Dry-run: Verify preflight integration", result.stdout)
         self.assertIn("state:     preflight validated, no write performed", result.stdout)
 
+    def test_remote_task_marks_metadata(self) -> None:
+        title = "Validate remote dispatch routing"
+        result = self.run_cli(
+            "--title",
+            title,
+            "--repo",
+            "CENTRAL",
+            "--template",
+            "planner-ops",
+            "--remote",
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+        created_id_line = next(
+            (line for line in result.stdout.splitlines() if line.startswith("Created ")),
+            "",
+        )
+        self.assertNotEqual(created_id_line, "")
+        created_id = created_id_line.split(":", 1)[0].replace("Created ", "").strip()
+        conn = task_db.connect(self.db_path)
+        try:
+            metadata = conn.execute(
+                "SELECT metadata_json FROM tasks WHERE task_id = ?",
+                (created_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(metadata)
+        parsed_metadata = task_db.parse_json_text(
+            str(metadata["metadata_json"]), default={}
+        ) if metadata else {}
+        self.assertTrue(parsed_metadata.get("remote") is True)
+        self.assertTrue(parsed_metadata.get("remote_only") is True)
+
 
 if __name__ == "__main__":
     unittest.main()

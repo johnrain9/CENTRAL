@@ -540,6 +540,26 @@ class DispatcherIntegrationTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def create_task_direct(
+        self,
+        task_id: str,
+        *,
+        execution_metadata: dict[str, object] | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        payload = task_payload(task_id, execution_metadata=execution_metadata, metadata=metadata)
+        conn = task_db.connect(self.db_path)
+        try:
+            with conn:
+                task_db.create_task(
+                    conn,
+                    payload,
+                    actor_kind="test",
+                    actor_id="dispatcher.tests",
+                )
+        finally:
+            conn.close()
+
     def fetch_snapshot(self, task_id: str) -> dict[str, object]:
         conn = task_db.connect(self.db_path)
         try:
@@ -649,6 +669,34 @@ class DispatcherIntegrationTest(unittest.TestCase):
         for key in REQUIRED_WORKER_FIELDS:
             self.assertIn(key, payload, f"missing required key: {key}")
         autonomy_runner.validate_worker_payload(payload, task_id=task_id, run_id=payload["run_id"])
+
+    def test_local_dispatch_skips_remote_only_task(self) -> None:
+        self.create_task_direct("CENTRAL-OPS-7991")
+        self.create_task_direct("CENTRAL-OPS-7992", metadata={"remote": True})
+        snapshot = self.dispatcher._claim_next()
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["task_id"], "CENTRAL-OPS-7991")
+        self.assertIsNone(self.dispatcher._claim_next())
+
+    def test_remote_only_claim_prefers_remote_tasks(self) -> None:
+        self.create_task_direct("CENTRAL-OPS-7993", metadata={"remote": True})
+        self.create_task_direct("CENTRAL-OPS-7994")
+        conn = task_db.connect(self.db_path)
+        try:
+            snapshot = task_db.runtime_claim(
+                conn,
+                worker_id="remote:test-1",
+                queue_name="remote",
+                lease_seconds=15,
+                task_id=None,
+                actor_id="unit.tests",
+                remote_only=True,
+                raise_on_empty=False,
+            )
+        finally:
+            conn.close()
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["task_id"], "CENTRAL-OPS-7993")
 
     def test_reconcile_done_audit_pass_routes_and_forwards_raw_payload(self) -> None:
         parent_task_id, audit_task_id = self._setup_parent_and_audit("CENTRAL-OPS-5905")
