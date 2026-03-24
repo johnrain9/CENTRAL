@@ -147,6 +147,9 @@ class ActiveWorker:
     selected_worker_model_source: str | None = None
     selected_worker_backend: str | None = None
     pgid: int | None = None
+    is_remote: bool = False
+    remote_worker_id: str | None = None
+    last_remote_heartbeat: str | None = None
 
 
 @dataclass

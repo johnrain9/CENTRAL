@@ -3,13 +3,18 @@ name = "central"
 version = "0.0.0"
 description = "CENTRAL operational tooling and runtime scripts"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "fastapi>=0.100",
+  "uvicorn>=0.20",
+  "pydantic>=2.0",
+]
 
 [project.optional-dependencies]
 test = [
   "pytest>=8.2,<9",
   "pytest-cov>=5,<7",
   "pytest-timeout>=4.2",
+  "httpx>=0.24",
 ]
 
 [tool.pytest.ini_options]
