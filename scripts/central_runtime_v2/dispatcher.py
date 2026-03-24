@@ -28,7 +28,13 @@ from central_runtime_v2.config import (
     RuntimePaths,
     snapshot_retry_count,
 )
-from central_runtime_v2.coordination import CoordinationConfig, CoordinationServer
+try:
+    from central_runtime_v2.coordination import CoordinationConfig, CoordinationServer
+    _coordination_import_error: BaseException | None = None
+except ModuleNotFoundError as exc:
+    CoordinationConfig = None  # type: ignore[assignment]
+    CoordinationServer = None  # type: ignore[assignment]
+    _coordination_import_error = exc
 from central_runtime_v2.paths import (
     acquire_lock,
     build_runtime_paths,
@@ -1557,6 +1563,22 @@ class CentralDispatcher:
 
         # Start coordination server for remote workers if enabled
         if self.config.remote_workers_enabled:
+            if _coordination_import_error is not None:
+                self.logger.emit(
+                    "ERR",
+                    "central.dispatcher",
+                    (
+                        "remote worker coordination dependencies missing; install with "
+                        "`python3 -m pip install fastapi uvicorn` "
+                        "(or `python3 -m pip install -e \".[test]\"` for all test deps)."
+                    ),
+                )
+                self.logger.emit(
+                    "ERR",
+                    "central.dispatcher",
+                    f"coordination import error: {_coordination_import_error}",
+                )
+                return 1
             token = os.environ.get(COORDINATION_TOKEN_ENV, "").strip()
             if not token:
                 self.logger.emit(
