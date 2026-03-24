@@ -548,7 +548,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Dependency task ID (repeatable)")
     p.add_argument("--initiative", default=None,
                    help="Optional initiative/epic tag for grouping (e.g. 'dispatcher-infrastructure')")
-    p.add_argument("--worker-backend", default=None, choices=["codex", "claude", "gemini", "stub"],
+    p.add_argument("--worker-backend", default=None, choices=["codex", "claude", "gemini", "grok", "stub"],
                    help="Route task to a specific worker backend (default: dispatcher default)")
     p.add_argument("--worker-model", default=None,
                    help="Override the worker model for this task (e.g. 'gemini-3-pro-preview')")
