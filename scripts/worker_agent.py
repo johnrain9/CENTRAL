@@ -28,6 +28,7 @@ import os
 import signal
 import subprocess
 import sys
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -334,6 +335,8 @@ class WorkerAgent:
         worktree_path = self._worktrees_base / run_id
         if worktree_path.exists():
             log.warning("Worktree %s already exists — removing before recreating", worktree_path)
+            if worktree_path.is_dir():
+                shutil.rmtree(worktree_path, ignore_errors=True)
             subprocess.run(
                 [
                     "git",
@@ -348,6 +351,19 @@ class WorkerAgent:
                 timeout=30,
             )
 
+        head_commit = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if head_commit.returncode != 0 or not head_commit.stdout.strip():
+            raise RuntimeError(
+                f"Unable to resolve source commit in {repo_path}: "
+                f"{(head_commit.stderr or '').strip()}"
+            )
+        source_ref = head_commit.stdout.strip()
+
         r = subprocess.run(
             [
                 "git",
@@ -355,8 +371,9 @@ class WorkerAgent:
                 str(repo_path),
                 "worktree",
                 "add",
+                "--detach",
                 str(worktree_path),
-                "main",
+                source_ref,
             ],
             capture_output=True,
             timeout=30,
