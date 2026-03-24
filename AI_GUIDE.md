@@ -39,6 +39,7 @@ If your task is about:
 - task lifecycle / concurrency: [docs/central_task_concurrency.md](/Users/paul/projects/CENTRAL/docs/central_task_concurrency.md)
 - operator workflow: [docs/central_task_cli.md](/Users/paul/projects/CENTRAL/docs/central_task_cli.md)
 - capability memory design: [docs/capability_memory_hld.md](/Users/paul/projects/CENTRAL/docs/capability_memory_hld.md) and [docs/capability_memory_lld_01_schema.md](/Users/paul/projects/CENTRAL/docs/capability_memory_lld_01_schema.md)
+- metrics / analytics queries: [metrics/AI_METRICS_GUIDE.md](/Users/paul/projects/CENTRAL/metrics/AI_METRICS_GUIDE.md)
 
 ## High-Signal Repo Map
 
@@ -55,6 +56,10 @@ Top-level areas that matter most:
 
 - [docs](/Users/paul/projects/CENTRAL/docs)
   - design docs, operator docs, lifecycle docs
+
+- [metrics](/Users/paul/projects/CENTRAL/metrics)
+  - canonical analytics query library and worker result parsing
+  - read [metrics/AI_METRICS_GUIDE.md](/Users/paul/projects/CENTRAL/metrics/AI_METRICS_GUIDE.md) before adding any metrics SQL
 
 - [db/migrations](/Users/paul/projects/CENTRAL/db/migrations)
   - canonical DB schema migrations
