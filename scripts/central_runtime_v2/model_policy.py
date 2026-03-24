@@ -226,11 +226,19 @@ def build_worker_task(
     metadata = snapshot.get("metadata") or {}
     execution_metadata = execution.get("metadata") or {}
     effective_backend = resolve_task_worker_backend(snapshot, worker_mode)
-    _backend_default = dispatcher_default_worker_model or {
+    # When a task overrides to a different backend, use that backend's default
+    # model — not the dispatcher's current default (which is for a different backend).
+    _backend_defaults = {
         "claude": resolve_default_claude_model(None),
         "gemini": resolve_default_gemini_model(None),
         "grok": resolve_default_grok_model(None),
-    }.get(effective_backend, dispatcher_default_codex_model)
+    }
+    if effective_backend != worker_mode and effective_backend in _backend_defaults:
+        _backend_default = _backend_defaults[effective_backend]
+    else:
+        _backend_default = dispatcher_default_worker_model or _backend_defaults.get(
+            effective_backend, dispatcher_default_codex_model
+        )
     resolved_model = resolve_worker_model(snapshot, _backend_default, effective_backend)
     deliverables = extract_markdown_items(snapshot.get("deliverables_md", "")) or [
         snapshot.get("deliverables_md", "").strip()
