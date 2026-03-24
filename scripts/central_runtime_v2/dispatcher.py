@@ -1558,16 +1558,11 @@ class CentralDispatcher:
         # Start coordination server for remote workers if enabled
         if self.config.remote_workers_enabled:
             token = os.environ.get(COORDINATION_TOKEN_ENV, "").strip()
-            token_source = COORDINATION_TOKEN_ENV
-            if not token:
-                token = os.environ.get("CENTRAL_WORKER_TOKEN", "").strip()
-                token_source = "CENTRAL_WORKER_TOKEN" if token else COORDINATION_TOKEN_ENV
             if not token:
                 self.logger.emit(
                     "ERR",
                     "central.dispatcher",
-                    "remote_workers_enabled but no coordination token found "
-                    "(set CENTRAL_COORDINATION_TOKEN or CENTRAL_WORKER_TOKEN).",
+                    "remote_workers_enabled requires CENTRAL_COORDINATION_TOKEN in process environment.",
                 )
                 return 1
             coord_config = CoordinationConfig(
@@ -1583,7 +1578,7 @@ class CentralDispatcher:
                 "central.dispatcher",
                 f"coordination_server_started port={self.config.coordination_port} "
                 f"max_remote_workers={self.config.max_remote_workers} "
-                f"auth=enabled token_source={token_source}",
+                "auth=enabled token_source=CENTRAL_COORDINATION_TOKEN",
             )
 
         adopted = self._adopt_active_workers()

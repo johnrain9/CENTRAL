@@ -698,6 +698,36 @@ class DispatcherIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot["task_id"], "CENTRAL-OPS-7993")
 
+    def test_run_daemon_remote_workers_requires_token(self) -> None:
+        original_token = os.environ.get("CENTRAL_COORDINATION_TOKEN")
+        if "CENTRAL_COORDINATION_TOKEN" in os.environ:
+            del os.environ["CENTRAL_COORDINATION_TOKEN"]
+
+        remote_dispatcher = CentralDispatcher(
+            DispatcherConfig(
+                db_path=self.db_path,
+                state_dir=self.state_dir,
+                max_workers=1,
+                poll_interval=0.05,
+                heartbeat_seconds=0.1,
+                status_heartbeat_seconds=0.1,
+                stale_recovery_seconds=0.1,
+                worker_mode="stub",
+                default_worker_model="gpt-5.4",
+                remote_workers_enabled=True,
+                max_remote_workers=1,
+            )
+        )
+        try:
+            with mock.patch.object(dispatcher_module, "acquire_lock"), \
+                mock.patch.object(dispatcher_module, "release_lock"), \
+                mock.patch.object(dispatcher_module.CentralDispatcher, "_setup_signals"):
+                ret = remote_dispatcher.run_daemon()
+        finally:
+            if original_token is not None:
+                os.environ["CENTRAL_COORDINATION_TOKEN"] = original_token
+        self.assertEqual(ret, 1)
+
     def test_reconcile_done_audit_pass_routes_and_forwards_raw_payload(self) -> None:
         parent_task_id, audit_task_id = self._setup_parent_and_audit("CENTRAL-OPS-5905")
         self._set_runtime_done(audit_task_id, notes="audit completed")
