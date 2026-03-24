@@ -490,6 +490,8 @@ def api_metrics_all():
         throughput_daily,
         failure_mode_groups,
         retry_heatmap,
+        audit_pass_rate_over_time,
+        duration_cost_over_time,
     )
 
     conn = _open_db()
@@ -508,6 +510,8 @@ def api_metrics_all():
             # Ops diagnostics (process failures: quota, timeout, crashes)
             "ops_failure_taxonomy": failure_mode_groups(conn, top_n=20),
             "retry_heatmap": retry_heatmap(conn),
+            "audit_rate_over_time": audit_pass_rate_over_time(conn),
+            "duration_cost_over_time": duration_cost_over_time(conn),
         }
     finally:
         conn.close()
@@ -1330,7 +1334,33 @@ tr.selected td { background: #1a2540; }
     </div>
   </div>
 
-  <!-- Audit Verdicts -->
+  <!-- Audit Pass Rate Over Time -->
+  <div class="section" id="msec-audit-rate">
+    <div class="section-header" onclick="toggleSection('msec-audit-rate')">
+      <span class="section-title">Audit Pass Rate Over Time</span>
+      <span class="section-count" id="msec-audit-rate-cnt">—</span>
+      <span class="collapse-arrow">▾</span>
+    </div>
+    <div class="section-body">
+      <div class="metrics-note">First-pass audit rate per model per ISO week. Models with &lt;3 data points shown as dots only.</div>
+      <div id="metrics-audit-rate"><div class="empty-state">Loading…</div></div>
+    </div>
+  </div>
+
+  <!-- Duration &amp; Cost Over Time -->
+  <div class="section" id="msec-duration-cost">
+    <div class="section-header" onclick="toggleSection('msec-duration-cost')">
+      <span class="section-title">Duration &amp; Cost Over Time</span>
+      <span class="section-count" id="msec-duration-cost-cnt">—</span>
+      <span class="collapse-arrow">▾</span>
+    </div>
+    <div class="section-body">
+      <div class="metrics-note">P50 duration (minutes) and avg cost (USD) per model per ISO week.</div>
+      <div id="metrics-duration-cost"><div class="empty-state">Loading…</div></div>
+    </div>
+  </div>
+
+    <!-- Audit Verdicts -->
   <div class="section" id="msec-audit-verdicts">
     <div class="section-header" onclick="toggleSection('msec-audit-verdicts')">
       <span class="section-title">Audit Verdicts</span>
@@ -2214,10 +2244,237 @@ function renderMetrics(m) {
   renderInitiativeHealth(m.initiative_health || []);
   renderDailyThroughput(m.daily_throughput || []);
   renderRetryHeatmap(m.retry_heatmap || []);
+  renderAuditRateOverTime(m.audit_rate_over_time || []);
+  renderDurationCostOverTime(m.duration_cost_over_time || []);
   renderFailureTaxonomy(m.ops_failure_taxonomy || []);
   renderAuditVerdicts(m.audit_verdicts || []);
   renderWorkerRichness(m.worker_richness || {});
 }
+
+// ─── Audit Pass Rate Over Time ────────────────────────────────────────────────
+function renderAuditRateOverTime(rows) {
+  const el = document.getElementById('metrics-audit-rate');
+  const cnt = document.getElementById('msec-audit-rate-cnt');
+  if (!rows.length) {
+    if (cnt) cnt.textContent = '0';
+    el.innerHTML = '<div class="empty-state">No data yet.</div>';
+    return;
+  }
+
+  // Group by model, collect weeks
+  const byModel = {};
+  const weekSet = new Set();
+  for (const r of rows) {
+    weekSet.add(r.week);
+    if (!byModel[r.model]) byModel[r.model] = {};
+    byModel[r.model][r.week] = r.first_pass_rate;
+  }
+  const weeks = Array.from(weekSet).sort();
+  const models = Object.keys(byModel).sort();
+  if (cnt) cnt.textContent = models.length + ' model' + (models.length !== 1 ? 's' : '');
+
+  const COLORS = ['#4299e1','#68d391','#f6ad55','#fc8181','#b794f4','#76e4f7','#f687b3','#faf089'];
+  const W = 680, H = 220, PAD_L = 48, PAD_R = 16, PAD_T = 16, PAD_B = 40;
+  const cw = W - PAD_L - PAD_R, ch = H - PAD_T - PAD_B;
+
+  // X positions
+  const xStep = weeks.length > 1 ? cw / (weeks.length - 1) : cw;
+  const xOf = i => PAD_L + (weeks.length > 1 ? i * xStep : cw / 2);
+
+  // Y: 0–100%
+  const yOf = v => PAD_T + ch - (v * ch);
+
+  let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;display:block;overflow:visible">`;
+
+  // Grid lines at 25%, 50%, 75%, 100%
+  for (const pct of [0, 0.25, 0.5, 0.75, 1.0]) {
+    const y = yOf(pct);
+    svg += `<line x1="${PAD_L}" y1="${y}" x2="${PAD_L + cw}" y2="${y}" stroke="var(--border)" stroke-width="1"/>`;
+    svg += `<text x="${PAD_L - 4}" y="${y + 4}" text-anchor="end" font-size="9" fill="var(--text-dim)">${Math.round(pct * 100)}%</text>`;
+  }
+
+  // X axis labels (every 2-3 weeks)
+  const labelStep = weeks.length <= 8 ? 1 : weeks.length <= 16 ? 2 : 3;
+  for (let i = 0; i < weeks.length; i++) {
+    if (i % labelStep !== 0 && i !== weeks.length - 1) continue;
+    const x = xOf(i);
+    // Show short label: strip leading year if same as prev
+    const label = weeks[i].replace(/^\d{4}-/, 'W');
+    svg += `<text x="${x}" y="${H - PAD_B + 14}" text-anchor="middle" font-size="9" fill="var(--text-dim)">${label}</text>`;
+  }
+
+  // Series
+  for (let mi = 0; mi < models.length; mi++) {
+    const model = models[mi];
+    const color = COLORS[mi % COLORS.length];
+    const pts = weeks.map((w, i) => {
+      const v = byModel[model][w];
+      return v != null ? { x: xOf(i), y: yOf(v), v, w } : null;
+    });
+    const validPts = pts.filter(p => p !== null);
+    if (!validPts.length) continue;
+
+    const shortModel = model.split('/').pop().replace(/^claude-/, '').replace(/-\d{8}$/, '');
+    const dotsOnly = validPts.length < 3;
+
+    if (!dotsOnly) {
+      // Build polyline, skipping gaps
+      let path = '';
+      let inLine = false;
+      for (const pt of pts) {
+        if (pt === null) { inLine = false; continue; }
+        if (!inLine) { path += `M${pt.x},${pt.y}`; inLine = true; }
+        else { path += `L${pt.x},${pt.y}`; }
+      }
+      svg += `<path d="${path}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round"/>`;
+    }
+
+    // Dots + tooltips
+    for (const pt of validPts) {
+      const tip = `${pt.w} ${shortModel}: ${Math.round(pt.v * 100)}% first-pass`;
+      svg += `<circle cx="${pt.x}" cy="${pt.y}" r="${dotsOnly ? 5 : 3.5}" fill="${color}" stroke="var(--bg2)" stroke-width="1.5">`;
+      svg += `<title>${tip}</title></circle>`;
+    }
+  }
+
+  // Legend
+  let legendX = PAD_L;
+  const legendY = H - 6;
+  for (let mi = 0; mi < models.length; mi++) {
+    const model = models[mi];
+    const color = COLORS[mi % COLORS.length];
+    const shortModel = model.split('/').pop().replace(/^claude-/, '').replace(/-\d{8}$/, '');
+    svg += `<rect x="${legendX}" y="${legendY - 8}" width="12" height="8" fill="${color}" rx="2"/>`;
+    svg += `<text x="${legendX + 15}" y="${legendY}" font-size="9" fill="var(--text-muted)">${shortModel}</text>`;
+    legendX += Math.max(shortModel.length * 6 + 20, 90);
+    if (legendX > W - 80) break;
+  }
+
+  svg += '</svg>';
+  el.innerHTML = svg;
+}
+
+// ─── Duration & Cost Over Time ────────────────────────────────────────────────
+function renderDurationCostOverTime(rows) {
+  const el = document.getElementById('metrics-duration-cost');
+  const cnt = document.getElementById('msec-duration-cost-cnt');
+  if (!rows.length) {
+    if (cnt) cnt.textContent = '0';
+    el.innerHTML = '<div class="empty-state">No data yet.</div>';
+    return;
+  }
+
+  // Group by model
+  const durByModel = {}, costByModel = {};
+  const weekSet = new Set();
+  for (const r of rows) {
+    weekSet.add(r.week);
+    if (!durByModel[r.model]) durByModel[r.model] = {};
+    if (!costByModel[r.model]) costByModel[r.model] = {};
+    if (r.p50_duration_s != null) durByModel[r.model][r.week] = r.p50_duration_s / 60;
+    if (r.avg_cost_usd != null) costByModel[r.model][r.week] = r.avg_cost_usd;
+  }
+  const weeks = Array.from(weekSet).sort();
+  const models = Object.keys(Object.assign({}, durByModel, costByModel)).sort();
+  if (cnt) cnt.textContent = models.length + ' model' + (models.length !== 1 ? 's' : '');
+
+  const COLORS = ['#4299e1','#68d391','#f6ad55','#fc8181','#b794f4','#76e4f7','#f687b3','#faf089'];
+
+  function makeChart(dataByModel, label, fmtVal, W, H, PAD_L, PAD_R, PAD_T, PAD_B) {
+    const cw = W - PAD_L - PAD_R, ch = H - PAD_T - PAD_B;
+    let maxVal = 0;
+    for (const m of models) {
+      for (const w of weeks) {
+        const v = dataByModel[m] && dataByModel[m][w];
+        if (v != null && v > maxVal) maxVal = v;
+      }
+    }
+    if (maxVal === 0) return `<div class="empty-state" style="font-size:11px">No ${label} data.</div>`;
+    maxVal = maxVal * 1.15;
+
+    const xStep = weeks.length > 1 ? cw / (weeks.length - 1) : cw;
+    const xOf = i => PAD_L + (weeks.length > 1 ? i * xStep : cw / 2);
+    const yOf = v => PAD_T + ch - (v / maxVal * ch);
+
+    let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;display:block;overflow:visible">`;
+
+    // Grid lines
+    for (let ti = 0; ti <= 4; ti++) {
+      const v = maxVal * ti / 4;
+      const y = yOf(v);
+      svg += `<line x1="${PAD_L}" y1="${y}" x2="${PAD_L + cw}" y2="${y}" stroke="var(--border)" stroke-width="1"/>`;
+      svg += `<text x="${PAD_L - 4}" y="${y + 4}" text-anchor="end" font-size="9" fill="var(--text-dim)">${fmtVal(v)}</text>`;
+    }
+
+    // X labels
+    const labelStep = weeks.length <= 8 ? 1 : weeks.length <= 16 ? 2 : 3;
+    for (let i = 0; i < weeks.length; i++) {
+      if (i % labelStep !== 0 && i !== weeks.length - 1) continue;
+      svg += `<text x="${xOf(i)}" y="${H - PAD_B + 14}" text-anchor="middle" font-size="9" fill="var(--text-dim)">${weeks[i].replace(/^\d{4}-/, 'W')}</text>`;
+    }
+
+    // Series
+    for (let mi = 0; mi < models.length; mi++) {
+      const model = models[mi];
+      const dm = dataByModel[model] || {};
+      const color = COLORS[mi % COLORS.length];
+      const pts = weeks.map((w, i) => {
+        const v = dm[w];
+        return v != null ? { x: xOf(i), y: yOf(v), v, w } : null;
+      });
+      const validPts = pts.filter(p => p !== null);
+      if (!validPts.length) continue;
+
+      const shortModel = model.split('/').pop().replace(/^claude-/, '').replace(/-\d{8}$/, '');
+      const dotsOnly = validPts.length < 3;
+
+      if (!dotsOnly) {
+        let path = '';
+        let inLine = false;
+        for (const pt of pts) {
+          if (pt === null) { inLine = false; continue; }
+          if (!inLine) { path += `M${pt.x},${pt.y}`; inLine = true; }
+          else { path += `L${pt.x},${pt.y}`; }
+        }
+        svg += `<path d="${path}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round"/>`;
+      }
+
+      for (const pt of validPts) {
+        const tip = `${pt.w} ${shortModel}: ${fmtVal(pt.v)}`;
+        svg += `<circle cx="${pt.x}" cy="${pt.y}" r="${dotsOnly ? 5 : 3.5}" fill="${color}" stroke="var(--bg2)" stroke-width="1.5">`;
+        svg += `<title>${tip}</title></circle>`;
+      }
+    }
+
+    // Legend
+    let legendX = PAD_L;
+    const legendY = H - 6;
+    for (let mi = 0; mi < models.length; mi++) {
+      const model = models[mi];
+      const color = COLORS[mi % COLORS.length];
+      const shortModel = model.split('/').pop().replace(/^claude-/, '').replace(/-\d{8}$/, '');
+      svg += `<rect x="${legendX}" y="${legendY - 8}" width="12" height="8" fill="${color}" rx="2"/>`;
+      svg += `<text x="${legendX + 15}" y="${legendY}" font-size="9" fill="var(--text-muted)">${shortModel}</text>`;
+      legendX += Math.max(shortModel.length * 6 + 20, 90);
+      if (legendX > W - 80) break;
+    }
+
+    svg += '</svg>';
+    return svg;
+  }
+
+  const fmtMin = v => v < 1 ? (v * 60).toFixed(0) + 's' : v.toFixed(1) + 'm';
+  const fmtCost = v => v < 0.001 ? (v * 1000).toFixed(3) + 'm$' : '$' + v.toFixed(3);
+
+  let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">';
+  html += `<div><div style="font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);font-weight:700;margin-bottom:6px">P50 Duration</div>` +
+    makeChart(durByModel, 'duration', fmtMin, 340, 200, 44, 12, 12, 36) + '</div>';
+  html += `<div><div style="font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);font-weight:700;margin-bottom:6px">Avg Cost (USD)</div>` +
+    makeChart(costByModel, 'cost', fmtCost, 340, 200, 52, 12, 12, 36) + '</div>';
+  html += '</div>';
+  el.innerHTML = html;
+}
+
 
 function renderBoxPlot(p25, p50, p75, p90, n_outliers, max_scale) {
   if (p50 == null) return '—';
