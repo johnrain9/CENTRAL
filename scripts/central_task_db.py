@@ -4337,7 +4337,7 @@ def runtime_requeue_task(
     task_id: str,
     actor_id: str,
     reason: str,
-    reset_retry_count: bool = False,
+    reset_retry_count: bool = True,
 ) -> dict[str, Any]:
     """Requeue a task by resetting its runtime_status to 'queued' and clearing the lease."""
     begin_immediate(conn)
@@ -8187,7 +8187,7 @@ def command_runtime_requeue_task(args: argparse.Namespace) -> int:
             task_id=args.task_id,
             actor_id=args.actor_id,
             reason=args.reason,
-            reset_retry_count=args.reset_retry_count,
+            reset_retry_count=not getattr(args, "keep_retry_count", False),
         )
     finally:
         conn.close()
@@ -8733,7 +8733,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_db_argument(runtime_requeue_parser)
     runtime_requeue_parser.add_argument("--task-id", required=True)
     runtime_requeue_parser.add_argument("--reason", required=True)
-    runtime_requeue_parser.add_argument("--reset-retry-count", action="store_true", help="Reset retry_count to 0 before requeue.")
+    runtime_requeue_parser.add_argument("--reset-retry-count", action="store_true", default=True, help="Reset retry_count to 0 before requeue (default: true).")
+    runtime_requeue_parser.add_argument("--keep-retry-count", action="store_true", help="Preserve existing retry_count instead of resetting to 0.")
     runtime_requeue_parser.add_argument("--actor-id", default="operator")
     add_json_argument(runtime_requeue_parser)
     runtime_requeue_parser.set_defaults(func=command_runtime_requeue_task)
