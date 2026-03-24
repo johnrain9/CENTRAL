@@ -78,6 +78,36 @@ def die(message: str, code: int = 1) -> "None":
     raise SystemExit(code)
 
 
+def _load_shell_api_keys() -> None:
+    """Source API keys from the user's shell profile into os.environ.
+
+    Workers spawned by the dispatcher inherit our env.  Keys like
+    GROK_API_KEY that live only in ~/.zprofile won't be present when the
+    dispatcher is started from a non-login shell.  We source the profile
+    once at launch and merge any *_API_KEY / *_TOKEN vars we find.
+    """
+    for profile in ("~/.zprofile", "~/.zshrc", "~/.bash_profile", "~/.bashrc"):
+        path = Path(profile).expanduser()
+        if not path.exists():
+            continue
+        try:
+            result = subprocess.run(
+                ["zsh", "-c", f"source {path} 2>/dev/null && env"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                continue
+            for line in result.stdout.splitlines():
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                if key.endswith("_API_KEY") or key.endswith("_TOKEN"):
+                    if key not in os.environ and value:
+                        os.environ[key] = value
+        except Exception:
+            continue
+
+
 def validate_model_for_mode(model: str, mode: str) -> None:
     if mode == "codex" and model not in ALLOWED_CODEX_MODELS:
         die(
@@ -486,6 +516,11 @@ def start_dispatcher(*, restart: bool = False) -> int:
         stop_dispatcher(quiet=True)
 
     effective_audit_model = saved_audit_model()
+    # Ensure API keys are available to the daemon subprocess.  The daemon
+    # inherits our env, but keys defined only in ~/.zprofile or ~/.zshrc
+    # won't be present when the dispatcher is launched from a non-login
+    # context (e.g. a cron, a resumed tmux pane, or another tool).
+    _load_shell_api_keys()
     with LAUNCH_LOG_PATH.open("ab") as handle:
         daemon_args = [
             "daemon",
