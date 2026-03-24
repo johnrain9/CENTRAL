@@ -12,6 +12,7 @@ COORDINATION_PORT=7429
 echo "🚀 Starting coordination server on http://$MAC_IP:$COORDINATION_PORT"
 cd "$(dirname "$0")/.." || exit 1
 export CENTRAL_COORDINATION_URL="http://$MAC_IP:$COORDINATION_PORT"
-export CENTRAL_COORDINATION_TOKEN="super-secret-token-2026-change-me"
-export CENTRAL_WORKER_TOKEN="$CENTRAL_COORDINATION_TOKEN"
+: "${CENTRAL_COORDINATION_TOKEN:=super-secret-token-2026-change-me}"
+export CENTRAL_COORDINATION_TOKEN
+export CENTRAL_WORKER_TOKEN="${CENTRAL_WORKER_TOKEN:-$CENTRAL_COORDINATION_TOKEN}"
 PYTHONPATH=scripts python3 -m central_runtime_v2 daemon --remote-workers

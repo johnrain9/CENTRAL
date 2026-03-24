@@ -96,6 +96,7 @@ _SAFE_SHELL_KEYS: frozenset[str] = frozenset({
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
     "CENTRAL_COORDINATION_TOKEN",
+    "CENTRAL_WORKER_TOKEN",
 })
 
 
