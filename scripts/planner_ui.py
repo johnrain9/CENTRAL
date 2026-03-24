@@ -2340,25 +2340,68 @@ function renderDailyThroughput(rows) {
     '</tbody></table></div>';
 }
 
+function interpHsl(v) {
+  // 0 → hsl(140,50%,20%)  0.3 → hsl(50,70%,25%)  1.0+ → hsl(0,60%,25%)
+  const stops = [{h:140,s:50,l:20},{h:50,s:70,l:25},{h:0,s:60,l:25}];
+  const ts = [0, 0.3, 1.0];
+  const clamped = Math.min(Math.max(v, 0), 1.0);
+  let i = ts.length - 2;
+  for (let j = 0; j < ts.length - 1; j++) { if (clamped <= ts[j + 1]) { i = j; break; } }
+  const t = (clamped - ts[i]) / (ts[i + 1] - ts[i]);
+  const a = stops[i], b = stops[i + 1];
+  const h = Math.round(a.h + (b.h - a.h) * t);
+  const s = Math.round(a.s + (b.s - a.s) * t);
+  const l = Math.round(a.l + (b.l - a.l) * t);
+  return 'hsl(' + h + ',' + s + '%,' + l + '%)';
+}
+
 function renderRetryHeatmap(rows) {
   const el = document.getElementById('metrics-retry-heatmap');
   const cnt = document.getElementById('msec-retry-cnt');
   if (cnt) cnt.textContent = rows.length;
   if (!rows.length) { el.innerHTML = '<div class="empty-state">No retry data available.</div>'; return; }
-  el.innerHTML = '<div class="task-table-wrap"><table>' +
-    '<thead><tr><th>Model</th><th>Task Type</th><th>Total</th><th>Avg Retries</th><th>Max Retries</th></tr></thead><tbody>' +
-    rows.map(r => {
-      const avg = r.avg_retries || 0;
-      const heat = avg > 1 ? 'badge-red' : avg > 0.3 ? 'badge-amber' : 'badge-green';
-      return '<tr>' +
-        '<td style="white-space:nowrap">' + esc(r.effective_worker_model) + '</td>' +
-        '<td>' + typeBadge(r.task_type) + '</td>' +
-        '<td>' + r.total + '</td>' +
-        '<td><span class="badge ' + heat + '">' + avg + '</span></td>' +
-        '<td>' + r.max_retries + '</td>' +
-        '</tr>';
-    }).join('') +
-    '</tbody></table></div>';
+
+  // Build row/col index
+  const models = [...new Set(rows.map(r => r.effective_worker_model))];
+  const taskTypes = [...new Set(rows.map(r => r.task_type))];
+  const map = {};
+  rows.forEach(r => { map[r.effective_worker_model + '\x00' + r.task_type] = r; });
+
+  const cellW = 60, cellH = 40;
+  const labelColW = 160;
+  const cols = taskTypes.length;
+
+  // Header row
+  let html = '<div style="overflow:auto">';
+  html += '<div style="display:grid;grid-template-columns:' + labelColW + 'px repeat(' + cols + ',' + cellW + 'px);margin-bottom:2px">';
+  html += '<div></div>';
+  taskTypes.forEach(tt => {
+    html += '<div style="font-size:9px;color:var(--text-dim);text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 2px" title="' + esc(tt) + '">' + esc(tt) + '</div>';
+  });
+  html += '</div>';
+
+  // Data rows
+  models.forEach(model => {
+    html += '<div style="display:grid;grid-template-columns:' + labelColW + 'px repeat(' + cols + ',' + cellW + 'px);margin-bottom:2px">';
+    html += '<div style="font-size:9px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:6px;line-height:' + cellH + 'px" title="' + esc(model) + '">' + esc(model) + '</div>';
+    taskTypes.forEach(tt => {
+      const r = map[model + '\x00' + tt];
+      const avg = r ? (r.avg_retries || 0) : 0;
+      const bg = r ? interpHsl(avg) : 'var(--bg3)';
+      const txt = r ? (avg === 0 ? '-' : avg.toFixed(2)) : '-';
+      html += '<div style="width:' + cellW + 'px;height:' + cellH + 'px;background:' + bg + ';display:flex;align-items:center;justify-content:center;font-size:9px;color:hsl(0,0%,90%);border:1px solid var(--border);box-sizing:border-box" title="' + esc(model) + ' / ' + esc(tt) + ': ' + txt + '">' + txt + '</div>';
+    });
+    html += '</div>';
+  });
+
+  // Legend
+  html += '<div style="margin-top:8px;display:flex;align-items:center;gap:8px">';
+  html += '<div style="width:' + (cellW * Math.min(cols, 6)) + 'px;height:10px;background:linear-gradient(to right,hsl(140,50%,20%),hsl(50,70%,25%),hsl(0,60%,25%));border-radius:2px"></div>';
+  html += '<div style="display:flex;justify-content:space-between;font-size:8px;color:var(--text-dim);width:' + (cellW * Math.min(cols, 6)) + 'px;position:absolute;margin-top:12px"><span>0</span><span>0.3</span><span>1.0+</span></div>';
+  html += '</div>';
+  html += '</div>';
+
+  el.innerHTML = html;
 }
 
 function renderFailureTaxonomy(rows) {
