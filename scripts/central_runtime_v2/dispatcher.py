@@ -77,7 +77,22 @@ import central_task_db as task_db
 DEFAULT_HANDOFF_LEASE_SECONDS = 90
 HEALTH_SNAPSHOT_SCRIPT = Path(__file__).resolve().parent.parent / "repo_health_check.py"
 _COMPLETION_GATE_REQUIRED_NAMES = ("cargo build", "git commit")
+_ECOSYSTEM_EXTRA_GATE_NAMES = ("frontend unit tests", "cargo test lib")
 _COMMIT_SHA_PATTERN = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
+
+
+def _get_extra_gates_for_repo(target_repo_root: str | None) -> tuple[str, ...]:
+    """Return additional required completion gates for the given repo root.
+
+    The ecosystem repo requires both frontend unit tests and Rust lib tests to
+    prevent the ECO-646 pattern where a worker modifies code without running
+    the affected test suite.
+    """
+    if not target_repo_root:
+        return ()
+    if Path(target_repo_root).name == "ecosystem":
+        return _ECOSYSTEM_EXTRA_GATE_NAMES
+    return ()
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -103,12 +118,12 @@ def _normalize_completion_gate_name(value: Any) -> str:
     return " ".join(raw.split())
 
 
-def _match_required_completion_gate(value: Any) -> str | None:
+def _match_required_completion_gate(value: Any, extra_required: tuple[str, ...] = ()) -> str | None:
     normalized = _normalize_completion_gate_name(value)
     if not normalized:
         return None
     normalized_for_match = f" {normalized} "
-    for required in _COMPLETION_GATE_REQUIRED_NAMES:
+    for required in _COMPLETION_GATE_REQUIRED_NAMES + extra_required:
         if normalized == required:
             return required
         if f" {required} " in normalized_for_match:
@@ -123,13 +138,18 @@ def _extract_commit_sha(notes: str | None) -> str | None:
     return match.group(0)
 
 
-def _collect_completion_gate_evidence(validation_entries: Any) -> tuple[dict[str, Any], list[str]]:
+def _collect_completion_gate_evidence(
+    validation_entries: Any,
+    extra_required: tuple[str, ...] = (),
+) -> tuple[dict[str, Any], list[str]]:
     """Collect required completion gates from worker validation entries.
 
     Returns (evidence_by_gate, missing_or_failed_reasons).
+    extra_required: additional gate names beyond the base set (e.g. repo-specific gates).
     """
+    all_required = _COMPLETION_GATE_REQUIRED_NAMES + extra_required
     evidence: dict[str, Any] = {}
-    for required in _COMPLETION_GATE_REQUIRED_NAMES:
+    for required in all_required:
         evidence[required] = {
             "required": True,
             "present": False,
@@ -142,7 +162,7 @@ def _collect_completion_gate_evidence(validation_entries: Any) -> tuple[dict[str
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        matched_gate = _match_required_completion_gate(entry.get("name"))
+        matched_gate = _match_required_completion_gate(entry.get("name"), extra_required)
         if matched_gate is None:
             continue
         gate = evidence[matched_gate]
@@ -153,7 +173,7 @@ def _collect_completion_gate_evidence(validation_entries: Any) -> tuple[dict[str
         if matched_gate == "git commit":
             gate["commit_sha"] = _extract_commit_sha(gate["notes"])
     failures: list[str] = []
-    for required in _COMPLETION_GATE_REQUIRED_NAMES:
+    for required in all_required:
         gate = evidence[required]
         if not gate["present"]:
             failures.append(f"required validation missing: {required}")
@@ -164,8 +184,9 @@ def _collect_completion_gate_evidence(validation_entries: Any) -> tuple[dict[str
 
 def _extract_completion_gate_status(
     validation_entries: Any,
+    extra_required: tuple[str, ...] = (),
 ) -> tuple[bool, dict[str, Any], list[str]]:
-    gate_evidence, failures = _collect_completion_gate_evidence(validation_entries)
+    gate_evidence, failures = _collect_completion_gate_evidence(validation_entries, extra_required)
     return len(failures) == 0, gate_evidence, failures
 
 
@@ -1445,7 +1466,8 @@ class CentralDispatcher:
                     validation_entries = result.validation
                 if validation_entries is None and isinstance(raw_result_payload, dict):
                     validation_entries = raw_result_payload.get("validation")
-                gate_ok, gate_metadata, gate_fail_reasons = _extract_completion_gate_status(validation_entries)
+                _extra_gates = _get_extra_gates_for_repo(str(state.task.get("target_repo_root") or ""))
+                gate_ok, gate_metadata, gate_fail_reasons = _extract_completion_gate_status(validation_entries, _extra_gates)
                 runtime_metadata["completion_gates"] = gate_metadata
                 runtime_metadata["completion_gate_status"] = "passed" if gate_ok else "failed"
                 if gate_fail_reasons:

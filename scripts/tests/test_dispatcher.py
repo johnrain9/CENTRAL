@@ -1093,5 +1093,147 @@ class RepoHealthCheckTest(unittest.TestCase):
         self.assertIn(".repo_health_trace_counts.pkl", " ".join(command))
 
 
+class TestEcosystemCompletionGates(unittest.TestCase):
+    """Tests for repo-specific completion gate enforcement (ECO-651)."""
+
+    def test_get_extra_gates_ecosystem(self) -> None:
+        extras = dispatcher_module._get_extra_gates_for_repo("/home/user/projects/ecosystem")
+        self.assertEqual(extras, dispatcher_module._ECOSYSTEM_EXTRA_GATE_NAMES)
+
+    def test_get_extra_gates_non_ecosystem(self) -> None:
+        extras = dispatcher_module._get_extra_gates_for_repo("/home/user/projects/CENTRAL")
+        self.assertEqual(extras, ())
+
+    def test_get_extra_gates_none(self) -> None:
+        self.assertEqual(dispatcher_module._get_extra_gates_for_repo(None), ())
+
+    def test_get_extra_gates_empty_string(self) -> None:
+        self.assertEqual(dispatcher_module._get_extra_gates_for_repo(""), ())
+
+    def test_match_gate_with_extra_required(self) -> None:
+        extra = ("frontend unit tests", "cargo test lib")
+        self.assertEqual(
+            dispatcher_module._match_required_completion_gate("frontend unit tests", extra),
+            "frontend unit tests",
+        )
+        self.assertEqual(
+            dispatcher_module._match_required_completion_gate("cargo test lib", extra),
+            "cargo test lib",
+        )
+        # Base gates still match
+        self.assertEqual(
+            dispatcher_module._match_required_completion_gate("cargo build", extra),
+            "cargo build",
+        )
+
+    def test_collect_evidence_extra_required_present_passing(self) -> None:
+        extra = dispatcher_module._ECOSYSTEM_EXTRA_GATE_NAMES
+        entries = [
+            {"name": "cargo build", "passed": True, "notes": "ok"},
+            {"name": "git commit", "passed": True, "notes": "abc1234"},
+            {"name": "frontend unit tests", "passed": True, "notes": "all pass"},
+            {"name": "cargo test lib", "passed": True, "notes": "all pass"},
+        ]
+        evidence, failures = dispatcher_module._collect_completion_gate_evidence(entries, extra)
+        self.assertEqual(failures, [])
+        self.assertTrue(evidence["frontend unit tests"]["present"])
+        self.assertTrue(evidence["frontend unit tests"]["passed"])
+        self.assertTrue(evidence["cargo test lib"]["present"])
+        self.assertTrue(evidence["cargo test lib"]["passed"])
+
+    def test_collect_evidence_extra_required_missing(self) -> None:
+        extra = dispatcher_module._ECOSYSTEM_EXTRA_GATE_NAMES
+        entries = [
+            {"name": "cargo build", "passed": True, "notes": "ok"},
+            {"name": "git commit", "passed": True, "notes": "abc1234"},
+            # frontend unit tests and cargo test lib intentionally omitted
+        ]
+        evidence, failures = dispatcher_module._collect_completion_gate_evidence(entries, extra)
+        self.assertIn("required validation missing: frontend unit tests", failures)
+        self.assertIn("required validation missing: cargo test lib", failures)
+
+    def test_collect_evidence_extra_required_failed(self) -> None:
+        extra = dispatcher_module._ECOSYSTEM_EXTRA_GATE_NAMES
+        entries = [
+            {"name": "cargo build", "passed": True, "notes": "ok"},
+            {"name": "git commit", "passed": True, "notes": "abc1234"},
+            {"name": "frontend unit tests", "passed": False, "notes": "2 failures"},
+            {"name": "cargo test lib", "passed": True, "notes": "ok"},
+        ]
+        evidence, failures = dispatcher_module._collect_completion_gate_evidence(entries, extra)
+        self.assertIn("validation failed: frontend unit tests", failures)
+        self.assertNotIn("validation failed: cargo test lib", failures)
+
+    def test_extract_gate_status_ecosystem_all_pass(self) -> None:
+        extra = dispatcher_module._ECOSYSTEM_EXTRA_GATE_NAMES
+        entries = [
+            {"name": "cargo build", "passed": True, "notes": "ok"},
+            {"name": "git commit", "passed": True, "notes": "abc1234"},
+            {"name": "frontend unit tests", "passed": True, "notes": "ok"},
+            {"name": "cargo test lib", "passed": True, "notes": "ok"},
+        ]
+        ok, _, failures = dispatcher_module._extract_completion_gate_status(entries, extra)
+        self.assertTrue(ok)
+        self.assertEqual(failures, [])
+
+    def test_extract_gate_status_ecosystem_missing_unit_tests(self) -> None:
+        extra = dispatcher_module._ECOSYSTEM_EXTRA_GATE_NAMES
+        entries = [
+            {"name": "cargo build", "passed": True, "notes": "ok"},
+            {"name": "git commit", "passed": True, "notes": "abc1234"},
+        ]
+        ok, _, failures = dispatcher_module._extract_completion_gate_status(entries, extra)
+        self.assertFalse(ok)
+        self.assertEqual(len(failures), 2)
+
+    def test_worker_prompt_includes_ecosystem_unit_test_gates(self) -> None:
+        snapshot = {
+            "task_id": "ECO-TEST-1",
+            "title": "Test task",
+            "target_repo_root": "/home/user/projects/ecosystem",
+            "task_type": "feature",
+            "objective_md": "Do a thing",
+            "context_md": "",
+            "scope_md": "",
+            "deliverables_md": "- thing done",
+            "acceptance_md": "",
+            "testing_md": "",
+            "dispatch_md": "repo=ecosystem",
+            "closeout_md": "",
+            "reconciliation_md": "",
+            "execution": {"task_kind": "mutating", "metadata": {}},
+            "metadata": {},
+        }
+        task = model_policy.build_worker_task(snapshot, "codex-mini", worker_mode="codex")
+        prompt = task["prompt_body"]
+        self.assertIn("npx vitest run --project unit", prompt)
+        self.assertIn("frontend unit tests", prompt)
+        self.assertIn("cargo test --lib", prompt)
+        self.assertIn("cargo test lib", prompt)
+
+    def test_worker_prompt_no_ecosystem_gates_for_other_repos(self) -> None:
+        snapshot = {
+            "task_id": "OTHER-1",
+            "title": "Other repo task",
+            "target_repo_root": "/home/user/projects/CENTRAL",
+            "task_type": "feature",
+            "objective_md": "Do a thing",
+            "context_md": "",
+            "scope_md": "",
+            "deliverables_md": "- thing done",
+            "acceptance_md": "",
+            "testing_md": "",
+            "dispatch_md": "repo=CENTRAL",
+            "closeout_md": "",
+            "reconciliation_md": "",
+            "execution": {"task_kind": "mutating", "metadata": {}},
+            "metadata": {},
+        }
+        task = model_policy.build_worker_task(snapshot, "codex-mini", worker_mode="codex")
+        prompt = task["prompt_body"]
+        self.assertNotIn("npx vitest run --project unit", prompt)
+        self.assertNotIn("cargo test --lib", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

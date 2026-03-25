@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 from central_runtime_v2.config import (
@@ -262,6 +263,25 @@ def build_worker_task(
             f"Do not explore unrelated code or documents. Make targeted changes only.\n\n"
             f"{rework_context}"
         )
+    _repo_root = str(snapshot.get("target_repo_root") or "")
+    _is_ecosystem = Path(_repo_root).name == "ecosystem"
+    _completion_gates = (
+        "## Completion Gates (Mandatory)\n"
+        "Before reporting done, you MUST complete and verify all of the following:\n"
+        "- Run `cargo build` and include a passing validation entry named `cargo build`.\n"
+        "- Commit all repo changes and include a passing validation entry named `git commit`.\n"
+    )
+    if _is_ecosystem:
+        _completion_gates += (
+            "- Run `cd frontend && npx vitest run --project unit` and include a passing "
+            "validation entry named `frontend unit tests`.\n"
+            "- Run `cargo test --lib` and include a passing validation entry named `cargo test lib`.\n"
+        )
+    _completion_gates += (
+        "- Do not mark task done until all checks have run successfully and you can prove it "
+        "via validation entries.\n"
+        "- If any check fails, return status `FAILED` with notes explaining why."
+    )
     prompt_sections += [
         f"## Objective\n{snapshot.get('objective_md', '').strip()}",
         f"## Context\n{snapshot.get('context_md', '').strip()}",
@@ -269,14 +289,7 @@ def build_worker_task(
         f"## Deliverables\n{snapshot.get('deliverables_md', '').strip()}",
         f"## Acceptance\n{snapshot.get('acceptance_md', '').strip()}",
         f"## Testing\n{snapshot.get('testing_md', '').strip()}",
-        (
-            "## Completion Gates (Mandatory)\n"
-            "Before reporting done, you MUST complete and verify all of the following:\n"
-            "- Run `cargo build` and include a passing validation entry named `cargo build`.\n"
-            "- Commit all repo changes and include a passing validation entry named `git commit`.\n"
-            "- Do not mark task done until both checks have run successfully and you can prove it via validation entries.\n"
-            "- If either check fails, return status `FAILED` with notes explaining why."
-        ),
+        _completion_gates,
         f"## Dispatch Contract\n{snapshot.get('dispatch_md', '').strip()}",
         f"## Closeout Contract\n{snapshot.get('closeout_md', '').strip()}",
         f"## Reconciliation\n{snapshot.get('reconciliation_md', '').strip()}",
