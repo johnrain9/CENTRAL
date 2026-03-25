@@ -1,3 +1,4 @@
 state/
+!state/central_tasks.db
 __pycache__/
 target/
