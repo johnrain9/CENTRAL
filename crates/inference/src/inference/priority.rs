@@ -1,7 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::task::{Context, Poll, Waker};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Priority {
     HumanInteractive,
     ChainReply,

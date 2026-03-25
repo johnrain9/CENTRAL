@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::types::{ExtensionTool, NativeTool};
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ToolRegistry {
     native_tools: HashMap<String, Arc<dyn NativeTool>>,
     extension_tools: HashMap<String, Arc<dyn ExtensionTool>>,
