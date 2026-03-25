@@ -5802,6 +5802,7 @@ def runtime_transition(
     exit_category: str | None = None,
     tokens_used: int | None = None,
     tokens_cost_usd: float | None = None,
+    runtime_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if status not in RUNTIME_STATUSES:
         die(f"invalid runtime status: {status}")
@@ -5850,6 +5851,17 @@ def runtime_transition(
     resolved_exit_category = exit_category if exit_category is not None else current.get("exit_category")
     resolved_tokens_used = tokens_used if tokens_used is not None else current.get("tokens_used")
     resolved_tokens_cost_usd = tokens_cost_usd if tokens_cost_usd is not None else current.get("tokens_cost_usd")
+    merged_runtime_metadata: dict[str, Any] = (
+        parse_json_text(current.get("runtime_metadata_json"), default={}) or {}
+    )
+    if runtime_metadata is None:
+        runtime_metadata = {}
+    if not isinstance(runtime_metadata, dict):
+        conn.rollback()
+        die("runtime_metadata must be a JSON object")
+    merged_runtime_metadata.update(runtime_metadata)
+    if notes is not None:
+        merged_runtime_metadata["notes"] = notes
     conn.execute(
         """
         UPDATE task_runtime_state
@@ -5883,7 +5895,7 @@ def runtime_transition(
             error_text,
             retry_count,
             transition_at,
-            compact_json({"notes": notes} if notes else {}),
+            compact_json(merged_runtime_metadata),
             resolved_model,
             resolved_source,
             resolved_exit_code,

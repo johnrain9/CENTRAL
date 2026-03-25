@@ -269,6 +269,14 @@ def build_worker_task(
         f"## Deliverables\n{snapshot.get('deliverables_md', '').strip()}",
         f"## Acceptance\n{snapshot.get('acceptance_md', '').strip()}",
         f"## Testing\n{snapshot.get('testing_md', '').strip()}",
+        (
+            "## Completion Gates (Mandatory)\n"
+            "Before reporting done, you MUST complete and verify all of the following:\n"
+            "- Run `cargo build` and include a passing validation entry named `cargo build`.\n"
+            "- Commit all repo changes and include a passing validation entry named `git commit`.\n"
+            "- Do not mark task done until both checks have run successfully and you can prove it via validation entries.\n"
+            "- If either check fails, return status `FAILED` with notes explaining why."
+        ),
         f"## Dispatch Contract\n{snapshot.get('dispatch_md', '').strip()}",
         f"## Closeout Contract\n{snapshot.get('closeout_md', '').strip()}",
         f"## Reconciliation\n{snapshot.get('reconciliation_md', '').strip()}",

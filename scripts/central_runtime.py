@@ -198,6 +198,8 @@ def json_dumps(payload: Any) -> str:
 ACTIVE_WORKER_RUNTIME_STATUSES = {"claimed", "running"}
 RECENT_WORKER_RUNTIME_STATUSES = {"pending_review", "failed", "timeout", "canceled", "done"}
 DEFAULT_HANDOFF_LEASE_SECONDS = 90
+_COMPLETION_GATE_REQUIRED_NAMES = ("cargo build", "git commit")
+_COMMIT_SHA_PATTERN = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
 
 
 def pid_alive(pid: int | None) -> bool:
@@ -712,6 +714,14 @@ def build_worker_task(snapshot: dict[str, Any], dispatcher_default_codex_model: 
         f"## Deliverables\n{snapshot.get('deliverables_md', '').strip()}",
         f"## Acceptance\n{snapshot.get('acceptance_md', '').strip()}",
         f"## Testing\n{snapshot.get('testing_md', '').strip()}",
+        (
+            "## Completion Gates (Mandatory)\n"
+            "Before reporting done, you MUST complete and verify all of the following:\n"
+            "- Run `cargo build` and include a passing validation entry named `cargo build`.\n"
+            "- Commit all repo changes and include a passing validation entry named `git commit`.\n"
+            "- Do not mark task done until both checks have run successfully and you can prove it via validation entries.\n"
+            "- If either check fails, return status `FAILED` with notes explaining why."
+        ),
         f"## Dispatch Contract\n{snapshot.get('dispatch_md', '').strip()}",
         f"## Closeout Contract\n{snapshot.get('closeout_md', '').strip()}",
         f"## Reconciliation\n{snapshot.get('reconciliation_md', '').strip()}",
@@ -1048,6 +1058,100 @@ def summarize_validation_results(entries: list[dict[str, Any]]) -> str | None:
         status = "passed" if passed else "failed"
         summaries.append(f"{name}: {status}{f' ({notes})' if notes else ''}")
     return "; ".join(summaries) if summaries else None
+
+
+def _normalize_completion_gate_name(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    raw = re.sub(r"`+|\"|'", "", raw)
+    raw = re.sub(r"[^a-z0-9]+", " ", raw)
+    return " ".join(raw.split())
+
+
+def _match_required_completion_gate(value: Any) -> str | None:
+    normalized = _normalize_completion_gate_name(value)
+    if not normalized:
+        return None
+    normalized_with_spaces = f" {normalized} "
+    for required in _COMPLETION_GATE_REQUIRED_NAMES:
+        if normalized == required:
+            return required
+        if f" {required} " in normalized_with_spaces:
+            return required
+    return None
+
+
+def _extract_commit_sha(notes: str | None) -> str | None:
+    match = _COMMIT_SHA_PATTERN.search(notes or "")
+    if match is None:
+        return None
+    return match.group(0)
+
+
+def _collect_completion_gate_evidence(validation_entries: Any) -> tuple[dict[str, Any], list[str]]:
+    """Collect required completion gates from worker validation entries.
+
+    Returns (evidence_by_gate, missing_or_failed_reasons).
+    """
+    evidence: dict[str, Any] = {}
+    for required in _COMPLETION_GATE_REQUIRED_NAMES:
+        evidence[required] = {
+            "required": True,
+            "present": False,
+            "passed": False,
+            "validation_name": None,
+            "notes": "",
+            "commit_sha": None,
+        }
+    entries = validation_entries if isinstance(validation_entries, list) else []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        matched_gate = _match_required_completion_gate(entry.get("name"))
+        if matched_gate is None:
+            continue
+        gate = evidence[matched_gate]
+        gate["present"] = True
+        gate["validation_name"] = str(entry.get("name") or "").strip()
+        gate["passed"] = bool(entry.get("passed"))
+        gate["notes"] = str(entry.get("notes") or "").strip()
+        if matched_gate == "git commit":
+            gate["commit_sha"] = _extract_commit_sha(gate["notes"])
+    failures: list[str] = []
+    for required in _COMPLETION_GATE_REQUIRED_NAMES:
+        gate = evidence[required]
+        if not gate["present"]:
+            failures.append(f"required validation missing: {required}")
+        elif not bool(gate["passed"]):
+            failures.append(f"validation failed: {required}")
+    return evidence, failures
+
+
+def _extract_completion_gate_status(
+    validation_entries: Any,
+) -> tuple[bool, dict[str, Any], list[str]]:
+    gate_evidence, failures = _collect_completion_gate_evidence(validation_entries)
+    return len(failures) == 0, gate_evidence, failures
+
+
+def _parent_completion_gates_passed(runtime: dict[str, Any] | None, parent_task_id: str) -> tuple[bool, list[str]]:
+    """Return whether parent runtime metadata includes passing completion gate evidence."""
+    runtime_metadata = (runtime or {}).get("metadata") or {}
+    gates = runtime_metadata.get("completion_gates")
+    if not isinstance(gates, dict):
+        return False, [f"parent task {parent_task_id} has no completion gate evidence"]
+    failures: list[str] = []
+    for required in _COMPLETION_GATE_REQUIRED_NAMES:
+        gate = gates.get(required)
+        if not isinstance(gate, dict):
+            failures.append(f"parent task {parent_task_id} missing completion gate: {required}")
+            continue
+        if not gate.get("present"):
+            failures.append(f"parent task {parent_task_id} missing completion gate: {required}")
+        elif not gate.get("passed"):
+            failures.append(f"parent task {parent_task_id} had failing completion gate: {required}")
+    return len(failures) == 0, failures
 
 
 def add_artifacts(task_id: str, artifacts: list[tuple[str, str, dict[str, Any]]], db_path: Path) -> None:
@@ -2022,8 +2126,68 @@ class CentralDispatcher:
                     error_text = "worker_crashed"
                     notes = "worker process not found; presumed crashed before result emission"
 
+            runtime_metadata: dict[str, Any] = {}
+            task_kind = str(((state.task.get("execution") or {}).get("task_kind") or "mutating")).strip().lower()
+            is_mutating_task = task_kind == "mutating"
+            is_audit_task = str(state.task.get("task_type") or "").strip().lower() == "audit"
+            selected_backend = str(getattr(state, "selected_worker_backend", None) or "")
+            should_enforce_gates = (
+                runtime_status in {"done", "pending_review"}
+                and is_mutating_task
+                and not is_audit_task
+                and selected_backend != "stub"
+            )
+            gate_ok = True
+            gate_fail_reasons: list[str] = []
+            if should_enforce_gates:
+                validation_entries = None
+                if result is not None:
+                    validation_entries = result.validation
+                if validation_entries is None and isinstance(raw_result_payload, dict):
+                    validation_entries = raw_result_payload.get("validation")
+                gate_ok, gate_metadata, gate_fail_reasons = _extract_completion_gate_status(validation_entries)
+                runtime_metadata["completion_gates"] = gate_metadata
+                runtime_metadata["completion_gate_status"] = "passed" if gate_ok else "failed"
+                if gate_fail_reasons:
+                    reason = "; ".join(gate_fail_reasons)
+                    runtime_status = "failed"
+                    notes = f"{notes}; {reason}" if notes else reason
+                    error_text = reason
+
+            audit_verdict = str(getattr(result, "verdict", "") or "") if result is not None else ""
+            should_check_parent_gate = (
+                runtime_status == "done"
+                and is_audit_task
+                and audit_verdict in {"accepted", "pass", "passed", "done", ""}
+            )
+            parent_gate_ok = True
+            parent_gate_reasons: list[str] = []
+            if should_check_parent_gate:
+                parent_task_id = str(((state.task.get("metadata") or {}).get("parent_task_id") or "") or "").strip() or "?"
+                if parent_task_id != "?":
+                    parent_snapshots = task_db.fetch_task_snapshots(conn, task_id=parent_task_id)
+                    if parent_snapshots:
+                        parent_gate_ok, parent_gate_reasons = _parent_completion_gates_passed(
+                            parent_snapshots[0].get("runtime"), parent_task_id
+                        )
+                    else:
+                        parent_gate_reasons = [f"parent task {parent_task_id} not found"]
+                else:
+                    parent_gate_reasons = ["parent task id not available on audit task"]
+                runtime_metadata["audit_parent_completion_gates"] = {
+                    "parent_task_id": parent_task_id,
+                    "passed": parent_gate_ok,
+                    "reasons": parent_gate_reasons,
+                }
+                if not parent_gate_ok:
+                    reason = "; ".join(parent_gate_reasons)
+                    runtime_status = "failed"
+                    notes = f"{notes}; {reason}" if notes else reason
+                    error_text = reason
+
             # Detect capacity/quota limits: requeue instead of failing, notify operator
             backend = str(getattr(state, "selected_worker_backend", None) or "")
+            should_skip_capacity = (not gate_ok) or (should_check_parent_gate and not parent_gate_ok)
             _quota_hit = (
                 runtime_status == "failed"
                 and (
@@ -2031,7 +2195,7 @@ class CentralDispatcher:
                     or (backend == "claude" and self._detect_claude_capacity_hit(state.log_path))
                 )
             )
-            if _quota_hit:
+            if _quota_hit and not should_skip_capacity:
                 requeue_conn = self._connect()
                 try:
                     task_db.runtime_requeue_task(
@@ -2067,6 +2231,7 @@ class CentralDispatcher:
                         notes=notes,
                         artifacts=result_artifacts,
                         actor_id="central.dispatcher",
+                        runtime_metadata=runtime_metadata,
                     )
                 self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status=runtime_status, summary=notes or error_text)
                 if runtime_status == "done":

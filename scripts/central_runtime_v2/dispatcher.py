@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import queue
 import signal
 import socket
@@ -75,6 +76,8 @@ import central_task_db as task_db
 
 DEFAULT_HANDOFF_LEASE_SECONDS = 90
 HEALTH_SNAPSHOT_SCRIPT = Path(__file__).resolve().parent.parent / "repo_health_check.py"
+_COMPLETION_GATE_REQUIRED_NAMES = ("cargo build", "git commit")
+_COMMIT_SHA_PATTERN = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -89,6 +92,100 @@ def _title_kv(task: dict) -> str:
     """Return a log-safe `title="..."` field string, or empty string if no title."""
     raw = str(task.get("title") or "").replace('"', "'")
     return f' title="{raw}"' if raw else ""
+
+
+def _normalize_completion_gate_name(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    raw = re.sub(r"`+|\"|'", "", raw)
+    raw = re.sub(r"[^a-z0-9]+", " ", raw)
+    return " ".join(raw.split())
+
+
+def _match_required_completion_gate(value: Any) -> str | None:
+    normalized = _normalize_completion_gate_name(value)
+    if not normalized:
+        return None
+    normalized_for_match = f" {normalized} "
+    for required in _COMPLETION_GATE_REQUIRED_NAMES:
+        if normalized == required:
+            return required
+        if f" {required} " in normalized_for_match:
+            return required
+    return None
+
+
+def _extract_commit_sha(notes: str | None) -> str | None:
+    match = _COMMIT_SHA_PATTERN.search(notes or "")
+    if match is None:
+        return None
+    return match.group(0)
+
+
+def _collect_completion_gate_evidence(validation_entries: Any) -> tuple[dict[str, Any], list[str]]:
+    """Collect required completion gates from worker validation entries.
+
+    Returns (evidence_by_gate, missing_or_failed_reasons).
+    """
+    evidence: dict[str, Any] = {}
+    for required in _COMPLETION_GATE_REQUIRED_NAMES:
+        evidence[required] = {
+            "required": True,
+            "present": False,
+            "passed": False,
+            "validation_name": None,
+            "notes": "",
+            "commit_sha": None,
+        }
+    entries = validation_entries if isinstance(validation_entries, list) else []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        matched_gate = _match_required_completion_gate(entry.get("name"))
+        if matched_gate is None:
+            continue
+        gate = evidence[matched_gate]
+        gate["present"] = True
+        gate["validation_name"] = str(entry.get("name") or "").strip()
+        gate["passed"] = bool(entry.get("passed"))
+        gate["notes"] = str(entry.get("notes") or "").strip()
+        if matched_gate == "git commit":
+            gate["commit_sha"] = _extract_commit_sha(gate["notes"])
+    failures: list[str] = []
+    for required in _COMPLETION_GATE_REQUIRED_NAMES:
+        gate = evidence[required]
+        if not gate["present"]:
+            failures.append(f"required validation missing: {required}")
+        elif not bool(gate["passed"]):
+            failures.append(f"validation failed: {required}")
+    return evidence, failures
+
+
+def _extract_completion_gate_status(
+    validation_entries: Any,
+) -> tuple[bool, dict[str, Any], list[str]]:
+    gate_evidence, failures = _collect_completion_gate_evidence(validation_entries)
+    return len(failures) == 0, gate_evidence, failures
+
+
+def _parent_completion_gates_passed(runtime: dict[str, Any] | None, parent_task_id: str) -> tuple[bool, list[str]]:
+    """Return whether parent runtime metadata includes passing completion gate evidence."""
+    runtime_metadata = (runtime or {}).get("metadata") or {}
+    gates = runtime_metadata.get("completion_gates")
+    if not isinstance(gates, dict):
+        return False, [f"parent task {parent_task_id} has no completion gate evidence"]
+    failures: list[str] = []
+    for required in _COMPLETION_GATE_REQUIRED_NAMES:
+        gate = gates.get(required)
+        if not isinstance(gate, dict):
+            failures.append(f"parent task {parent_task_id} missing completion gate: {required}")
+            continue
+        if not gate.get("present"):
+            failures.append(f"parent task {parent_task_id} missing completion gate: {required}")
+        elif not gate.get("passed"):
+            failures.append(f"parent task {parent_task_id} had failing completion gate: {required}")
+    return len(failures) == 0, failures
 
 
 def json_dumps(payload: Any) -> str:
@@ -1329,7 +1426,67 @@ class CentralDispatcher:
                 _tokens_used = raw_result_payload.get("tokens_used") or None
                 _tokens_cost_usd = raw_result_payload.get("tokens_cost_usd") or None
 
-            if not self._handle_capacity_limit(state, runtime_status):
+            runtime_metadata: dict[str, Any] = {}
+            task_kind = str(((state.task.get("execution") or {}).get("task_kind") or "mutating")).strip().lower()
+            is_mutating_task = task_kind == "mutating"
+            is_audit_task = str(state.task.get("task_type") or "").strip().lower() == "audit"
+            selected_backend = str(getattr(state, "selected_worker_backend", None) or "")
+            should_enforce_gates = (
+                runtime_status in {"done", "pending_review"}
+                and is_mutating_task
+                and not is_audit_task
+                and selected_backend != "stub"
+            )
+            gate_ok = True
+            gate_fail_reasons: list[str] = []
+            if should_enforce_gates:
+                validation_entries = None
+                if result is not None:
+                    validation_entries = result.validation
+                if validation_entries is None and isinstance(raw_result_payload, dict):
+                    validation_entries = raw_result_payload.get("validation")
+                gate_ok, gate_metadata, gate_fail_reasons = _extract_completion_gate_status(validation_entries)
+                runtime_metadata["completion_gates"] = gate_metadata
+                runtime_metadata["completion_gate_status"] = "passed" if gate_ok else "failed"
+                if gate_fail_reasons:
+                    reason = "; ".join(gate_fail_reasons)
+                    runtime_status = "failed"
+                    notes = f"{notes}; {reason}" if notes else reason
+                    error_text = reason
+
+            audit_verdict = str(getattr(result, "verdict", "") or "") if result is not None else ""
+            should_check_parent_gate = (
+                runtime_status == "done"
+                and is_audit_task
+                and audit_verdict in {"accepted", "pass", "passed", "done", ""}
+            )
+            parent_gate_ok = True
+            parent_gate_reasons: list[str] = []
+            if should_check_parent_gate:
+                parent_task_id = str(((state.task.get("metadata") or {}).get("parent_task_id") or "") or "").strip() or "?"
+                if parent_task_id != "?":
+                    parent_snapshots = task_db.fetch_task_snapshots(conn, task_id=parent_task_id)
+                    if parent_snapshots:
+                        parent_gate_ok, parent_gate_reasons = _parent_completion_gates_passed(
+                            parent_snapshots[0].get("runtime"), parent_task_id
+                        )
+                    else:
+                        parent_gate_reasons = [f"parent task {parent_task_id} not found"]
+                else:
+                    parent_gate_reasons = ["parent task id not available on audit task"]
+                runtime_metadata["audit_parent_completion_gates"] = {
+                    "parent_task_id": parent_task_id,
+                    "passed": parent_gate_ok,
+                    "reasons": parent_gate_reasons,
+                }
+                if not parent_gate_ok:
+                    reason = "; ".join(parent_gate_reasons)
+                    runtime_status = "failed"
+                    notes = f"{notes}; {reason}" if notes else reason
+                    error_text = reason
+
+            should_skip_capacity = (not gate_ok) or (should_check_parent_gate and not parent_gate_ok)
+            if should_skip_capacity or not self._handle_capacity_limit(state, runtime_status):
                 with conn:
                     task_db.runtime_transition(
                         conn,
@@ -1344,6 +1501,7 @@ class CentralDispatcher:
                         exit_category=_exit_category,
                         tokens_used=_tokens_used,
                         tokens_cost_usd=_tokens_cost_usd,
+                        runtime_metadata=runtime_metadata,
                     )
                 self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status=runtime_status, summary=notes or error_text, task_id=task_id)
                 if runtime_status == "done":
