@@ -3662,6 +3662,7 @@ def fetch_task_snapshots(
     repo_id: str | None = None,
     planner_status: str | None = None,
     initiative: str | None = None,
+    task_type: str | None = None,
 ) -> list[dict[str, Any]]:
     clauses = ["t.archived_at IS NULL"]
     params: list[Any] = []
@@ -3677,6 +3678,9 @@ def fetch_task_snapshots(
     if initiative is not None:
         clauses.append("t.initiative = ?")
         params.append(initiative)
+    if task_type is not None:
+        clauses.append("t.task_type = ?")
+        params.append(task_type)
     query = f"""
         SELECT
             t.*,
@@ -7229,7 +7233,8 @@ def command_task_list(args: argparse.Namespace) -> int:
     try:
         repo_id = resolve_repo_filter(conn, args.repo_id)
         initiative_filter = getattr(args, "initiative", None) or None
-        snapshots = fetch_task_snapshots(conn, repo_id=repo_id, planner_status=args.planner_status, initiative=initiative_filter)
+        task_type_filter = getattr(args, "task_type", None) or None
+        snapshots = fetch_task_snapshots(conn, repo_id=repo_id, planner_status=args.planner_status, initiative=initiative_filter, task_type=task_type_filter)
         rows = [
             {
                 "task_id": snapshot["task_id"],
@@ -7237,6 +7242,7 @@ def command_task_list(args: argparse.Namespace) -> int:
                 "planner_status": snapshot["planner_status"],
                 "runtime_status": snapshot["runtime"]["runtime_status"] if snapshot["runtime"] else "",
                 "repo": snapshot["target_repo_id"],
+                "task_type": snapshot.get("task_type", ""),
                 "initiative": snapshot["initiative"] or "",
                 "planner_owner": snapshot["planner_owner"],
                 "worker_owner": snapshot["worker_owner"] or "",
@@ -8493,6 +8499,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_list_parser.add_argument("--repo-id")
     task_list_parser.add_argument("--planner-status", choices=sorted(PLANNER_STATUSES))
     task_list_parser.add_argument("--initiative", default=None, help="Filter by initiative/epic tag.")
+    task_list_parser.add_argument("--task-type", default=None, help="Filter by task type (e.g., investigation, bugfix, feature).")
     add_json_argument(task_list_parser)
     task_list_parser.set_defaults(func=command_task_list)
 
