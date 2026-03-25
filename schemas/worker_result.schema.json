@@ -19,7 +19,9 @@
     "system_fit_assessment",
     "files_changed",
     "warnings",
-    "artifacts"
+    "artifacts",
+    "tokens_used",
+    "tokens_cost_usd"
   ],
   "properties": {
     "status": {
@@ -130,14 +132,14 @@
       }
     },
     "tokens_used": {
-      "type": ["integer", "null"],
+      "type": "integer",
       "minimum": 0,
-      "description": "Total tokens consumed by this worker run (input + output). Optional; populated by backends that expose usage data."
+      "description": "Total tokens consumed by this worker run (input + output). Use 0 if unknown."
     },
     "tokens_cost_usd": {
-      "type": ["number", "null"],
+      "type": "number",
       "minimum": 0,
-      "description": "Estimated cost in USD for this worker run. Optional; populated by backends that expose cost data."
+      "description": "Estimated cost in USD for this worker run. Use 0 if unknown."
     }
   },
   "additionalProperties": false
