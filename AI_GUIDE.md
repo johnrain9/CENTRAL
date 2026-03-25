@@ -197,6 +197,52 @@ Task creation:
 python3 scripts/create_planner_task.py --help
 ```
 
+## Dispatcher Quick Reference
+
+```bash
+# Dispatcher control
+python3 scripts/dispatcher_control.py status          # health, workers, eligible count
+python3 scripts/dispatcher_control.py start
+python3 scripts/dispatcher_control.py stop
+python3 scripts/dispatcher_control.py restart
+python3 scripts/dispatcher_control.py logs            # recent log lines
+python3 scripts/dispatcher_control.py follow          # tail logs live
+
+# Config (takes effect on next restart)
+python3 scripts/dispatcher_control.py config \
+  --worker-model claude-sonnet-4-6 \
+  --audit-model claude-sonnet-4-6 \
+  --worker-mode claude \
+  --max-workers 7
+
+# Task queue
+python3 scripts/central_task_db.py view-active        # all non-terminal tasks
+python3 scripts/central_task_db.py view-review        # failed + pending review
+python3 scripts/central_task_db.py view-eligible      # ready to dispatch
+python3 scripts/central_task_db.py task-show --task-id ECO-481   # full task detail
+
+# Fix stuck/failed tasks
+python3 scripts/central_task_db.py runtime-requeue-task --task-id TASK-ID --reason "reason"
+python3 scripts/central_task_db.py operator-fail-task --task-id TASK-ID --reason "reason"
+```
+
+Key dispatcher log fields:
+
+- `workers=4/7` — active/max
+- `eligible=12` — tasks ready to pick up
+- `failed=2` — needs operator attention
+- `mismatch=1` — planner/runtime status out of sync; investigate
+- `review=0` — pending audit review
+- `quota_backoff=300s` — hitting API rate limits, will retry
+
+Common patterns:
+
+- `failed=N` → run `view-review`, then `runtime-requeue-task` for each
+- `mismatch=N` → run `view-active`, look for `status_mismatch`, use `task-reconcile` or fix planner status manually
+- `quota_backoff` → wait or switch model; resets automatically
+- Zombie worker → `operator-fail-task` to kill lease, then requeue
+- `max_retries_exceeded` → `runtime-requeue-task` resets the counter automatically
+
 ## Audit Model
 
 CENTRAL uses paired audit tasks for most non-trivial implementation work.
@@ -277,3 +323,4 @@ Then stop expanding once you have enough context to act.
 - 2026-03-19 20:12 MDT: Created initial `AI_GUIDE.md` for CENTRAL with repo map, starting paths, common commands, audit model, and common traps.
 - 2026-03-19 20:13 MDT: Standardized guide maintenance pattern to include a minimal timestamped changelog at the bottom.
 - 2026-03-19 21:50 MDT: Added Planner Status UI section (`scripts/planner_ui.py`, `tests/test_planner_ui.py`). Flask-based, serves at port 7099, read-only v1.
+- 2026-03-25: Added Dispatcher Quick Reference section with operator commands, log field glossary, and common failure patterns.
