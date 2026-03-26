@@ -3865,6 +3865,11 @@ def task_is_eligible(snapshot: dict[str, Any], *, remote_only: bool | None = Non
     # Don't re-dispatch failed tasks that have exceeded max retries
     if status == "failed" and runtime.get("retry_count", 0) >= 5 and runtime.get("last_runtime_error") == "max_retries_exceeded":
         return False
+    # Don't re-dispatch tasks whose parent gate failure is immutable (parent is done/canceled).
+    # Retrying cannot fix missing or empty completion_gates on a finished parent task.
+    last_error = runtime.get("last_runtime_error") or ""
+    if status == "failed" and last_error.startswith("parent gate check permanently failed:"):
+        return False
     return True
 
 

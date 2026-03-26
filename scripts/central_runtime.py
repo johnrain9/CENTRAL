@@ -2192,10 +2192,13 @@ class CentralDispatcher:
                         parent_gate_ok, parent_gate_reasons = _parent_completion_gates_passed(
                             parent_snapshots[0].get("runtime"), parent_task_id
                         )
+                        parent_runtime_status = (parent_snapshots[0].get("runtime") or {}).get("runtime_status", "")
                     else:
                         parent_gate_reasons = [f"parent task {parent_task_id} not found"]
+                        parent_runtime_status = ""
                 else:
                     parent_gate_reasons = ["parent task id not available on audit task"]
+                    parent_runtime_status = ""
                 runtime_metadata["audit_parent_completion_gates"] = {
                     "parent_task_id": parent_task_id,
                     "passed": parent_gate_ok,
@@ -2205,7 +2208,13 @@ class CentralDispatcher:
                     reason = "; ".join(parent_gate_reasons)
                     runtime_status = "failed"
                     notes = f"{notes}; {reason}" if notes else reason
-                    error_text = reason
+                    # If the parent task is already in a terminal done/canceled state, the gate
+                    # failure is immutable — retrying the audit will never fix it.  Use the
+                    # permanent-failure prefix so the dispatcher does not waste retries.
+                    if parent_runtime_status in {"done", "canceled"}:
+                        error_text = f"parent gate check permanently failed: {reason}"
+                    else:
+                        error_text = reason
 
             # Detect capacity/quota limits: requeue instead of failing, notify operator
             backend = str(getattr(state, "selected_worker_backend", None) or "")
