@@ -83,13 +83,23 @@ def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: 
         "    except Exception:\n"
         "        sys.stdout.write(_line); sys.stdout.flush()\n"
         "proc.wait()\n"
-        "claude_result = {}\n"
-        "for _line in reversed(lines):\n"
+        "# Collect all result events; prefer the one with structured_output (StructuredOutput tool\n"
+        "# call from any session) so that sub-agent follow-on sessions do not shadow the main\n"
+        "# session's StructuredOutput call.\n"
+        "_all_results = []\n"
+        "for _line in lines:\n"
         "    try:\n"
         "        _obj = json.loads(_line)\n"
         "        if _obj.get('type') == 'result':\n"
-        "            claude_result = _obj; break\n"
+        "            _all_results.append(_obj)\n"
         "    except Exception: pass\n"
+        "claude_result = {}\n"
+        "for _r in _all_results:\n"
+        "    _so = _r.get('structured_output')\n"
+        "    if isinstance(_so, dict) and 'schema_version' in _so:\n"
+        "        claude_result = _r; break\n"
+        "if not claude_result:\n"
+        "    claude_result = _all_results[-1] if _all_results else {}\n"
         "is_error = claude_result.get('is_error', False) or claude_result.get('type') == 'error'\n"
         "result_text = str(claude_result.get('result', '') or claude_result.get('error', {}).get('message', 'no result'))\n"
         "# Try to parse structured JSON output from --json-schema.\n"
@@ -229,27 +239,36 @@ def normalize_claude_result(log_path: Path, result_path: Path, task_id: str, run
     """
     if not log_path.exists():
         return False
-    claude_result: dict[str, Any] | None = None
+    all_results: list[dict[str, Any]] = []
     try:
         text = log_path.read_text(encoding="utf-8", errors="replace")
-        for line in reversed(text.splitlines()):
+        for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
                 obj = json.loads(line)
                 if isinstance(obj, dict) and obj.get("type") == "result":
-                    claude_result = obj
-                    break
+                    all_results.append(obj)
             except json.JSONDecodeError:
                 continue
     except Exception:
         return False
-    if claude_result is None:
+    if not all_results:
         return False
+    # Prefer the result event that carries structured_output (StructuredOutput tool call from
+    # any session in the worker's session tree).  Sub-agent follow-on sessions emit their own
+    # result events after the main session; without this preference the last (empty) sub-agent
+    # result would shadow the main session's StructuredOutput payload.
+    claude_result: dict[str, Any] = {}
+    for r in all_results:
+        so = r.get("structured_output")
+        if isinstance(so, dict) and "schema_version" in so:
+            claude_result = r
+            break
+    if not claude_result:
+        claude_result = all_results[-1]
     is_error = bool(claude_result.get("is_error"))
-    raw_result = str(claude_result.get("result") or "")
-    status = "FAILED" if is_error else "COMPLETED"
     _usage = claude_result.get("usage") or {}
     _inp = int(_usage.get("input_tokens") or 0)
     _out = int(_usage.get("output_tokens") or 0)
@@ -257,36 +276,57 @@ def normalize_claude_result(log_path: Path, result_path: Path, task_id: str, run
     _cache_write = int(_usage.get("cache_creation_input_tokens") or 0)
     tokens_used: int | None = (_inp + _out + _cache_read + _cache_write) or None
     tokens_cost_usd: float | None = claude_result.get("total_cost_usd") or claude_result.get("cost_usd") or None
-    payload: dict[str, Any] = {
-        "status": status,
-        "schema_version": 2,
-        "task_id": task_id,
-        "run_id": run_id,
-        "summary": raw_result[:2000]
-        if raw_result
-        else ("claude worker error" if is_error else "claude worker completed"),
-        "completed_items": [] if is_error else ["claude worker run finished"],
-        "remaining_items": [],
-        "decisions": [],
-        "discoveries": [],
-        "blockers": [],
-        "validation": [
-            {"name": "claude-exit", "passed": not is_error, "notes": f"is_error={is_error}"}
-        ],
-        "capability_mutation": None,
-        "files_changed": [],
-        "warnings": [],
-        "artifacts": [],
-        "tokens_used": tokens_used,
-        "tokens_cost_usd": tokens_cost_usd,
-        "_claude_meta": {
+    # If the preferred result event carries a full structured_output payload, use it directly
+    # (augmented with metadata) rather than synthesising a minimal payload from the text result.
+    _so = claude_result.get("structured_output")
+    if isinstance(_so, dict) and "schema_version" in _so:
+        payload: dict[str, Any] = dict(_so)
+        payload["task_id"] = task_id
+        payload["run_id"] = run_id
+        if tokens_used is not None:
+            payload["tokens_used"] = tokens_used
+        if tokens_cost_usd is not None:
+            payload["tokens_cost_usd"] = tokens_cost_usd
+        payload["_claude_meta"] = {
             "subtype": claude_result.get("subtype"),
             "session_id": claude_result.get("session_id"),
             "num_turns": claude_result.get("num_turns"),
             "cost_usd": tokens_cost_usd,
             "duration_ms": claude_result.get("duration_ms"),
-        },
-    }
+        }
+    else:
+        raw_result = str(claude_result.get("result") or "")
+        status = "FAILED" if is_error else "COMPLETED"
+        payload = {
+            "status": status,
+            "schema_version": 2,
+            "task_id": task_id,
+            "run_id": run_id,
+            "summary": raw_result[:2000]
+            if raw_result
+            else ("claude worker error" if is_error else "claude worker completed"),
+            "completed_items": [] if is_error else ["claude worker run finished"],
+            "remaining_items": [],
+            "decisions": [],
+            "discoveries": [],
+            "blockers": [],
+            "validation": [
+                {"name": "claude-exit", "passed": not is_error, "notes": f"is_error={is_error}"}
+            ],
+            "capability_mutation": None,
+            "files_changed": [],
+            "warnings": [],
+            "artifacts": [],
+            "tokens_used": tokens_used,
+            "tokens_cost_usd": tokens_cost_usd,
+            "_claude_meta": {
+                "subtype": claude_result.get("subtype"),
+                "session_id": claude_result.get("session_id"),
+                "num_turns": claude_result.get("num_turns"),
+                "cost_usd": tokens_cost_usd,
+                "duration_ms": claude_result.get("duration_ms"),
+            },
+        }
     try:
         result_path.write_text(json.dumps(payload), encoding="utf-8")
         return True
