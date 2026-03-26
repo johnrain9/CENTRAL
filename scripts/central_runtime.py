@@ -2407,21 +2407,43 @@ class CentralDispatcher:
                 f"stale_recovery recovered={result['recovered_count']}",
             )
 
-    def _abort_if_max_retries(self, snapshot: dict[str, Any]) -> bool:
-        """Transition task to failed with max_retries_exceeded if retry_count >= max_retries.
+    # Error-text prefixes that indicate a permanently unresolvable failure.  When a
+    # claimed task's last_runtime_error starts with one of these, retrying the worker
+    # will never succeed — fail immediately instead of burning all max_retries slots.
+    _PERMANENT_FAILURE_PREFIXES: tuple[str, ...] = ("parent gate check permanently failed:",)
 
-        Returns True if the task was aborted, False if it should proceed to spawn.
+    def _abort_if_max_retries(self, snapshot: dict[str, Any]) -> bool:
+        """Transition task to failed if retry_count >= max_retries OR if the previous
+        failure was permanently unresolvable (e.g. parent gate check failed on a
+        terminal parent).  Returns True if the task was aborted, False otherwise.
         """
         retry_count = snapshot_retry_count(snapshot)
-        if retry_count < self.config.max_retries:
-            return False
         task_id = snapshot["task_id"]
         worker_id = (snapshot.get("lease") or {}).get("lease_owner_id")
-        self.logger.emit(
-            "WRN",
-            "central.dispatcher",
-            f"max_retries_exceeded task={task_id} retry_count={retry_count} max_retries={self.config.max_retries}",
-        )
+
+        last_error = str((snapshot.get("runtime") or {}).get("last_runtime_error") or "")
+        is_permanent = any(last_error.startswith(prefix) for prefix in self._PERMANENT_FAILURE_PREFIXES)
+
+        if not is_permanent and retry_count < self.config.max_retries:
+            return False
+
+        if is_permanent:
+            self.logger.emit(
+                "WRN",
+                "central.dispatcher",
+                f"permanent_failure_abort task={task_id} retry_count={retry_count} reason={last_error!r}",
+            )
+            error_text = last_error
+            notes = f"permanently unresolvable failure; skipping retries. {last_error}"
+        else:
+            self.logger.emit(
+                "WRN",
+                "central.dispatcher",
+                f"max_retries_exceeded task={task_id} retry_count={retry_count} max_retries={self.config.max_retries}",
+            )
+            error_text = "max_retries_exceeded"
+            notes = f"retry_count={retry_count} reached max_retries={self.config.max_retries}; halting automatic retry"
+
         conn = self._connect()
         try:
             with conn:
@@ -2430,8 +2452,8 @@ class CentralDispatcher:
                     task_id=task_id,
                     status="failed",
                     worker_id=worker_id,
-                    error_text="max_retries_exceeded",
-                    notes=f"retry_count={retry_count} reached max_retries={self.config.max_retries}; halting automatic retry",
+                    error_text=error_text,
+                    notes=notes,
                     artifacts=[],
                     actor_id="central.dispatcher",
                 )
