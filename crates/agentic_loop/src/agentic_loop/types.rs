@@ -12,7 +12,6 @@ use tool_executor::{ToolContent, ToolExecutor};
 
 pub type ChainId = String;
 
-#[derive(Debug)]
 pub struct LoopDependencies {
     pub inference_client: Arc<InferenceClient>,
     pub tool_executor: Arc<ToolExecutor>,
@@ -22,6 +21,12 @@ pub struct LoopDependencies {
     pub session_manager: Arc<dyn SessionManager>,
     pub human_interface: Arc<dyn HumanInterface>,
     pub config: LoopConfig,
+}
+
+impl std::fmt::Debug for LoopDependencies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopDependencies").field("config", &self.config).finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]

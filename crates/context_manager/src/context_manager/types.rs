@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use inference::types::InferenceError;
+use inference::InferenceError;
 use persistence::{PersistenceError, SessionId, SummaryId, Turn};
 
 pub type TurnIndex = u32;

@@ -1,4 +1,5 @@
-use super::types::{ArchivedTurnInjection, ArchivedTurnRequest, Turn};
+use persistence::Turn;
+use super::types::{ArchivedTurnInjection, ArchivedTurnRequest};
 
 pub fn prepare_injection(turns: Vec<Turn>, request: ArchivedTurnRequest) -> ArchivedTurnInjection {
     ArchivedTurnInjection {
