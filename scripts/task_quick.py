@@ -157,6 +157,7 @@ TEMPLATES = {
     },
     "investigation": {
         "task_type": "investigation",
+        "task_kind": "read_only",
         "priority": 55,
         "audit_required": False,
         "objective": "Investigate the described problem, diagnose root causes, and produce a structured findings report. Do NOT make code changes or create follow-on tasks.",
@@ -408,6 +409,9 @@ def create_task(args: argparse.Namespace) -> None:
         "--reconciliation", reconciliation,
         "--json",
     ]
+    tpl_task_kind = tpl.get("task_kind")
+    if tpl_task_kind:
+        planner_new_cmd += ["--task-kind", tpl_task_kind]
 
     if initiative:
         planner_new_cmd += ["--initiative", initiative]

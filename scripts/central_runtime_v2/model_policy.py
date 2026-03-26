@@ -265,23 +265,37 @@ def build_worker_task(
         )
     _repo_root = str(snapshot.get("target_repo_root") or "")
     _is_ecosystem = Path(_repo_root).name == "ecosystem"
-    _completion_gates = (
-        "## Completion Gates (Mandatory)\n"
-        "Before reporting done, you MUST complete and verify all of the following:\n"
-        "- Run `cargo build` and include a passing validation entry named `cargo build`.\n"
-        "- Commit all repo changes and include a passing validation entry named `git commit`.\n"
-    )
-    if _is_ecosystem:
-        _completion_gates += (
-            "- Run `cd frontend && npx vitest run --project unit` and include a passing "
-            "validation entry named `frontend unit tests`.\n"
-            "- Run `cargo test --lib` and include a passing validation entry named `cargo test lib`.\n"
+    _task_kind = str(execution.get("task_kind") or "mutating").strip().lower()
+    _is_read_only = _task_kind == "read_only"
+    if _is_read_only:
+        _completion_gates = (
+            "## Completion Gates (Mandatory)\n"
+            "Before reporting done, you MUST complete and verify all of the following:\n"
+            "- Write a structured findings report in the closeout summary and include a passing "
+            "validation entry named `report written`.\n"
+            "- Do NOT run cargo build or make code commits — this is a read-only task.\n"
+            "- Do not mark task done until the report is written and you can prove it via a "
+            "validation entry.\n"
+            "- If any check fails, return status `FAILED` with notes explaining why."
         )
-    _completion_gates += (
-        "- Do not mark task done until all checks have run successfully and you can prove it "
-        "via validation entries.\n"
-        "- If any check fails, return status `FAILED` with notes explaining why."
-    )
+    else:
+        _completion_gates = (
+            "## Completion Gates (Mandatory)\n"
+            "Before reporting done, you MUST complete and verify all of the following:\n"
+            "- Run `cargo build` and include a passing validation entry named `cargo build`.\n"
+            "- Commit all repo changes and include a passing validation entry named `git commit`.\n"
+        )
+        if _is_ecosystem:
+            _completion_gates += (
+                "- Run `cd frontend && npx vitest run --project unit` and include a passing "
+                "validation entry named `frontend unit tests`.\n"
+                "- Run `cargo test --lib` and include a passing validation entry named `cargo test lib`.\n"
+            )
+        _completion_gates += (
+            "- Do not mark task done until all checks have run successfully and you can prove it "
+            "via validation entries.\n"
+            "- If any check fails, return status `FAILED` with notes explaining why."
+        )
     prompt_sections += [
         f"## Objective\n{snapshot.get('objective_md', '').strip()}",
         f"## Context\n{snapshot.get('context_md', '').strip()}",
