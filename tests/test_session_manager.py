@@ -114,6 +114,16 @@ class SessionManagerTest(unittest.TestCase):
             self.assertTrue(session_manager.validate_session("sess-1", repo_root=self.repo_root))
             self.assertFalse(session_manager.validate_session("missing", repo_root=self.repo_root))
 
+    def test_validate_session_falls_back_to_global_scan_when_repo_dir_misses(self) -> None:
+        other_repo_root = self.tmp_path / "other-repo"
+        other_repo_root.mkdir()
+        project_dir = self.projects_dir / session_manager._claude_project_dir_name(other_repo_root)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "sess-fallback.jsonl").write_text('{"type":"result"}\n', encoding="utf-8")
+
+        with patch.object(session_manager, "CLAUDE_PROJECTS_DIR", self.projects_dir):
+            self.assertTrue(session_manager.validate_session("sess-fallback", repo_root=self.repo_root))
+
     def test_get_fork_args_demotes_invalid_session_to_retired(self) -> None:
         self._insert_session(session_id="sess-invalid")
 

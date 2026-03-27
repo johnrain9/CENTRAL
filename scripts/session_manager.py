@@ -85,6 +85,8 @@ def validate_session(session_id: str, repo_root: str | Path | None = None) -> bo
                 return True
         except OSError:
             continue
+    if repo_root is not None:
+        return validate_session(session_id)
     return False
 
 

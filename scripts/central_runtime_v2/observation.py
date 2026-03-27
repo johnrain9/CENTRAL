@@ -236,7 +236,11 @@ def infer_recent_run_id(task_id: str, artifacts: list[dict[str, Any]], paths: Ru
     logs_dir = paths.worker_logs_dir / task_id
     if not logs_dir.exists():
         return None
-    latest_log = max(logs_dir.glob("*.log"), key=lambda item: item.stat().st_mtime, default=None)
+    latest_log = max(
+        logs_dir.glob("*.log"),
+        key=lambda item: (item.stat().st_mtime_ns, item.stat().st_ino, item.name),
+        default=None,
+    )
     return latest_log.stem if latest_log is not None else None
 
 
