@@ -102,6 +102,12 @@ class SessionManagerTest(unittest.TestCase):
 
         self.assertIsNone(session_manager.get_fork_args("TEST", self.tmp_path / "pre_migration.db"))
 
+    def test_get_fork_args_returns_none_after_session_registry_rollback(self) -> None:
+        self.conn.execute("DROP TABLE session_registry")
+        self.conn.commit()
+
+        self.assertIsNone(session_manager.get_fork_args("TEST", self.db_path))
+
     def test_validate_session_matches_exact_repo_project_dir(self) -> None:
         self._write_session_file("sess-1")
         with patch.object(session_manager, "CLAUDE_PROJECTS_DIR", self.projects_dir):
