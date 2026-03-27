@@ -89,6 +89,18 @@ class TaskQuickPlannerSmokeTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def fetch_acceptance(self, title: str) -> str:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT acceptance_md FROM tasks WHERE title = ?",
+                (title,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        return str(row[0])
+
     def test_planner_ops_smoke_is_repeatable_when_source_db_already_has_same_title(self) -> None:
         conn = task_db.connect(self.db_path)
         try:
@@ -133,6 +145,24 @@ class TaskQuickPlannerSmokeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
         self.assertIn("Dry-run: Verify preflight integration", result.stdout)
         self.assertIn("state:     preflight validated, no write performed", result.stdout)
+
+    def test_bugfix_template_writes_behavioral_verify_line(self) -> None:
+        title = "Fix badge display"
+        result = self.run_cli(
+            "--title",
+            title,
+            "--repo",
+            "CENTRAL",
+            "--template",
+            "bugfix",
+            "--context",
+            "Notification bell badge count stays stale after refresh.",
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
+        acceptance = self.fetch_acceptance(title)
+        self.assertIn('VERIFY: Reproduce "badge display" from the task title', acceptance)
+        self.assertIn("Notification bell badge count stays stale after refresh.", acceptance)
+        self.assertIn("Bug no longer reproduces. Regression test passes. No new failures introduced.", acceptance)
 
     def test_remote_task_marks_metadata(self) -> None:
         title = "Validate remote dispatch routing"

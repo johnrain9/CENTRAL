@@ -16,6 +16,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -351,6 +352,22 @@ def build_alpha(task_id: str, preflight_token: str) -> str:
     return f"alpha-{alpha}"
 
 
+def build_bugfix_acceptance(title: str, context: str, default_acceptance: str) -> str:
+    """Add a bug-specific VERIFY line unless the planner provided acceptance text."""
+    normalized_title = " ".join((title or "").strip().split())
+    normalized_context = " ".join((context or "").strip().split())
+    if not normalized_title:
+        return default_acceptance
+
+    symptom = re.sub(r"^(fix|bugfix|debug|resolve|correct|repair)\s+", "", normalized_title, flags=re.IGNORECASE)
+    symptom = symptom.rstrip(".")
+    verify = f'VERIFY: Reproduce "{symptom or normalized_title}" from the task title'
+    if normalized_context:
+        verify += f" using the provided context ({normalized_context})"
+    verify += ", then confirm the same user-visible path now behaves correctly."
+    return f"{verify}\n{default_acceptance}"
+
+
 def create_task(args: argparse.Namespace) -> None:
     template_name = args.template or DEFAULT_TEMPLATE
     if template_name not in TEMPLATES:
@@ -390,6 +407,10 @@ def create_task(args: argparse.Namespace) -> None:
     dispatch = f"Dispatch from CENTRAL using repo={args.repo} do task {task_id}."
     closeout = f"Summarize results and closeout evidence for {task_id}."
     reconciliation = args.reconciliation or tpl["reconciliation"]
+    context = args.context or tpl["context"]
+    acceptance = args.acceptance or tpl["acceptance"]
+    if template_name == "bugfix" and args.acceptance is None:
+        acceptance = build_bugfix_acceptance(args.title, context, acceptance)
 
     planner_new_cmd = [
         sys.executable, str(DB_SCRIPT), "planner-new",
@@ -399,10 +420,10 @@ def create_task(args: argparse.Namespace) -> None:
         "--task-type", args.task_type or tpl["task_type"],
         "--priority", str(args.priority if args.priority is not None else tpl["priority"]),
         "--objective", args.objective or tpl["objective"],
-        "--context", args.context or tpl["context"],
+        "--context", context,
         "--scope", args.scope or tpl["scope"],
         "--deliverables", args.deliverables or tpl["deliverables"],
-        "--acceptance", args.acceptance or tpl["acceptance"],
+        "--acceptance", acceptance,
         "--testing", args.testing or tpl["testing"],
         "--dispatch", dispatch,
         "--closeout", closeout,

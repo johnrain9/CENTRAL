@@ -39,7 +39,7 @@ python3 scripts/task_quick.py --list-templates   # show all templates with detai
 
 **feature** — Adding new behavior that does not exist yet. Worker produces running code and tests.
 
-**bugfix** — A specific defect has been identified. Worker diagnoses root cause, fixes minimally, adds regression test.
+**bugfix** — A specific defect has been identified. Worker diagnoses root cause, fixes minimally, adds regression test. Unless you override `--acceptance`, `task_quick.py` now prepends a `VERIFY:` line built from the task title and context so the acceptance criteria explicitly call out the reported behavior that must be checked end-to-end.
 
 **refactor** — Code quality work with no external behavior change. Worker must run tests before and after.
 
@@ -65,6 +65,12 @@ python3 scripts/task_quick.py --title "Add export API" --repo AIM_SOLO_ANALYSIS
 
 # Bugfix with explicit template
 python3 scripts/task_quick.py --title "Fix null pointer in parser" --repo MOTO_HELPER --template bugfix
+
+Expected bugfix acceptance pattern:
+```
+VERIFY: Reproduce "null pointer in parser" from the task title using the provided context (...), then confirm the same user-visible path now behaves correctly.
+Bug no longer reproduces. Regression test passes. No new failures introduced.
+```
 
 # Refactor with priority override
 python3 scripts/task_quick.py --title "Refactor DB layer" --repo CENTRAL --template refactor --priority 55

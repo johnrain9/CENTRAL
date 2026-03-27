@@ -39,6 +39,10 @@ class TaskQuickBehaviorTest(unittest.TestCase):
             "planner_ops_smoke": False,
             "novelty_rationale": None,
             "list_templates": False,
+            "worker_backend": None,
+            "worker_model": None,
+            "effort": None,
+            "remote": False,
         }
         base.update(overrides)
         return argparse.Namespace(**base)
@@ -69,6 +73,80 @@ class TaskQuickBehaviorTest(unittest.TestCase):
             payload["override"]["acknowledged_candidate_ids"],
             ["task:CENTRAL-OPS-1", "cap:foo"],
         )
+
+    def test_build_bugfix_acceptance_adds_verify_line(self) -> None:
+        acceptance = task_quick.build_bugfix_acceptance(
+            "Fix badge display",
+            "Header bell badge count is stale after refresh.",
+            task_quick.TEMPLATES["bugfix"]["acceptance"],
+        )
+        self.assertIn('VERIFY: Reproduce "badge display" from the task title', acceptance)
+        self.assertIn("Header bell badge count is stale after refresh.", acceptance)
+        self.assertTrue(acceptance.endswith(task_quick.TEMPLATES["bugfix"]["acceptance"]))
+
+    def test_create_task_bugfix_autogenerates_behavioral_acceptance(self) -> None:
+        args = self.make_args(
+            repo="PHOTO_AUTO_TAGGING",
+            template="bugfix",
+            title="Fix badge display",
+            context="Bell badge count stays stale after refresh.",
+        )
+
+        planner_new_cmd: list[str] | None = None
+
+        def fake_run(cmd, stdin=None, db_path=None, env_overrides=None):
+            del stdin, db_path, env_overrides
+            nonlocal planner_new_cmd
+            if "planner-new" in cmd:
+                planner_new_cmd = cmd
+                return {
+                    "task_id": "CENTRAL-OPS-7001",
+                    "title": "Fix badge display",
+                    "summary": "Synthetic",
+                    "objective_md": "obj",
+                    "context_md": "ctx",
+                    "scope_md": "scope",
+                    "deliverables_md": "deliv",
+                    "acceptance_md": "acc",
+                    "testing_md": "test",
+                    "dispatch_md": "dispatch",
+                    "closeout_md": "close",
+                    "reconciliation_md": "recon",
+                    "planner_status": "todo",
+                    "priority": 70,
+                    "task_type": "bugfix",
+                    "planner_owner": "planner/coordinator",
+                    "worker_owner": None,
+                    "target_repo_id": "PHOTO_AUTO_TAGGING",
+                    "target_repo_root": "/tmp/repo",
+                    "approval_required": False,
+                    "initiative": "one-off",
+                    "metadata": {},
+                    "execution": {
+                        "task_kind": "mutating",
+                        "sandbox_mode": "workspace-write",
+                        "approval_policy": "never",
+                        "timeout_seconds": 60,
+                        "additional_writable_dirs": [],
+                        "metadata": {},
+                    },
+                    "dependencies": [],
+                }
+            if "task-create" in cmd:
+                return {"task_id": "CENTRAL-OPS-7001"}
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with mock.patch.object(task_quick, "get_next_task_id", return_value="CENTRAL-OPS-7001"), mock.patch.object(
+            task_quick, "run", side_effect=fake_run
+        ), mock.patch("sys.stdout"):
+            task_quick.create_task(args)
+
+        self.assertIsNotNone(planner_new_cmd)
+        assert planner_new_cmd is not None
+        acceptance = planner_new_cmd[planner_new_cmd.index("--acceptance") + 1]
+        self.assertIn('VERIFY: Reproduce "badge display" from the task title', acceptance)
+        self.assertIn("Bell badge count stays stale after refresh.", acceptance)
+        self.assertTrue(acceptance.endswith(task_quick.TEMPLATES["bugfix"]["acceptance"]))
 
     def test_create_task_non_platform_repo_skips_preflight_and_creates(self) -> None:
         args = self.make_args(repo="PHOTO_AUTO_TAGGING", template="feature")
