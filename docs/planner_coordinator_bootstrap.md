@@ -374,6 +374,8 @@ What to look for:
 - audit child in `todo` and eligible
 - accepted audits eventually close parent to `done`
 - failed audits should leave a clear trail of evidence and move the parent to `failed`
+- for bug-fix audits, the auditor should reproduce the original bug or reported behavior from task context when applicable before passing and confirm it no longer occurs
+- if that original behavior cannot be reproduced or verified, the verdict must say so explicitly and must not pass by default
 
 ## Checking Active Work
 

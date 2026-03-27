@@ -333,7 +333,19 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
             "context_md": "\n".join(audit_context_lines),
             "dispatch_md": f"Audit immediately. `{args.task_id}` is a backfill task that already landed and is already in `awaiting_audit`.",
             "acceptance_md": (
-                "Verify the landed change against the canonical task requirements, referenced change set, and overall system behavior."
+                "Verify the landed change against the canonical task requirements, referenced change set, and overall "
+                "system behavior. Before passing, reproduce the original bug or reported behavior from the task "
+                "context when applicable and confirm it no longer occurs."
+            ),
+            "testing_md": (
+                "Use reality-based validation against the landed change. Before passing, reproduce the original bug "
+                "or reported behavior from the task context when applicable. If you cannot reproduce or verify it, "
+                "say so explicitly in the verdict and do not pass by default."
+            ),
+            "closeout_md": (
+                "Record verdict, landed-change evidence, and whether you reproduced the original bug or reported "
+                "behavior and confirmed it no longer occurs. If that verification was not possible, call it out "
+                "explicitly and do not pass by default."
             ),
             "metadata": {"audit_policy": audit_mode, "fixup_threshold": "bounded_only"},
         }
@@ -355,13 +367,21 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
                 "reason the task should escalate to broader planner review."
             ),
             "acceptance_md": (
-                "Confirm the bounded change works as intended in reality and does not obviously violate nearby system expectations."
+                "Confirm the bounded change works as intended in reality and does not obviously violate nearby system "
+                "expectations. Before passing, reproduce the original bug or reported behavior from the task context "
+                "when applicable and confirm it no longer occurs."
             ),
             "testing_md": (
-                "Use one or a few decisive validation paths. Prefer direct evidence over broad redundant investigation."
+                "Use one or a few decisive validation paths. Prefer direct evidence over broad redundant "
+                "investigation. Before passing, reproduce the original bug or reported behavior from the task "
+                "context when applicable. If you cannot reproduce or verify it, say so explicitly in the verdict "
+                "and do not pass by default."
             ),
             "closeout_md": (
-                "Record verdict, concise evidence, and any bounded fixups. Escalate instead of broadening the audit beyond its intended scope."
+                "Record verdict, concise evidence, any bounded fixups, and whether you reproduced the original bug "
+                "or reported behavior and confirmed it no longer occurs. If that verification was not possible, "
+                "call it out explicitly and do not pass by default. Escalate instead of broadening the audit beyond "
+                "its intended scope."
             ),
             "metadata": {"audit_policy": "light", "fixup_threshold": "bounded_only"},
         }

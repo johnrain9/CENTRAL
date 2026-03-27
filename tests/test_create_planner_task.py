@@ -87,6 +87,8 @@ class CreatePlannerTaskTest(unittest.TestCase):
         self.assertIsNotNone(audit)
         self.assertEqual(audit["task_id"], "CENTRAL-OPS-3501-AUDIT")
         self.assertEqual(audit["dependencies"], ["CENTRAL-OPS-3501"])
+        self.assertIn("reproduce the original bug", audit["testing_md"])
+        self.assertIn("do not pass by default", audit["closeout_md"])
 
     def test_create_supports_audit_opt_out_and_dependencies(self) -> None:
         with tempfile.TemporaryDirectory(prefix="central_create_task_") as tmpdir:
@@ -210,6 +212,38 @@ class CreatePlannerTaskTest(unittest.TestCase):
         self.assertIn("already landed", audit["dispatch_md"])
         self.assertIn("Focused audit expectations", audit["context_md"])
         self.assertIn("commit:abc123", audit["context_md"])
+        self.assertIn("reproduce the original bug", audit["testing_md"])
+        self.assertIn("do not pass by default", audit["closeout_md"])
+
+    def test_light_audit_preview_requires_bug_reproduction_before_passing(self) -> None:
+        result = self.run_cli(
+            "--preview-graph",
+            "--task-id",
+            "CENTRAL-OPS-3506",
+            "--title",
+            "Fix bounded regression",
+            "--objective",
+            "Fix a small regression without changing broader planner behavior.",
+            "--context-item",
+            "Bug report: clicking the status bell opens search instead of alerts.",
+            "--scope-item",
+            "Bounded planner UI fix only.",
+            "--deliverable",
+            "Regression fix.",
+            "--acceptance-item",
+            "Bell opens alerts instead of search.",
+            "--test",
+            "python3 -m unittest tests.test_create_planner_task",
+            "--audit-mode",
+            "light",
+        )
+        payload = json.loads(result.stdout)
+        audit = payload["audit"]
+
+        self.assertIsNotNone(audit)
+        self.assertIn("reproduce the original bug", audit["acceptance_md"])
+        self.assertIn("do not pass by default", audit["testing_md"])
+        self.assertIn("confirmed it no longer occurs", audit["closeout_md"])
 
     def test_backfill_create_makes_parent_non_dispatchable_and_audit_immediately_eligible(self) -> None:
         with tempfile.TemporaryDirectory(prefix="central_backfill_task_") as tmpdir:

@@ -4184,14 +4184,29 @@ def build_audit_task_payload(parent_payload: dict[str, Any], audit_override: dic
         "objective_md": f"Audit `{parent_task_id}` for requirement fidelity, real-environment behavior, and whole-system fit.",
         "context_md": (
             f"Parent task: `{parent_task_id}`.\n\n"
-            "Ground the audit in the parent objective, acceptance criteria, artifacts, and runtime evidence."
+            "Ground the audit in the parent objective, acceptance criteria, artifacts, and runtime evidence.\n\n"
+            "Before passing, reproduce the original bug or reported behavior from the task context when applicable. "
+            "Confirm the described behavior no longer occurs. If you cannot reproduce or verify it, flag that "
+            "explicitly in the verdict and do not pass by default."
         ),
         "scope_md": "Validate the delivered change against requirements and full-system behavior.",
         "deliverables_md": "Record an audit verdict with concrete evidence and any bounded fixups.",
-        "acceptance_md": "Confirm the implementation matches intent, works in reality, and does not fail outside a narrow local window.",
-        "testing_md": "Run reality-based validation and record commands, artifacts, and observed outcomes.",
+        "acceptance_md": (
+            "Confirm the implementation matches intent, works in reality, and does not fail outside a narrow local "
+            "window. Before passing, reproduce the original bug or reported behavior from the task context when "
+            "applicable and confirm it no longer occurs."
+        ),
+        "testing_md": (
+            "Run reality-based validation and record commands, artifacts, and observed outcomes. Before passing, "
+            "reproduce the original bug or reported behavior from the task context when applicable. If you cannot "
+            "reproduce or verify it, say so explicitly in the verdict and do not pass by default."
+        ),
         "dispatch_md": f"Dispatch after `{parent_task_id}` reaches `awaiting_audit`.",
-        "closeout_md": "Record audit evidence, final verdict, and any bounded fixups performed during the audit.",
+        "closeout_md": (
+            "Record audit evidence, final verdict, and any bounded fixups performed during the audit. Explicitly state "
+            "whether you reproduced the original bug or reported behavior and verified it no longer occurs; if that "
+            "verification was not possible, call that out and do not pass by default."
+        ),
         "reconciliation_md": (
             f"When this audit is `done`, `{parent_task_id}` closes automatically. "
             "If this audit fails, planner follow-up is required."

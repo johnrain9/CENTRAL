@@ -261,6 +261,7 @@ python3 /home/cobra/CENTRAL/scripts/central_task_db.py task-show --task-id CENTR
 ```
 
 The audit should verify the landed change and the backfill metadata, not re-run a fake implementation workflow.
+Before passing, the auditor must reproduce the original bug or reported behavior from the task context when applicable and confirm it no longer occurs. If that cannot be reproduced or verified, the verdict must say so explicitly and must not pass by default.
 
 ### Update a task with optimistic concurrency
 
