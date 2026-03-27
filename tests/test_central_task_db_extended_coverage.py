@@ -8,6 +8,7 @@ reconcile, heartbeat, utility helpers, and schema/migration paths.
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -1226,6 +1227,43 @@ class TestMigrationHelpers(unittest.TestCase):
                 tables = task_db.fetch_tables(conn)
                 self.assertIn("tasks", tables)
                 self.assertIn("task_events", tables)
+            finally:
+                conn.close()
+
+    def test_session_registry_migration_creates_table_and_partial_unique_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            conn = task_db.connect(db_path)
+            try:
+                task_db.apply_migrations(conn, task_db.load_migrations(task_db.resolve_migrations_dir(None)))
+                with conn:
+                    task_db.ensure_repo(conn, repo_id="CENTRAL", repo_root=str(REPO_ROOT), display_name="CENTRAL")
+
+                table = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_registry'"
+                ).fetchone()
+                index = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_session_registry_repo_active'"
+                ).fetchone()
+                self.assertIsNotNone(table)
+                self.assertIsNotNone(index)
+
+                with conn:
+                    conn.execute(
+                        "INSERT INTO session_registry (repo_id, session_id, seed_cwd, status) VALUES (?, ?, ?, ?)",
+                        ("CENTRAL", "sess-1", str(REPO_ROOT), "active"),
+                    )
+                    conn.execute(
+                        "INSERT INTO session_registry (repo_id, session_id, seed_cwd, status) VALUES (?, ?, ?, ?)",
+                        ("CENTRAL", "sess-2", str(REPO_ROOT), "stale"),
+                    )
+
+                with self.assertRaises(sqlite3.IntegrityError):
+                    with conn:
+                        conn.execute(
+                            "INSERT INTO session_registry (repo_id, session_id, seed_cwd, status) VALUES (?, ?, ?, ?)",
+                            ("CENTRAL", "sess-3", str(REPO_ROOT), "active"),
+                        )
             finally:
                 conn.close()
 
