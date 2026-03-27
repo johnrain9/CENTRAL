@@ -740,6 +740,7 @@ class CentralDispatcher:
             worker_mode=effective_backend,
             dispatcher_default_worker_model=effective_model,
         )
+        worker_task["db_path"] = str(self.config.db_path)
         run_id = (snapshot.get("lease") or {}).get("execution_run_id") or f"{snapshot['task_id']}-{int(time.time())}"
         prompts_dir = self.paths.worker_prompts_dir / snapshot["task_id"]
         results_dir = self.paths.worker_results_dir / snapshot["task_id"]

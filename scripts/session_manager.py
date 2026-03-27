@@ -21,7 +21,6 @@ CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 DEFAULT_SEED_MODEL = "claude-sonnet-4-6"
 DEFAULT_REFRESH_AFTER_FORKS = 50
 DEFAULT_REFRESH_AFTER_HOURS = 72
-DEFAULT_MAX_CONTEXT_TOKENS = 200000
 
 
 @dataclass(frozen=True)
@@ -137,10 +136,6 @@ def _stale_reason(row: sqlite3.Row | dict[str, Any], meta: dict[str, Any], repo_
     current_prompt_hash = _current_prompt_hash(repo_row, meta)
     if row["seed_prompt_hash"] and str(row["seed_prompt_hash"]) != current_prompt_hash:
         return "prompt_hash_changed"
-    max_context_tokens = int(meta.get("session_max_context_tokens", DEFAULT_MAX_CONTEXT_TOKENS) or DEFAULT_MAX_CONTEXT_TOKENS)
-    context_tokens = row["context_tokens"]
-    if context_tokens is not None and int(context_tokens) > max_context_tokens:
-        return f"context_tokens_exceeded({max_context_tokens})"
     return None
 
 
@@ -159,54 +154,60 @@ def get_fork_args(repo_id: str, db_path: Path) -> SessionForkResult | None:
         repo_row, meta = loaded
         if not meta.get("session_persistence_enabled"):
             return None
-        row = conn.execute(
+        rows = conn.execute(
             """
             SELECT session_id, status, fork_count, seed_completed_at, seed_prompt_hash, context_tokens, seed_cwd
             FROM session_registry
             WHERE repo_id = ? AND status IN ('active', 'stale') AND seed_completed_at IS NOT NULL
-            ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, seed_completed_at DESC
-            LIMIT 1
+            ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, seed_completed_at DESC, registry_id DESC
             """,
             (repo_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        if not validate_session(str(row["session_id"]), repo_root=str(row["seed_cwd"])):
+        ).fetchall()
+        for row in rows:
+            if not validate_session(str(row["session_id"]), repo_root=str(row["seed_cwd"])):
+                validation_note = f"validation_failed:{row['session_id']}"
+                with conn:
+                    conn.execute(
+                        """
+                        UPDATE session_registry
+                        SET status = 'retired',
+                            updated_at = ?,
+                            notes = CASE
+                                WHEN notes IS NULL OR notes = '' THEN ?
+                                ELSE notes || '\n' || ?
+                            END
+                        WHERE repo_id = ? AND session_id = ?
+                        """,
+                        (
+                            _utc_now_text(),
+                            validation_note,
+                            validation_note,
+                            repo_id,
+                            row["session_id"],
+                        ),
+                    )
+                continue
+
+            stale_reason = _stale_reason(row, meta, repo_row)
+            forked_at = _utc_now_text()
             with conn:
                 conn.execute(
                     """
                     UPDATE session_registry
-                    SET status = 'retired',
-                        updated_at = ?,
-                        notes = ?
+                    SET fork_count = fork_count + 1,
+                        last_forked_at = ?,
+                        updated_at = ?
                     WHERE repo_id = ? AND session_id = ?
                     """,
-                    (
-                        _utc_now_text(),
-                        f"validation_failed:{row['session_id']}",
-                        repo_id,
-                        row["session_id"],
-                    ),
+                    (forked_at, forked_at, repo_id, row["session_id"]),
                 )
-            return None
-        stale_reason = _stale_reason(row, meta, repo_row)
-        with conn:
-            conn.execute(
-                """
-                UPDATE session_registry
-                SET fork_count = fork_count + 1,
-                    last_forked_at = ?,
-                    updated_at = ?
-                WHERE repo_id = ? AND session_id = ?
-                """,
-                (_utc_now_text(), _utc_now_text(), repo_id, row["session_id"]),
+            return SessionForkResult(
+                args=["--resume", str(row["session_id"]), "--fork-session"],
+                session_id=str(row["session_id"]),
+                stale=stale_reason is not None,
+                stale_reason=stale_reason,
             )
-        return SessionForkResult(
-            args=["--resume", str(row["session_id"]), "--fork-session"],
-            session_id=str(row["session_id"]),
-            stale=stale_reason is not None,
-            stale_reason=stale_reason,
-        )
+        return None
     finally:
         conn.close()
 

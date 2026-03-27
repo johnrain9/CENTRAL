@@ -317,6 +317,39 @@ class BuildersTest(unittest.TestCase):
             self.assertIn("--model", script)
             self.assertIn("gpt-5.4-variant", script)
 
+    def test_build_claude_command_appends_extra_args(self) -> None:
+        with managed_tmpdir("dispatcher-claude-flags-") as tmp_path:
+            command = backends.build_claude_command(
+                {"id": "TASK-59", "run_id": "run-extra"},
+                tmp_path / "result.json",
+                model="gpt-5.4-variant",
+                extra_args=["--resume", "sess-123", "--fork-session"],
+            )
+
+            script = command[2]
+            self.assertIn("--resume", script)
+            self.assertIn("sess-123", script)
+            self.assertIn("--fork-session", script)
+
+    def test_claude_backend_prepare_uses_session_fork_args(self) -> None:
+        backend = backends.ClaudeBackend()
+        snapshot = {"target_repo_id": "TEST"}
+        worker_task = {
+            "prompt_body": "prompt body",
+            "worker_model": "claude-sonnet-4-6",
+            "db_path": "/tmp/test.db",
+        }
+        fork_result = mock.Mock(args=["--resume", "sess-123", "--fork-session"])
+
+        with mock.patch.object(backends.session_manager, "get_fork_args", return_value=fork_result) as get_fork_args_mock:
+            prompt_text, command, stdin_mode = backend.prepare(snapshot, worker_task, "run-1", Path("/tmp/result.json"))
+
+        self.assertEqual(prompt_text, "prompt body")
+        self.assertEqual(stdin_mode, subprocess.PIPE)
+        get_fork_args_mock.assert_called_once_with("TEST", Path("/tmp/test.db"))
+        self.assertIn("--resume", command[2])
+        self.assertIn("sess-123", command[2])
+
     def test_build_stub_command_has_required_fields(self) -> None:
         snapshot = task_payload("TASK-59-STUB-FIELDS")
         run_id = "run-stub-fields"

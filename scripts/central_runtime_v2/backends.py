@@ -18,11 +18,13 @@ from central_runtime_v2.config import (
     AUTONOMY_ROOT,
     AUTONOMY_SCHEMA_PATH,
     ActiveWorker,
+    DEFAULT_DB_PATH,
     DispatcherConfig,
     ModelSelection,
     RuntimePaths,
 )
 from central_runtime_v2.model_policy import build_worker_task
+import session_manager
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +51,13 @@ def load_autonomy_runner():
 # ---------------------------------------------------------------------------
 
 
-def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: str) -> list[str]:
+def build_claude_command(
+    worker_task: dict[str, Any],
+    result_path: Path,
+    model: str,
+    *,
+    extra_args: list[str] | None = None,
+) -> list[str]:
     """Build a shell command that runs claude -p and converts output to worker_result schema."""
     task_id = worker_task.get("id") or worker_task.get("task_id") or "unknown"
     run_id = worker_task.get("run_id") or "unknown"
@@ -65,10 +73,13 @@ def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: 
     _SKIP_TYPES = "{'content_block_delta', 'input_json_delta', 'content_block_start', 'content_block_stop'}"
     _schema_arg = f", '--json-schema', {_schema_str!r}" if _schema_str else ""
     _effort_arg = f", '--effort', {effort!r}" if effort else ""
+    _extra_args = extra_args or []
     script = (
         "import json, subprocess, sys\n"
+        f"cmd = ['claude', '-p', '--verbose', '--dangerously-skip-permissions', '--model', {model!r}, '--output-format', 'stream-json'{_schema_arg}{_effort_arg}]\n"
+        f"cmd.extend({_extra_args!r})\n"
         f"proc = subprocess.Popen(\n"
-        f"    ['claude', '-p', '--verbose', '--dangerously-skip-permissions', '--model', {model!r}, '--output-format', 'stream-json'{_schema_arg}{_effort_arg}],\n"
+        f"    cmd,\n"
         "    stdin=sys.stdin, stdout=subprocess.PIPE, text=True\n"
         ")\n"
         "lines = []\n"
@@ -396,7 +407,14 @@ class ClaudeBackend(WorkerBackend):
         result_path: Path,
     ) -> tuple[str, list[str], Any]:
         prompt_text = worker_task["prompt_body"]
-        command = build_claude_command(worker_task, result_path, worker_task["worker_model"])
+        db_path = Path(worker_task.get("db_path") or DEFAULT_DB_PATH)
+        fork_result = session_manager.get_fork_args(snapshot["target_repo_id"], db_path)
+        command = build_claude_command(
+            worker_task,
+            result_path,
+            worker_task["worker_model"],
+            extra_args=fork_result.args if fork_result else None,
+        )
         return prompt_text, command, subprocess.PIPE
 
 

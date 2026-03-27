@@ -127,6 +127,27 @@ class SessionManagerTest(unittest.TestCase):
         self.assertEqual(row["status"], "retired")
         self.assertIn("validation_failed", str(row["notes"]))
 
+    def test_get_fork_args_falls_back_to_stale_after_invalid_active(self) -> None:
+        self._insert_session(session_id="bad-active", status="active")
+        self._insert_session(
+            session_id="good-stale",
+            status="stale",
+            seed_completed_at="2026-03-27T08:00:00+00:00",
+        )
+        self._write_session_file("good-stale")
+
+        with patch.object(session_manager, "CLAUDE_PROJECTS_DIR", self.projects_dir):
+            result = session_manager.get_fork_args("TEST", self.db_path)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.session_id, "good-stale")
+        active_row = self.conn.execute(
+            "SELECT status FROM session_registry WHERE session_id = ?",
+            ("bad-active",),
+        ).fetchone()
+        self.assertEqual(active_row["status"], "retired")
+
     def test_get_fork_args_prefers_most_recent_stale_session(self) -> None:
         self._insert_session(
             session_id="older",

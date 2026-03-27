@@ -48,6 +48,7 @@ if str(SCRIPT_PATH.parent) not in sys.path:
     sys.path.insert(0, str(SCRIPT_PATH.parent))
 
 import central_task_db as task_db
+import session_manager
 
 
 def utc_now() -> str:
@@ -785,17 +786,26 @@ def load_autonomy_runner():
     return autonomy_runner
 
 
-def build_claude_command(worker_task: dict[str, Any], result_path: Path, model: str) -> list[str]:
+def build_claude_command(
+    worker_task: dict[str, Any],
+    result_path: Path,
+    model: str,
+    *,
+    extra_args: list[str] | None = None,
+) -> list[str]:
     """Build a shell command that runs claude -p and converts output to worker_result schema."""
     task_id = worker_task.get("id") or worker_task.get("task_id") or "unknown"
     run_id = worker_task.get("run_id") or "unknown"
     # Shell script: stream claude output to log (filtered), capture result line for parsing
     # Uses stream-json so the log shows live tool-use activity; skips noisy delta events.
     _SKIP_TYPES = "{'content_block_delta', 'input_json_delta', 'content_block_start', 'content_block_stop'}"
+    _extra_args = extra_args or []
     script = (
         "import json, subprocess, sys\n"
+        f"cmd = ['claude', '-p', '--verbose', '--dangerously-skip-permissions', '--model', {model!r}, '--output-format', 'stream-json']\n"
+        f"cmd.extend({_extra_args!r})\n"
         f"proc = subprocess.Popen(\n"
-        f"    ['claude', '-p', '--verbose', '--dangerously-skip-permissions', '--model', {model!r}, '--output-format', 'stream-json'],\n"
+        f"    cmd,\n"
         "    stdin=sys.stdin, stdout=subprocess.PIPE, text=True\n"
         ")\n"
         "lines = []\n"
@@ -955,8 +965,15 @@ class ClaudeBackend(WorkerBackend):
         run_id: str,
         result_path: Path,
     ) -> tuple[str, list[str], Any]:
-        prompt_text = worker_task["prompt_body"]
-        command = build_claude_command(worker_task, result_path, worker_task["worker_model"])
+        prompt_text = _build_worker_prompt(snapshot, worker_task, run_id)
+        db_path = Path(worker_task.get("db_path") or DEFAULT_DB_PATH)
+        fork_result = session_manager.get_fork_args(snapshot["target_repo_id"], db_path)
+        command = build_claude_command(
+            worker_task,
+            result_path,
+            worker_task["worker_model"],
+            extra_args=fork_result.args if fork_result else None,
+        )
         return prompt_text, command, subprocess.PIPE
 
 
@@ -1785,6 +1802,7 @@ class CentralDispatcher:
             worker_mode=effective_backend,
             dispatcher_default_worker_model=self.config.default_worker_model,
         )
+        worker_task["db_path"] = str(self.config.db_path)
         run_id = (snapshot.get("lease") or {}).get("execution_run_id") or f"{snapshot['task_id']}-{int(time.time())}"
         prompts_dir = self.paths.worker_prompts_dir / snapshot["task_id"]
         results_dir = self.paths.worker_results_dir / snapshot["task_id"]
