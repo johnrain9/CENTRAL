@@ -2193,12 +2193,15 @@ class CentralDispatcher:
                             parent_snapshots[0].get("runtime"), parent_task_id
                         )
                         parent_runtime_status = (parent_snapshots[0].get("runtime") or {}).get("runtime_status", "")
+                        parent_planner_status = parent_snapshots[0].get("planner_status", "")
                     else:
                         parent_gate_reasons = [f"parent task {parent_task_id} not found"]
                         parent_runtime_status = ""
+                        parent_planner_status = ""
                 else:
                     parent_gate_reasons = ["parent task id not available on audit task"]
                     parent_runtime_status = ""
+                    parent_planner_status = ""
                 runtime_metadata["audit_parent_completion_gates"] = {
                     "parent_task_id": parent_task_id,
                     "passed": parent_gate_ok,
@@ -2208,10 +2211,15 @@ class CentralDispatcher:
                     reason = "; ".join(parent_gate_reasons)
                     runtime_status = "failed"
                     notes = f"{notes}; {reason}" if notes else reason
-                    # If the parent task is already in a terminal done/canceled state, the gate
-                    # failure is immutable — retrying the audit will never fix it.  Use the
-                    # permanent-failure prefix so the dispatcher does not waste retries.
-                    if parent_runtime_status in {"done", "canceled"}:
+                    # If the parent task is already in a terminal state, the gate failure is
+                    # immutable — retrying the audit will never fix it. This includes:
+                    # - runtime_status done/canceled (worker completed)
+                    # - planner_status done (manually reconciled; parent won't be re-dispatched)
+                    parent_is_terminal = (
+                        parent_runtime_status in {"done", "canceled"}
+                        or parent_planner_status == "done"
+                    )
+                    if parent_is_terminal:
                         error_text = f"parent gate check permanently failed: {reason}"
                     else:
                         error_text = reason
