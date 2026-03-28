@@ -333,22 +333,64 @@ class BuildersTest(unittest.TestCase):
 
     def test_claude_backend_prepare_uses_session_fork_args(self) -> None:
         backend = backends.ClaudeBackend()
-        snapshot = {"target_repo_id": "TEST"}
+        snapshot = {"task_id": "TASK-59", "target_repo_id": "TEST"}
         worker_task = {
             "prompt_body": "prompt body",
             "worker_model": "claude-sonnet-4-6",
             "db_path": "/tmp/test.db",
         }
-        fork_result = mock.Mock(args=["--resume", "sess-123", "--fork-session"])
+        fork_result = backends.session_manager.SessionForkResult(
+            args=["--resume", "sess-123", "--fork-session"],
+            session_id="sess-123",
+            stale=False,
+            stale_reason=None,
+        )
 
-        with mock.patch.object(backends.session_manager, "get_fork_args", return_value=fork_result) as get_fork_args_mock:
+        with (
+            mock.patch.object(backends.session_manager, "get_fork_args", return_value=fork_result) as get_fork_args_mock,
+            mock.patch.object(backend, "_log_session_fork") as log_session_fork_mock,
+        ):
             prompt_text, command, stdin_mode = backend.prepare(snapshot, worker_task, "run-1", Path("/tmp/result.json"))
 
         self.assertEqual(prompt_text, "prompt body")
         self.assertEqual(stdin_mode, subprocess.PIPE)
         get_fork_args_mock.assert_called_once_with("TEST", Path("/tmp/test.db"))
+        log_session_fork_mock.assert_called_once_with("TASK-59", "TEST", Path("/tmp/test.db"), fork_result)
         self.assertIn("--resume", command[2])
         self.assertIn("sess-123", command[2])
+        self.assertEqual(worker_task["run_id"], "run-1")
+
+    def test_claude_backend_log_session_fork_emits_stale_events(self) -> None:
+        backend = backends.ClaudeBackend()
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = {"fork_count": 12}
+        result = backends.session_manager.SessionForkResult(
+            args=["--resume", "sess-123", "--fork-session"],
+            session_id="sess-123",
+            stale=True,
+            stale_reason="fork_count_exceeded(50)",
+        )
+
+        with (
+            mock.patch.object(backends.task_db, "connect", return_value=conn) as connect_mock,
+            mock.patch.object(backends.task_db, "insert_event") as insert_event_mock,
+        ):
+            backend._log_session_fork("TASK-59", "TEST", Path("/tmp/test.db"), result)
+
+        connect_mock.assert_called_once_with(Path("/tmp/test.db"))
+        conn.execute.assert_called_once_with(
+            "SELECT fork_count FROM session_registry WHERE session_id = ?",
+            ("sess-123",),
+        )
+        self.assertEqual(insert_event_mock.call_count, 2)
+        first_call = insert_event_mock.call_args_list[0]
+        self.assertEqual(first_call.kwargs["event_type"], "session.forked")
+        self.assertEqual(first_call.kwargs["payload"]["fork_count"], 12)
+        self.assertTrue(first_call.kwargs["payload"]["stale"])
+        second_call = insert_event_mock.call_args_list[1]
+        self.assertEqual(second_call.kwargs["event_type"], "session.stale_detected")
+        self.assertEqual(second_call.kwargs["payload"]["reason"], "fork_count_exceeded(50)")
+        conn.commit.assert_called_once_with()
 
     def test_build_stub_command_has_required_fields(self) -> None:
         snapshot = task_payload("TASK-59-STUB-FIELDS")

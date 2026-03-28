@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import central_task_db as task_db
 from central_runtime_v2.config import (
     AUTONOMY_ROOT,
     AUTONOMY_SCHEMA_PATH,
@@ -406,6 +407,7 @@ class ClaudeBackend(WorkerBackend):
         run_id: str,
         result_path: Path,
     ) -> tuple[str, list[str], Any]:
+        worker_task["run_id"] = run_id
         prompt_text = worker_task["prompt_body"]
         db_path = Path(worker_task.get("db_path") or DEFAULT_DB_PATH)
         fork_result = session_manager.get_fork_args(snapshot["target_repo_id"], db_path)
@@ -415,7 +417,62 @@ class ClaudeBackend(WorkerBackend):
             worker_task["worker_model"],
             extra_args=fork_result.args if fork_result else None,
         )
+        if fork_result:
+            task_id = str(snapshot.get("task_id") or worker_task.get("task_id") or "")
+            if task_id:
+                self._log_session_fork(task_id, snapshot["target_repo_id"], db_path, fork_result)
         return prompt_text, command, subprocess.PIPE
+
+    def _log_session_fork(
+        self,
+        task_id: str,
+        repo_id: str,
+        db_path: Path,
+        result: session_manager.SessionForkResult,
+    ) -> None:
+        try:
+            conn = task_db.connect(db_path)
+        except Exception:
+            return
+        try:
+            fork_count: int | None = None
+            row = conn.execute(
+                "SELECT fork_count FROM session_registry WHERE session_id = ?",
+                (result.session_id,),
+            ).fetchone()
+            if row is not None:
+                fork_count = int(row["fork_count"] or 0)
+            task_db.insert_event(
+                conn,
+                task_id=task_id,
+                event_type="session.forked",
+                actor_kind="runtime",
+                actor_id="central.dispatcher",
+                payload={
+                    "repo_id": repo_id,
+                    "session_id": result.session_id,
+                    "fork_count": fork_count,
+                    "stale": result.stale,
+                },
+            )
+            if result.stale:
+                task_db.insert_event(
+                    conn,
+                    task_id=task_id,
+                    event_type="session.stale_detected",
+                    actor_kind="runtime",
+                    actor_id="central.dispatcher",
+                    payload={
+                        "repo_id": repo_id,
+                        "session_id": result.session_id,
+                        "reason": result.stale_reason,
+                    },
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        finally:
+            conn.close()
 
 
 def build_gemini_command(worker_task: dict[str, Any], result_path: Path, model: str) -> list[str]:

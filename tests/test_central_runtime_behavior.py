@@ -7,6 +7,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,81 @@ import central_runtime
 
 
 class CentralRuntimeBehaviorTest(unittest.TestCase):
+    def test_build_claude_command_appends_extra_args(self) -> None:
+        command = central_runtime.build_claude_command(
+            {"task_id": "CENTRAL-OPS-171", "run_id": "run-171"},
+            Path("/tmp/result.json"),
+            model="claude-sonnet-4-6",
+            extra_args=["--resume", "sess-123", "--fork-session"],
+        )
+
+        script = command[2]
+        self.assertIn("--resume", script)
+        self.assertIn("sess-123", script)
+        self.assertIn("--fork-session", script)
+
+    def test_claude_backend_prepare_uses_session_fork_args_and_logs(self) -> None:
+        backend = central_runtime.ClaudeBackend()
+        snapshot = {"task_id": "CENTRAL-OPS-171", "target_repo_id": "TEST", "dependencies": []}
+        worker_task = {
+            "task_id": "CENTRAL-OPS-171",
+            "worker_model": "claude-sonnet-4-6",
+            "db_path": "/tmp/test.db",
+        }
+        fork_result = central_runtime.session_manager.SessionForkResult(
+            args=["--resume", "sess-123", "--fork-session"],
+            session_id="sess-123",
+            stale=False,
+            stale_reason=None,
+        )
+
+        with (
+            mock.patch.object(central_runtime, "_build_worker_prompt", return_value="prompt body") as prompt_mock,
+            mock.patch.object(central_runtime.session_manager, "get_fork_args", return_value=fork_result) as get_fork_args_mock,
+            mock.patch.object(backend, "_log_session_fork") as log_session_fork_mock,
+        ):
+            prompt_text, command, stdin_mode = backend.prepare(snapshot, worker_task, "run-171", Path("/tmp/result.json"))
+
+        self.assertEqual(prompt_text, "prompt body")
+        self.assertEqual(stdin_mode, central_runtime.subprocess.PIPE)
+        prompt_mock.assert_called_once_with(snapshot, worker_task, "run-171")
+        get_fork_args_mock.assert_called_once_with("TEST", Path("/tmp/test.db"))
+        log_session_fork_mock.assert_called_once_with("CENTRAL-OPS-171", "TEST", Path("/tmp/test.db"), fork_result)
+        self.assertIn("--resume", command[2])
+        self.assertIn("sess-123", command[2])
+
+    def test_claude_backend_log_session_fork_emits_stale_events(self) -> None:
+        backend = central_runtime.ClaudeBackend()
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = {"fork_count": 12}
+        result = central_runtime.session_manager.SessionForkResult(
+            args=["--resume", "sess-123", "--fork-session"],
+            session_id="sess-123",
+            stale=True,
+            stale_reason="fork_count_exceeded(50)",
+        )
+
+        with (
+            mock.patch.object(central_runtime.task_db, "connect", return_value=conn) as connect_mock,
+            mock.patch.object(central_runtime.task_db, "insert_event") as insert_event_mock,
+        ):
+            backend._log_session_fork("CENTRAL-OPS-171", "TEST", Path("/tmp/test.db"), result)
+
+        connect_mock.assert_called_once_with(Path("/tmp/test.db"))
+        conn.execute.assert_called_once_with(
+            "SELECT fork_count FROM session_registry WHERE session_id = ?",
+            ("sess-123",),
+        )
+        self.assertEqual(insert_event_mock.call_count, 2)
+        self.assertEqual(insert_event_mock.call_args_list[0].kwargs["event_type"], "session.forked")
+        self.assertEqual(insert_event_mock.call_args_list[0].kwargs["payload"]["fork_count"], 12)
+        self.assertEqual(insert_event_mock.call_args_list[1].kwargs["event_type"], "session.stale_detected")
+        self.assertEqual(
+            insert_event_mock.call_args_list[1].kwargs["payload"]["reason"],
+            "fork_count_exceeded(50)",
+        )
+        conn.commit.assert_called_once_with()
+
     def test_resolve_task_class_uses_override_then_metadata_signals(self) -> None:
         self.assertEqual(
             central_runtime.resolve_task_class({"execution": {"metadata": {"task_class": "Design"}}}),
