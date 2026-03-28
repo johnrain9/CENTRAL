@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import subprocess
 from dataclasses import asdict, dataclass
@@ -365,6 +366,9 @@ def seed_session(
             "--dangerously-skip-permissions",
             "-p",
         ]
+        # Strip ANTHROPIC_API_KEY so claude uses the OAuth session (Claude Max)
+        # rather than a bare API key — same as the dispatcher does for workers.
+        seed_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
         try:
             completed = subprocess.run(
                 command,
@@ -373,6 +377,7 @@ def seed_session(
                 capture_output=True,
                 cwd=str(repo_root),
                 check=False,
+                env=seed_env,
             )
         except Exception:
             with conn:
