@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -108,10 +109,28 @@ class SessionManagerTest(unittest.TestCase):
 
         self.assertIsNone(session_manager.get_fork_args("TEST", self.db_path))
 
+    def test_get_fork_args_returns_none_when_feature_gate_disabled(self) -> None:
+        self.conn.execute(
+            "UPDATE repos SET metadata_json = ? WHERE repo_id = ?",
+            (json.dumps({"session_persistence_enabled": False}), "TEST"),
+        )
+        self.conn.commit()
+        self._insert_session(session_id="sess-disabled")
+        self._write_session_file("sess-disabled")
+
+        with patch.object(session_manager, "CLAUDE_PROJECTS_DIR", self.projects_dir):
+            self.assertIsNone(session_manager.get_fork_args("TEST", self.db_path))
+
     def test_validate_session_matches_exact_repo_project_dir(self) -> None:
         self._write_session_file("sess-1")
         with patch.object(session_manager, "CLAUDE_PROJECTS_DIR", self.projects_dir):
             self.assertTrue(session_manager.validate_session("sess-1", repo_root=self.repo_root))
+            self.assertFalse(session_manager.validate_session("missing", repo_root=self.repo_root))
+
+    def test_validate_session_returns_false_for_missing_files_with_mocked_filesystem(self) -> None:
+        with patch.object(session_manager, "CLAUDE_PROJECTS_DIR", self.projects_dir), patch.object(
+            Path, "glob", return_value=[]
+        ), patch.object(Path, "is_file", return_value=False):
             self.assertFalse(session_manager.validate_session("missing", repo_root=self.repo_root))
 
     def test_validate_session_falls_back_to_global_scan_when_repo_dir_misses(self) -> None:
@@ -157,6 +176,26 @@ class SessionManagerTest(unittest.TestCase):
             ("bad-active",),
         ).fetchone()
         self.assertEqual(active_row["status"], "retired")
+
+    def test_get_fork_args_returns_resume_and_fork_flags_for_valid_active_session(self) -> None:
+        self._insert_session(session_id="sess-active")
+        self._write_session_file("sess-active")
+
+        with patch.object(session_manager, "CLAUDE_PROJECTS_DIR", self.projects_dir):
+            result = session_manager.get_fork_args("TEST", self.db_path)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.args, ["--resume", "sess-active", "--fork-session"])
+        self.assertEqual(result.session_id, "sess-active")
+        self.assertFalse(result.stale)
+        self.assertIsNone(result.stale_reason)
+        row = self.conn.execute(
+            "SELECT fork_count, last_forked_at FROM session_registry WHERE session_id = ?",
+            ("sess-active",),
+        ).fetchone()
+        self.assertEqual(row["fork_count"], 1)
+        self.assertIsNotNone(row["last_forked_at"])
 
     def test_get_fork_args_prefers_most_recent_stale_session(self) -> None:
         self._insert_session(
@@ -258,10 +297,11 @@ class SessionManagerTest(unittest.TestCase):
         self.assertEqual(run_mock.call_args.kwargs["cwd"], str(self.repo_root))
         self.assertIn("--session-id", run_mock.call_args.args[0])
         rows = self.conn.execute(
-            "SELECT session_id, status, context_tokens FROM session_registry ORDER BY session_id"
+            "SELECT session_id, status, context_tokens, seed_cwd FROM session_registry ORDER BY session_id"
         ).fetchall()
         self.assertEqual([(row["session_id"], row["status"]) for row in rows], [("new-session", "active"), ("old-active", "retired")])
         self.assertEqual(rows[0]["context_tokens"], 15)
+        self.assertEqual(rows[0]["seed_cwd"], str(self.repo_root))
 
     def test_seed_session_deletes_failed_seed_row(self) -> None:
         completed = subprocess.CompletedProcess(args=["claude"], returncode=1, stdout="", stderr="boom")
@@ -294,12 +334,23 @@ class SessionManagerTest(unittest.TestCase):
             [(row["session_id"], row["status"]) for row in rows],
             [("active-1", "retired"), ("fresh", "active"), ("stale-1", "retired"), ("stale-2", "retired")],
         )
+        stale_count = self.conn.execute(
+            "SELECT COUNT(*) AS count FROM session_registry WHERE repo_id = ? AND status = 'stale'",
+            ("TEST",),
+        ).fetchone()
+        self.assertEqual(stale_count["count"], 0)
 
     def test_list_sessions_filters_by_repo(self) -> None:
         self._insert_session(session_id="one")
         rows = session_manager.list_sessions(self.db_path, repo_id="TEST")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["repo_id"], "TEST")
+
+    def test_session_registry_enforces_single_active_row_per_repo(self) -> None:
+        self._insert_session(session_id="active-1", status="active")
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self._insert_session(session_id="active-2", status="active")
 
 
 if __name__ == "__main__":
