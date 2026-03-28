@@ -241,6 +241,23 @@ class SessionManagerTest(unittest.TestCase):
         self.assertTrue(result.stale)
         self.assertEqual(result.stale_reason, "prompt_hash_changed")
 
+    def test_get_fork_args_treats_missing_prompt_file_as_stale_not_fatal(self) -> None:
+        self.conn.execute(
+            "UPDATE repos SET metadata_json = ? WHERE repo_id = ?",
+            (json.dumps({"session_persistence_enabled": True, "session_seed_prompt_file": "missing.md"}), "TEST"),
+        )
+        self.conn.commit()
+        self._insert_session(session_id="sess-stale", seed_prompt_hash="outdated")
+        self._write_session_file("sess-stale")
+
+        with patch.object(session_manager, "CLAUDE_PROJECTS_DIR", self.projects_dir):
+            result = session_manager.get_fork_args("TEST", self.db_path)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result.stale)
+        self.assertEqual(result.stale_reason, "prompt_hash_unavailable")
+
     def test_is_stale_checks_fork_count_age_and_prompt_hash(self) -> None:
         repo_row, meta = session_manager._load_repo(self.conn, "TEST")  # type: ignore[misc]
         assert repo_row is not None

@@ -122,8 +122,11 @@ def _resolve_prompt(repo_row: sqlite3.Row, meta: dict[str, Any], prompt_file: st
     return _default_seed_prompt(repo_name), None
 
 
-def _current_prompt_hash(repo_row: sqlite3.Row, meta: dict[str, Any]) -> str:
-    prompt_text, _ = _resolve_prompt(repo_row, meta, None)
+def _current_prompt_hash(repo_row: sqlite3.Row, meta: dict[str, Any]) -> str | None:
+    try:
+        prompt_text, _ = _resolve_prompt(repo_row, meta, None)
+    except OSError:
+        return None
     return sha256(prompt_text.encode("utf-8")).hexdigest()
 
 
@@ -136,6 +139,8 @@ def _stale_reason(row: sqlite3.Row | dict[str, Any], meta: dict[str, Any], repo_
     if completed_at is not None and _utc_now() - completed_at > timedelta(hours=refresh_after_hours):
         return f"age_exceeded({refresh_after_hours}h)"
     current_prompt_hash = _current_prompt_hash(repo_row, meta)
+    if row["seed_prompt_hash"] and current_prompt_hash is None:
+        return "prompt_hash_unavailable"
     if row["seed_prompt_hash"] and str(row["seed_prompt_hash"]) != current_prompt_hash:
         return "prompt_hash_changed"
     return None
