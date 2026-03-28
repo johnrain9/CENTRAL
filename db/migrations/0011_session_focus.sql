@@ -11,6 +11,7 @@
 ALTER TABLE session_registry ADD COLUMN focus TEXT NOT NULL DEFAULT '';
 
 DROP INDEX IF EXISTS uq_session_registry_active_repo;
+DROP INDEX IF EXISTS idx_session_registry_repo_active;
 
 CREATE UNIQUE INDEX uq_session_registry_active_repo_focus
     ON session_registry (repo_id, focus) WHERE status = 'active';
