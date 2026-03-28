@@ -24,6 +24,9 @@ DEFAULT_REFRESH_AFTER_FORKS = 50
 DEFAULT_REFRESH_AFTER_HOURS = 72
 
 
+DEFAULT_STALE_LOCK_SECONDS = 7200  # 2x default worker timeout
+
+
 @dataclass(frozen=True)
 class SessionForkResult:
     args: list[str]
@@ -31,6 +34,7 @@ class SessionForkResult:
     stale: bool
     stale_reason: str | None
     focus: str = ""  # which focus was actually resolved ('' = unfocused)
+    is_resume: bool = False  # True for resume-in-place, False for fork
 
 
 def _utc_now() -> datetime:
@@ -211,8 +215,15 @@ def _is_stale(row: sqlite3.Row | dict[str, Any], meta: dict[str, Any], repo_row:
     return _stale_reason(row, meta, repo_row) is not None
 
 
-def get_fork_args(repo_id: str, db_path: Path, focus: str = "") -> SessionForkResult | None:
-    """Return ``--resume``/``--fork-session`` args for the best matching session.
+def get_fork_args(repo_id: str, db_path: Path, focus: str = "", resume_mode: bool = False) -> SessionForkResult | None:
+    """Return session args for the best matching session.
+
+    When *resume_mode* is ``False`` (default): returns ``--resume ID --fork-session``
+    (independent branch, workers don't see each other's context).
+
+    When *resume_mode* is ``True``: returns ``--resume ID`` only (in-place resume,
+    session accumulates context across workers). Caller must acquire a session lock
+    separately via :func:`acquire_session_lock`.
 
     Fallback chain: requested *focus* → ``''`` (unfocused) → ``None`` (cold start).
     If *focus* is already ``''`` only the unfocused bucket is tried.
@@ -272,26 +283,140 @@ def get_fork_args(repo_id: str, db_path: Path, focus: str = "") -> SessionForkRe
                     continue
 
                 stale_reason = _stale_reason(row, meta, repo_row)
-                forked_at = _utc_now_text()
-                with conn:
-                    conn.execute(
-                        """
-                        UPDATE session_registry
-                        SET fork_count = fork_count + 1,
-                            last_forked_at = ?,
-                            updated_at = ?
-                        WHERE repo_id = ? AND session_id = ?
-                        """,
-                        (forked_at, forked_at, repo_id, row["session_id"]),
-                    )
+                if not resume_mode:
+                    # Fork mode: increment usage counter here (lock not needed)
+                    forked_at = _utc_now_text()
+                    with conn:
+                        conn.execute(
+                            """
+                            UPDATE session_registry
+                            SET fork_count = fork_count + 1,
+                                last_forked_at = ?,
+                                updated_at = ?
+                            WHERE repo_id = ? AND session_id = ?
+                            """,
+                            (forked_at, forked_at, repo_id, row["session_id"]),
+                        )
+                # In resume mode, usage counter is incremented by acquire_session_lock()
+                if resume_mode:
+                    args = ["--resume", str(row["session_id"])]
+                else:
+                    args = ["--resume", str(row["session_id"]), "--fork-session"]
                 return SessionForkResult(
-                    args=["--resume", str(row["session_id"]), "--fork-session"],
+                    args=args,
                     session_id=str(row["session_id"]),
                     stale=stale_reason is not None,
                     stale_reason=stale_reason,
                     focus=candidate_focus,
+                    is_resume=resume_mode,
                 )
         return None
+    finally:
+        conn.close()
+
+
+def acquire_session_lock(repo_id: str, db_path: Path, task_id: str, focus: str = "") -> bool:
+    """Atomically lock a session for exclusive resume-in-place use.
+
+    Sets ``locked_by_task_id`` on the matching active session and increments
+    ``fork_count``.  Returns ``True`` if the lock was acquired, ``False`` if
+    the session is already locked or does not exist.
+    """
+    conn = connect(db_path)
+    try:
+        if not _table_exists(conn, "session_registry"):
+            return False
+        now = _utc_now_text()
+        with conn:
+            cur = conn.execute(
+                """
+                UPDATE session_registry
+                SET locked_by_task_id = ?,
+                    locked_at = ?,
+                    fork_count = fork_count + 1,
+                    last_forked_at = ?,
+                    updated_at = ?
+                WHERE repo_id = ? AND focus = ? AND status = 'active'
+                  AND locked_by_task_id IS NULL
+                """,
+                (task_id, now, now, now, repo_id, focus),
+            )
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def release_session_lock(db_path: Path, task_id: str) -> bool:
+    """Release a session lock held by *task_id*.  Idempotent."""
+    conn = connect(db_path)
+    try:
+        if not _table_exists(conn, "session_registry"):
+            return False
+        with conn:
+            cur = conn.execute(
+                """
+                UPDATE session_registry
+                SET locked_by_task_id = NULL,
+                    locked_at = NULL,
+                    updated_at = ?
+                WHERE locked_by_task_id = ?
+                """,
+                (_utc_now_text(), task_id),
+            )
+            return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def active_session_locks(db_path: Path) -> dict[tuple[str, str], str]:
+    """Return ``{(repo_id, focus): locked_by_task_id}`` for all locked sessions."""
+    conn = connect(db_path)
+    try:
+        if not _table_exists(conn, "session_registry"):
+            return {}
+        rows = conn.execute(
+            "SELECT repo_id, focus, locked_by_task_id FROM session_registry "
+            "WHERE locked_by_task_id IS NOT NULL"
+        ).fetchall()
+        return {
+            (str(r["repo_id"]), str(r["focus"])): str(r["locked_by_task_id"])
+            for r in rows
+        }
+    finally:
+        conn.close()
+
+
+def cleanup_stale_session_locks(
+    db_path: Path,
+    stale_seconds: int = DEFAULT_STALE_LOCK_SECONDS,
+) -> list[dict[str, str]]:
+    """Release session locks older than *stale_seconds*.  Returns released locks."""
+    conn = connect(db_path)
+    try:
+        if not _table_exists(conn, "session_registry"):
+            return []
+        cutoff = (_utc_now() - timedelta(seconds=stale_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%f+00:00"
+        )
+        rows = conn.execute(
+            "SELECT repo_id, focus, locked_by_task_id FROM session_registry "
+            "WHERE locked_by_task_id IS NOT NULL AND locked_at < ?",
+            (cutoff,),
+        ).fetchall()
+        if not rows:
+            return []
+        released = [
+            {"repo_id": str(r["repo_id"]), "focus": str(r["focus"]),
+             "locked_by_task_id": str(r["locked_by_task_id"])}
+            for r in rows
+        ]
+        with conn:
+            conn.execute(
+                "UPDATE session_registry SET locked_by_task_id = NULL, locked_at = NULL, "
+                "updated_at = ? WHERE locked_by_task_id IS NOT NULL AND locked_at < ?",
+                (_utc_now_text(), cutoff),
+            )
+        return released
     finally:
         conn.close()
 

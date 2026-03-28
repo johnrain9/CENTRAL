@@ -42,6 +42,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 import central_task_db as task_db
+import session_manager
 from central_runtime_v2.config import ActiveWorker, DispatcherConfig, RuntimePaths
 from central_runtime_v2.log import DaemonLog
 from central_runtime_v2.model_policy import build_worker_task, resolve_task_worker_backend
@@ -358,6 +359,7 @@ class CoordinationServer:
             finally:
                 read_conn.close()
 
+            session_locks = session_manager.active_session_locks(self._config.db_path)
             candidate: dict[str, Any] | None = None
             for snapshot in eligible:
                 effective_backend = resolve_task_worker_backend(snapshot, disp_config.worker_mode)
@@ -368,6 +370,8 @@ class CoordinationServer:
                     snapshot.get("repo_metadata") or {}
                 )
                 if repo_count >= max_repo:
+                    continue
+                if not task_db._session_lock_allows_dispatch(snapshot, session_locks):
                     continue
                 candidate = snapshot
                 break

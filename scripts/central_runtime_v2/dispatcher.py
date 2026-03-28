@@ -69,6 +69,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 import central_task_db as task_db
+import session_manager
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -703,6 +704,9 @@ class CentralDispatcher:
             self.logger.emit("WRN", "central.dispatcher", f"heartbeat_db_write_failed error={_hb_exc}")
 
     def _claim_next(self) -> dict[str, Any] | None:
+        # Query session locks so the dispatch filter can skip tasks whose
+        # resume-in-place session is currently held by another worker.
+        locks = session_manager.active_session_locks(self.config.db_path)
         conn = self._connect()
         try:
             return task_db.runtime_claim(
@@ -714,6 +718,7 @@ class CentralDispatcher:
                 actor_id="central.dispatcher",
                 remote_only=False,
                 raise_on_empty=False,
+                session_locks=locks,
             )
         finally:
             conn.close()
@@ -1404,6 +1409,26 @@ class CentralDispatcher:
     # _finalize_worker
     # ------------------------------------------------------------------
 
+    def _release_session_lock_if_held(self, state: ActiveWorker) -> None:
+        """Release the resume-in-place session lock if this worker held one."""
+        repo_meta = state.task.get("repo_metadata") or {}
+        task_focus = str((state.task.get("metadata") or {}).get("session_focus") or "")
+        if not repo_meta.get("session_resume_mode") or not task_focus:
+            return
+        task_id = state.task["task_id"]
+        try:
+            released = session_manager.release_session_lock(self.config.db_path, task_id)
+            if released:
+                self.logger.emit(
+                    "INF", "central.dispatcher",
+                    f"session_lock_released task={task_id} focus={task_focus}",
+                )
+        except Exception as exc:
+            self.logger.emit(
+                "ERR", "central.dispatcher",
+                f"session_lock_release_error task={task_id} error={exc}",
+            )
+
     def _finalize_worker(
         self, state: ActiveWorker, *, timed_out: bool = False, interrupted_by_restart: bool = False
     ) -> None:
@@ -1434,6 +1459,7 @@ class CentralDispatcher:
                     )
                 self.logger.emit("WRN", "central.dispatcher", f"worker_timeout_failed task={task_id} run={state.run_id}{_title_kv(state.task)}")
                 self._maybe_notify(title=str(state.task.get("title") or task_id), runtime_status="failed", summary="hard timeout exceeded (no auto-retry)", task_id=task_id)
+                self._release_session_lock_if_held(state)
                 return
 
             runtime_status, notes, error_text, tests, result, raw_result_payload, result_artifacts, extra_artifacts = (
@@ -1545,6 +1571,7 @@ class CentralDispatcher:
                 f"worker_finished task={task_id} run={state.run_id} runtime_status={runtime_status}{_title_kv(state.task)}",
             )
         finally:
+            self._release_session_lock_if_held(state)
             conn.close()
 
     def _process_active(self) -> None:
@@ -1653,6 +1680,17 @@ class CentralDispatcher:
                 "central.dispatcher",
                 f"stale_recovery recovered={result['recovered_count']}",
             )
+        # Clean up session locks held by workers that crashed without releasing.
+        try:
+            released = session_manager.cleanup_stale_session_locks(self.config.db_path)
+            if released:
+                detail = " ".join(f"{r['repo_id']}:{r['focus']}" for r in released)
+                self.logger.emit(
+                    "WRN", "central.dispatcher",
+                    f"stale_session_locks_released count={len(released)} {detail}",
+                )
+        except Exception as exc:
+            self.logger.emit("ERR", "central.dispatcher", f"session_lock_cleanup_error error={exc}")
 
     def _abort_if_max_retries(self, snapshot: dict[str, Any]) -> bool:
         """Transition task to failed with max_retries_exceeded if retry_count >= max_retries.

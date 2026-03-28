@@ -5648,6 +5648,31 @@ def active_repo_worker_counts(conn: sqlite3.Connection) -> dict[str, int]:
     }
 
 
+def _session_lock_allows_dispatch(
+    snapshot: dict[str, Any],
+    session_locks: dict[tuple[str, str], str],
+) -> bool:
+    """Return True if the task may be dispatched given current session locks.
+
+    A task is blocked only when ALL of:
+    - The repo has ``session_resume_mode: true``
+    - The task has a ``session_focus``
+    - The task is not an audit
+    - The (repo_id, focus) session is currently locked by another task
+    """
+    if not session_locks:
+        return True
+    repo_meta = snapshot.get("repo_metadata") or {}
+    if not repo_meta.get("session_resume_mode"):
+        return True
+    task_focus = str((snapshot.get("metadata") or {}).get("session_focus") or "")
+    if not task_focus:
+        return True
+    if str(snapshot.get("task_type") or "").strip().lower() == "audit":
+        return True
+    return (str(snapshot["target_repo_id"]), task_focus) not in session_locks
+
+
 def runtime_claim(
     conn: sqlite3.Connection,
     *,
@@ -5658,6 +5683,7 @@ def runtime_claim(
     actor_id: str,
     remote_only: bool | None = None,
     raise_on_empty: bool = True,
+    session_locks: dict[tuple[str, str], str] | None = None,
 ) -> dict[str, Any] | None:
     begin_immediate(conn)
     snapshots = fetch_task_snapshots(conn, task_id=task_id) if task_id else fetch_task_snapshots(conn)
@@ -5671,6 +5697,9 @@ def runtime_claim(
         if active_counts.get(str(snapshot["target_repo_id"]), 0)
         < resolve_repo_max_concurrent_workers(snapshot.get("repo_metadata") or {})
     ]
+    # Session lock filtering: skip tasks whose resume-in-place session is held
+    if session_locks:
+        ordered = [s for s in ordered if _session_lock_allows_dispatch(s, session_locks)]
     if not ordered:
         conn.rollback()
         if raise_on_empty:

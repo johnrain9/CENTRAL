@@ -973,7 +973,12 @@ class ClaudeBackend(WorkerBackend):
         prompt_text = _build_worker_prompt(snapshot, worker_task, run_id)
         db_path = Path(worker_task.get("db_path") or DEFAULT_DB_PATH)
         session_focus = str((snapshot.get("metadata") or {}).get("session_focus") or "")
-        fork_result = session_manager.get_fork_args(snapshot["target_repo_id"], db_path, focus=session_focus)
+        repo_meta = snapshot.get("repo_metadata") or {}
+        is_audit = str(snapshot.get("task_type") or "").strip().lower() == "audit"
+        resume_mode = bool(repo_meta.get("session_resume_mode")) and bool(session_focus) and not is_audit
+        fork_result = session_manager.get_fork_args(
+            snapshot["target_repo_id"], db_path, focus=session_focus, resume_mode=resume_mode,
+        )
         command = build_claude_command(
             worker_task,
             result_path,
