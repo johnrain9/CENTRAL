@@ -102,7 +102,7 @@ def _default_seed_prompt(repo_name: str, focus: str = "") -> str:
         return preamble + (
             "Focus exclusively on the FRONTEND codebase.\n\n"
             "Please do the following:\n"
-            "1. Read AI_GUIDE.md if it exists at the repo root.\n"
+            "1. Read AI_UI_GUIDE.md if it exists at the repo root, otherwise AI_GUIDE.md.\n"
             "2. Locate the frontend source tree (e.g. src/ui/, frontend/, web/, app/ or similar).\n"
             "3. Read the entry point (e.g. main.tsx, index.tsx, App.tsx) and trace the top-level component tree.\n"
             "4. Understand the routing approach (React Router, file-based, etc.) and the main page/view structure.\n"
