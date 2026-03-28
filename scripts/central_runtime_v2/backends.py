@@ -410,7 +410,8 @@ class ClaudeBackend(WorkerBackend):
         worker_task["run_id"] = run_id
         prompt_text = worker_task["prompt_body"]
         db_path = Path(worker_task.get("db_path") or DEFAULT_DB_PATH)
-        fork_result = session_manager.get_fork_args(snapshot["target_repo_id"], db_path)
+        session_focus = str((snapshot.get("metadata") or {}).get("session_focus") or "")
+        fork_result = session_manager.get_fork_args(snapshot["target_repo_id"], db_path, focus=session_focus)
         command = build_claude_command(
             worker_task,
             result_path,
@@ -451,6 +452,7 @@ class ClaudeBackend(WorkerBackend):
                 payload={
                     "repo_id": repo_id,
                     "session_id": result.session_id,
+                    "focus": result.focus,
                     "fork_count": fork_count,
                     "stale": result.stale,
                 },

@@ -29,6 +29,7 @@ class SessionForkResult:
     session_id: str
     stale: bool
     stale_reason: str | None
+    focus: str = ""  # which focus was actually resolved ('' = unfocused)
 
 
 def _utc_now() -> datetime:
@@ -150,7 +151,12 @@ def _is_stale(row: sqlite3.Row | dict[str, Any], meta: dict[str, Any], repo_row:
     return _stale_reason(row, meta, repo_row) is not None
 
 
-def get_fork_args(repo_id: str, db_path: Path) -> SessionForkResult | None:
+def get_fork_args(repo_id: str, db_path: Path, focus: str = "") -> SessionForkResult | None:
+    """Return ``--resume``/``--fork-session`` args for the best matching session.
+
+    Fallback chain: requested *focus* → ``''`` (unfocused) → ``None`` (cold start).
+    If *focus* is already ``''`` only the unfocused bucket is tried.
+    """
     conn = connect(db_path)
     try:
         if not _table_exists(conn, "session_registry"):
@@ -161,59 +167,70 @@ def get_fork_args(repo_id: str, db_path: Path) -> SessionForkResult | None:
         repo_row, meta = loaded
         if not meta.get("session_persistence_enabled"):
             return None
-        rows = conn.execute(
-            """
-            SELECT session_id, status, fork_count, seed_completed_at, seed_prompt_hash, context_tokens, seed_cwd
-            FROM session_registry
-            WHERE repo_id = ? AND status IN ('active', 'stale') AND seed_completed_at IS NOT NULL
-            ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, seed_completed_at DESC, registry_id DESC
-            """,
-            (repo_id,),
-        ).fetchall()
-        for row in rows:
-            if not validate_session(str(row["session_id"]), repo_root=str(row["seed_cwd"])):
-                validation_note = f"validation_failed:{row['session_id']}"
+
+        # Build fallback chain: [requested_focus] then [''] if different
+        focuses_to_try: list[str] = [focus]
+        if focus != "":
+            focuses_to_try.append("")
+
+        for candidate_focus in focuses_to_try:
+            rows = conn.execute(
+                """
+                SELECT session_id, status, fork_count, seed_completed_at,
+                       seed_prompt_hash, context_tokens, seed_cwd
+                FROM session_registry
+                WHERE repo_id = ? AND focus = ?
+                  AND status IN ('active', 'stale') AND seed_completed_at IS NOT NULL
+                ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,
+                         seed_completed_at DESC, registry_id DESC
+                """,
+                (repo_id, candidate_focus),
+            ).fetchall()
+            for row in rows:
+                if not validate_session(str(row["session_id"]), repo_root=str(row["seed_cwd"])):
+                    validation_note = f"validation_failed:{row['session_id']}"
+                    with conn:
+                        conn.execute(
+                            """
+                            UPDATE session_registry
+                            SET status = 'retired',
+                                updated_at = ?,
+                                notes = CASE
+                                    WHEN notes IS NULL OR notes = '' THEN ?
+                                    ELSE notes || '\n' || ?
+                                END
+                            WHERE repo_id = ? AND session_id = ?
+                            """,
+                            (
+                                _utc_now_text(),
+                                validation_note,
+                                validation_note,
+                                repo_id,
+                                row["session_id"],
+                            ),
+                        )
+                    continue
+
+                stale_reason = _stale_reason(row, meta, repo_row)
+                forked_at = _utc_now_text()
                 with conn:
                     conn.execute(
                         """
                         UPDATE session_registry
-                        SET status = 'retired',
-                            updated_at = ?,
-                            notes = CASE
-                                WHEN notes IS NULL OR notes = '' THEN ?
-                                ELSE notes || '\n' || ?
-                            END
+                        SET fork_count = fork_count + 1,
+                            last_forked_at = ?,
+                            updated_at = ?
                         WHERE repo_id = ? AND session_id = ?
                         """,
-                        (
-                            _utc_now_text(),
-                            validation_note,
-                            validation_note,
-                            repo_id,
-                            row["session_id"],
-                        ),
+                        (forked_at, forked_at, repo_id, row["session_id"]),
                     )
-                continue
-
-            stale_reason = _stale_reason(row, meta, repo_row)
-            forked_at = _utc_now_text()
-            with conn:
-                conn.execute(
-                    """
-                    UPDATE session_registry
-                    SET fork_count = fork_count + 1,
-                        last_forked_at = ?,
-                        updated_at = ?
-                    WHERE repo_id = ? AND session_id = ?
-                    """,
-                    (forked_at, forked_at, repo_id, row["session_id"]),
+                return SessionForkResult(
+                    args=["--resume", str(row["session_id"]), "--fork-session"],
+                    session_id=str(row["session_id"]),
+                    stale=stale_reason is not None,
+                    stale_reason=stale_reason,
+                    focus=candidate_focus,
                 )
-            return SessionForkResult(
-                args=["--resume", str(row["session_id"]), "--fork-session"],
-                session_id=str(row["session_id"]),
-                stale=stale_reason is not None,
-                stale_reason=stale_reason,
-            )
         return None
     finally:
         conn.close()
@@ -240,6 +257,7 @@ def seed_session(
     db_path: Path,
     model: str = DEFAULT_SEED_MODEL,
     prompt_file: str | None = None,
+    focus: str = "",
     retire_statuses: tuple[str, ...] = ("active", "stale"),
 ) -> str:
     conn = connect(db_path)
@@ -253,22 +271,25 @@ def seed_session(
         prompt_text, resolved_prompt_path = _resolve_prompt(repo_row, meta, prompt_file)
         session_id = str(uuid4())
         repo_root = Path(str(repo_row["repo_root"])).expanduser().resolve()
+        focus_suffix = f"-{focus}" if focus else ""
         notes = str(resolved_prompt_path) if resolved_prompt_path is not None else "default_prompt"
         with conn:
             conn.execute(
                 """
                 INSERT INTO session_registry (
-                    repo_id, session_id, session_name, status, seed_model, seed_cwd, seed_prompt_hash, notes, created_at, updated_at
+                    repo_id, session_id, session_name, status, seed_model,
+                    seed_cwd, seed_prompt_hash, focus, notes, created_at, updated_at
                 )
-                VALUES (?, ?, ?, 'seeding', ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, 'seeding', ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     repo_id,
                     session_id,
-                    f"{repo_root.name}-base-{_utc_now().strftime('%Y%m%d%H%M%S')}",
+                    f"{repo_root.name}-base{focus_suffix}-{_utc_now().strftime('%Y%m%d%H%M%S')}",
                     model,
                     str(repo_root),
                     sha256(prompt_text.encode("utf-8")).hexdigest(),
+                    focus,
                     notes,
                     _utc_now_text(),
                     _utc_now_text(),
@@ -277,7 +298,7 @@ def seed_session(
         command = [
             "claude",
             "--name",
-            f"{repo_root.name}-base",
+            f"{repo_root.name}-base{focus_suffix}",
             "--session-id",
             session_id,
             "--model",
@@ -318,9 +339,9 @@ def seed_session(
                     UPDATE session_registry
                     SET status = 'retired',
                         updated_at = ?
-                    WHERE repo_id = ? AND session_id != ? AND status IN ({placeholders})
+                    WHERE repo_id = ? AND focus = ? AND session_id != ? AND status IN ({placeholders})
                     """,
-                    (completed_at, repo_id, session_id, *retire_statuses),
+                    (completed_at, repo_id, focus, session_id, *retire_statuses),
                 )
             conn.execute(
                 """
@@ -338,7 +359,13 @@ def seed_session(
         conn.close()
 
 
-def refresh_session(repo_id: str, db_path: Path, model: str = DEFAULT_SEED_MODEL, prompt_file: str | None = None) -> str:
+def refresh_session(
+    repo_id: str,
+    db_path: Path,
+    model: str = DEFAULT_SEED_MODEL,
+    prompt_file: str | None = None,
+    focus: str = "",
+) -> str:
     conn = connect(db_path)
     try:
         if not _table_exists(conn, "session_registry"):
@@ -350,9 +377,9 @@ def refresh_session(repo_id: str, db_path: Path, model: str = DEFAULT_SEED_MODEL
                 UPDATE session_registry
                 SET status = 'stale',
                     updated_at = ?
-                WHERE repo_id = ? AND status = 'active'
+                WHERE repo_id = ? AND focus = ? AND status = 'active'
                 """,
-                (retired_at, repo_id),
+                (retired_at, repo_id, focus),
             )
     finally:
         conn.close()
@@ -361,6 +388,7 @@ def refresh_session(repo_id: str, db_path: Path, model: str = DEFAULT_SEED_MODEL
         db_path,
         model=model,
         prompt_file=prompt_file,
+        focus=focus,
         retire_statuses=("stale",),
     )
 
@@ -396,11 +424,13 @@ def _build_parser() -> argparse.ArgumentParser:
     seed_parser.add_argument("--repo", required=True)
     seed_parser.add_argument("--model", default=DEFAULT_SEED_MODEL)
     seed_parser.add_argument("--prompt-file")
+    seed_parser.add_argument("--focus", default="", help="Session focus: frontend, backend, other, or empty for unfocused")
 
     refresh_parser = subparsers.add_parser("refresh")
     refresh_parser.add_argument("--repo", required=True)
     refresh_parser.add_argument("--model", default=DEFAULT_SEED_MODEL)
     refresh_parser.add_argument("--prompt-file")
+    refresh_parser.add_argument("--focus", default="", help="Session focus to refresh")
 
     list_parser = subparsers.add_parser("list")
     list_parser.add_argument("--repo")
@@ -411,12 +441,12 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     db_path = Path(args.db_path).expanduser().resolve()
     if args.command == "seed":
-        session_id = seed_session(args.repo, db_path, model=args.model, prompt_file=args.prompt_file)
-        print(json.dumps({"repo_id": args.repo, "session_id": session_id}, indent=2))
+        session_id = seed_session(args.repo, db_path, model=args.model, prompt_file=args.prompt_file, focus=args.focus)
+        print(json.dumps({"repo_id": args.repo, "session_id": session_id, "focus": args.focus}, indent=2))
         return 0
     if args.command == "refresh":
-        session_id = refresh_session(args.repo, db_path, model=args.model, prompt_file=args.prompt_file)
-        print(json.dumps({"repo_id": args.repo, "session_id": session_id}, indent=2))
+        session_id = refresh_session(args.repo, db_path, model=args.model, prompt_file=args.prompt_file, focus=args.focus)
+        print(json.dumps({"repo_id": args.repo, "session_id": session_id, "focus": args.focus}, indent=2))
         return 0
     sessions = list_sessions(db_path, repo_id=args.repo)
     print(json.dumps(sessions, indent=2))
