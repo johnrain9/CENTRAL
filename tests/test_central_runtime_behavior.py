@@ -60,6 +60,30 @@ class CentralRuntimeBehaviorTest(unittest.TestCase):
         self.assertIn("--resume", command[2])
         self.assertIn("sess-123", command[2])
 
+    def test_claude_backend_prepare_cold_starts_when_no_session_fork_exists(self) -> None:
+        backend = central_runtime.ClaudeBackend()
+        snapshot = {"task_id": "CENTRAL-OPS-171", "target_repo_id": "TEST", "dependencies": []}
+        worker_task = {
+            "task_id": "CENTRAL-OPS-171",
+            "worker_model": "claude-sonnet-4-6",
+            "db_path": "/tmp/test.db",
+        }
+
+        with (
+            mock.patch.object(central_runtime, "_build_worker_prompt", return_value="prompt body") as prompt_mock,
+            mock.patch.object(central_runtime.session_manager, "get_fork_args", return_value=None) as get_fork_args_mock,
+            mock.patch.object(backend, "_log_session_fork") as log_session_fork_mock,
+        ):
+            prompt_text, command, stdin_mode = backend.prepare(snapshot, worker_task, "run-171", Path("/tmp/result.json"))
+
+        self.assertEqual(prompt_text, "prompt body")
+        self.assertEqual(stdin_mode, central_runtime.subprocess.PIPE)
+        prompt_mock.assert_called_once_with(snapshot, worker_task, "run-171")
+        get_fork_args_mock.assert_called_once_with("TEST", Path("/tmp/test.db"))
+        log_session_fork_mock.assert_not_called()
+        self.assertNotIn("--resume", command[2])
+        self.assertNotIn("--fork-session", command[2])
+
     def test_claude_backend_log_session_fork_emits_stale_events(self) -> None:
         backend = central_runtime.ClaudeBackend()
         conn = mock.Mock()

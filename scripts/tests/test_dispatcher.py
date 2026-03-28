@@ -360,6 +360,29 @@ class BuildersTest(unittest.TestCase):
         self.assertIn("sess-123", command[2])
         self.assertEqual(worker_task["run_id"], "run-1")
 
+    def test_claude_backend_prepare_cold_starts_without_session_fork(self) -> None:
+        backend = backends.ClaudeBackend()
+        snapshot = {"task_id": "TASK-59", "target_repo_id": "TEST"}
+        worker_task = {
+            "prompt_body": "prompt body",
+            "worker_model": "claude-sonnet-4-6",
+            "db_path": "/tmp/test.db",
+        }
+
+        with (
+            mock.patch.object(backends.session_manager, "get_fork_args", return_value=None) as get_fork_args_mock,
+            mock.patch.object(backend, "_log_session_fork") as log_session_fork_mock,
+        ):
+            prompt_text, command, stdin_mode = backend.prepare(snapshot, worker_task, "run-1", Path("/tmp/result.json"))
+
+        self.assertEqual(prompt_text, "prompt body")
+        self.assertEqual(stdin_mode, subprocess.PIPE)
+        get_fork_args_mock.assert_called_once_with("TEST", Path("/tmp/test.db"))
+        log_session_fork_mock.assert_not_called()
+        self.assertNotIn("--resume", command[2])
+        self.assertNotIn("--fork-session", command[2])
+        self.assertEqual(worker_task["run_id"], "run-1")
+
     def test_claude_backend_log_session_fork_emits_stale_events(self) -> None:
         backend = backends.ClaudeBackend()
         conn = mock.Mock()
