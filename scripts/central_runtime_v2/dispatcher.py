@@ -657,7 +657,7 @@ class CentralDispatcher:
                 f"parked={snapshot['runtime_counts'].get('parked', 0)} "
                 f"review={snapshot['runtime_counts'].get('pending_review', 0)} "
                 f"failed={snapshot['actionable_failed']} "
-                f"mismatch={snapshot['mismatch_count']}"
+                f"mismatch={self._format_task_ids(snapshot['mismatch_ids'])}"
                 f"{backoff_str}"
                 f"{elapsed_str}"
             ),

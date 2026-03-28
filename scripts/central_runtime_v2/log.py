@@ -124,7 +124,7 @@ class DaemonLog:
                 + (f" next={self._style(next_task, self.GREEN)}" if next_task != '-' else "")
                 + (f" review={self._style(review, self.YELLOW)}" if review != '0' else "")
                 + (f" failed={self._style(failed, self.RED)}" if failed != '0' else "")
-                + (f" mismatch={self._style(mismatch, self.RED)}" if mismatch not in ('0', '-', '') else "")
+                + (f" mismatch={self._style(mismatch, self.RED)}" if mismatch not in ('0', '-', '', 'None') else "")
                 + (f" {self._style(f'({elapsed_ms}ms)', self.DIM)}" if elapsed_ms and elapsed_ms != '0' else "")
             )
         if message.startswith("worker_spawned "):
