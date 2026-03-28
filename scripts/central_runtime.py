@@ -927,6 +927,27 @@ class WorkerBackend(abc.ABC):
         """Return (prompt_text, command, stdin_mode) for subprocess.Popen."""
 
 
+def _build_dependency_context(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "task_id": dep.get("depends_on_task_id"),
+            "title": dep.get("depends_on_title"),
+            "summary": dep.get("depends_on_status"),
+            "decisions": "",
+            "blockers": "",
+            "validation": "",
+        }
+        for dep in snapshot.get("dependencies") or []
+    ]
+
+
+def _build_worker_prompt(snapshot: dict[str, Any], worker_task: dict[str, Any], run_id: str) -> str:
+    worker_task["run_id"] = run_id
+    autonomy_runner = load_autonomy_runner()
+    dependency_context = autonomy_runner.normalize_dependency_context(_build_dependency_context(snapshot))
+    return autonomy_runner.build_prompt(worker_task, dependency_context)
+
+
 class CodexBackend(WorkerBackend):
     def prepare(
         self,
@@ -935,24 +956,8 @@ class CodexBackend(WorkerBackend):
         run_id: str,
         result_path: Path,
     ) -> tuple[str, list[str], Any]:
-        worker_task["run_id"] = run_id
+        prompt_text = _build_worker_prompt(snapshot, worker_task, run_id)
         autonomy_runner = load_autonomy_runner()
-        prompt_text = autonomy_runner.build_prompt(
-            worker_task,
-            autonomy_runner.normalize_dependency_context(
-                [
-                    {
-                        "task_id": dep.get("depends_on_task_id"),
-                        "title": dep.get("depends_on_title"),
-                        "summary": dep.get("depends_on_status"),
-                        "decisions": "",
-                        "blockers": "",
-                        "validation": "",
-                    }
-                    for dep in snapshot.get("dependencies") or []
-                ]
-            ),
-        )
         command = autonomy_runner.build_codex_command(worker_task, result_path, AUTONOMY_SCHEMA_PATH)
         return prompt_text, command, subprocess.PIPE
 
