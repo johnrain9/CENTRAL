@@ -738,6 +738,76 @@ def duration_cost_over_time(
         })
     return result
 
+def weekly_quality_trend(
+    conn: sqlite3.Connection,
+    *,
+    weeks: int = 12,
+) -> list[dict[str, Any]]:
+    """Weekly first-pass rate and P50 duration trend, aggregated across all models.
+
+    Aggregates ``audit_pass_rate_over_time`` and ``duration_cost_over_time``
+    by ISO week, collapsing the per-model breakdown so each row represents a
+    single week.
+
+    Returns list of dicts sorted ascending by week with keys:
+        week (str, YYYY-WW), total_done (int), tasks_reworked (int),
+        first_pass_pct (float 0–100 or None), p50_duration_min (float or None).
+    Only weeks with at least one completed impl task are returned.
+    """
+    by_model_quality = audit_pass_rate_over_time(conn, weeks=weeks)
+    by_model_duration = duration_cost_over_time(conn, weeks=weeks)
+
+    # Aggregate quality by week
+    agg: dict[str, dict[str, Any]] = {}
+    for r in by_model_quality:
+        w = r["week"]
+        if w not in agg:
+            agg[w] = {"total_done": 0, "tasks_reworked": 0}
+        agg[w]["total_done"] += r["total_done"]
+        agg[w]["tasks_reworked"] += r["tasks_reworked"]
+
+    # Aggregate duration by week (weighted P50 approximation: collect all durations)
+    dur_by_week: dict[str, list[float]] = {}
+    dur_sql = """
+        SELECT
+            STRFTIME('%Y-%W', trs.finished_at) AS week,
+            trs.started_at,
+            trs.finished_at
+        FROM task_runtime_state trs
+        JOIN tasks t ON t.task_id = trs.task_id
+        WHERE trs.runtime_status = 'done'
+          AND t.task_id NOT LIKE '%-AUDIT'
+          AND t.task_type != 'audit'
+          AND trs.finished_at >= DATE('now', ?)
+          AND trs.started_at IS NOT NULL
+    """
+    for r in _rows(conn, dur_sql, (f"-{weeks * 7} days",)):
+        w = r["week"] or "unknown"
+        d = _duration_seconds(r["started_at"], r["finished_at"])
+        if d is not None and d >= 0:
+            dur_by_week.setdefault(w, []).append(d)
+
+    result = []
+    for week in sorted(agg.keys()):
+        total = agg[week]["total_done"]
+        reworked = agg[week]["tasks_reworked"]
+        fpp = round((total - reworked) / total * 100, 1) if total else None
+        durs = dur_by_week.get(week, [])
+        p25_s = _percentile(durs, 25) if durs else None
+        p50_s = _percentile(durs, 50) if durs else None
+        p75_s = _percentile(durs, 75) if durs else None
+        result.append({
+            "week": week,
+            "total_done": total,
+            "tasks_reworked": reworked,
+            "first_pass_pct": fpp,
+            "p25_duration_min": round(p25_s / 60, 1) if p25_s is not None else None,
+            "p50_duration_min": round(p50_s / 60, 1) if p50_s is not None else None,
+            "p75_duration_min": round(p75_s / 60, 1) if p75_s is not None else None,
+        })
+    return result
+
+
 def failure_mode_groups(
     conn: sqlite3.Connection,
     *,

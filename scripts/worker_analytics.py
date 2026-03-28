@@ -521,6 +521,40 @@ def print_report(report: dict) -> None:
         print()
 
 
+def _print_trend(rows: list[dict], *, weeks: int) -> None:
+    print(f"\n=== Weekly Quality Trend (last {weeks} weeks) ===")
+    print("  first-pass: zero audit-rework cycles (quota retries excluded)")
+    print("  duration: P50 (median); P25–P75 = IQR; includes inter-retry queue wait\n")
+    if not rows:
+        print("  (no data)")
+        return
+    print_table(
+        ["Week", "Done", "1st-pass%", "Reworked", "P25(m)", "P50(m)", "P75(m)"],
+        [
+            [
+                r["week"],
+                r["total_done"],
+                f"{r['first_pass_pct']}%" if r["first_pass_pct"] is not None else "—",
+                r["tasks_reworked"],
+                str(r["p25_duration_min"]) if r["p25_duration_min"] is not None else "—",
+                str(r["p50_duration_min"]) if r["p50_duration_min"] is not None else "—",
+                str(r["p75_duration_min"]) if r["p75_duration_min"] is not None else "—",
+            ]
+            for r in rows
+        ],
+        ["l", "r", "r", "r", "r", "r", "r"],
+    )
+    # Delta between first and last week
+    if len(rows) >= 2:
+        first = rows[0]
+        last = rows[-1]
+        if first["first_pass_pct"] is not None and last["first_pass_pct"] is not None:
+            delta = last["first_pass_pct"] - first["first_pass_pct"]
+            direction = "+" if delta >= 0 else ""
+            print(f"\n  Trend: {first['week']} → {last['week']}  first-pass {direction}{delta:.1f} pp")
+    print()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="worker_analytics.py",
@@ -540,6 +574,18 @@ def main() -> None:
         action="store_true",
         help="Remove the 7d default time filter from audit/slowest sections",
     )
+    parser.add_argument(
+        "--trend",
+        action="store_true",
+        help="Show weekly first-pass rate and duration trend (last 12 weeks)",
+    )
+    parser.add_argument(
+        "--trend-weeks",
+        type=int,
+        default=12,
+        metavar="N",
+        help="Number of weeks to include in --trend output (default: 12)",
+    )
     args = parser.parse_args()
 
     db_path = resolve_db(args.db_path)
@@ -547,11 +593,18 @@ def main() -> None:
     since = parse_since(args.since, all_time=args.all_time)
 
     try:
-        report = build_report(conn, db_path, repo=args.repo, model=args.model, since=since)
-        if args.json:
-            print(json.dumps(report, indent=2))
+        if args.trend:
+            trend = mq.weekly_quality_trend(conn, weeks=args.trend_weeks)
+            if args.json:
+                print(json.dumps(trend, indent=2))
+            else:
+                _print_trend(trend, weeks=args.trend_weeks)
         else:
-            print_report(report)
+            report = build_report(conn, db_path, repo=args.repo, model=args.model, since=since)
+            if args.json:
+                print(json.dumps(report, indent=2))
+            else:
+                print_report(report)
     finally:
         conn.close()
 
