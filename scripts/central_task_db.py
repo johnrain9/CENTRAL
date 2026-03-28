@@ -5655,7 +5655,7 @@ def _session_lock_allows_dispatch(
     """Return True if the task may be dispatched given current session locks.
 
     A task is blocked only when ALL of:
-    - The repo has ``session_resume_mode: true``
+    - The repo has ``session_persistence_enabled``
     - The task has a ``session_focus``
     - The task is not an audit
     - The (repo_id, focus) session is currently locked by another task
@@ -5663,7 +5663,7 @@ def _session_lock_allows_dispatch(
     if not session_locks:
         return True
     repo_meta = snapshot.get("repo_metadata") or {}
-    if not repo_meta.get("session_resume_mode"):
+    if not repo_meta.get("session_persistence_enabled"):
         return True
     task_focus = str((snapshot.get("metadata") or {}).get("session_focus") or "")
     if not task_focus:

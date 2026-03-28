@@ -1410,10 +1410,10 @@ class CentralDispatcher:
     # ------------------------------------------------------------------
 
     def _release_session_lock_if_held(self, state: ActiveWorker) -> None:
-        """Release the resume-in-place session lock if this worker held one."""
+        """Release the session lock if this worker held one."""
         repo_meta = state.task.get("repo_metadata") or {}
         task_focus = str((state.task.get("metadata") or {}).get("session_focus") or "")
-        if not repo_meta.get("session_resume_mode") or not task_focus:
+        if not repo_meta.get("session_persistence_enabled") or not task_focus:
             return
         task_id = state.task["task_id"]
         try:

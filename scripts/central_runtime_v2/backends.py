@@ -396,6 +396,29 @@ class CodexBackend(WorkerBackend):
             ),
         )
         command = autonomy_runner.build_codex_command(worker_task, result_path, AUTONOMY_SCHEMA_PATH)
+        # Session integration for Codex (currently stubbed — resume not yet verified)
+        session_focus = str((snapshot.get("metadata") or {}).get("session_focus") or "")
+        is_audit = str(snapshot.get("task_type") or "").strip().lower() == "audit"
+        if session_focus and not is_audit:
+            try:
+                fork_result = session_manager.get_session_args(
+                    snapshot["target_repo_id"],
+                    Path(worker_task.get("db_path") or DEFAULT_DB_PATH),
+                    focus=session_focus,
+                    backend="codex",
+                )
+                if fork_result:
+                    task_id = str(snapshot.get("task_id") or worker_task.get("task_id") or "")
+                    if task_id:
+                        session_manager.acquire_session_lock(
+                            snapshot["target_repo_id"],
+                            Path(worker_task.get("db_path") or DEFAULT_DB_PATH),
+                            task_id,
+                            focus=session_focus,
+                        )
+                    # TODO: integrate fork_result.args into codex command when resume is supported
+            except NotImplementedError:
+                pass  # Codex resume not yet supported — cold start
         return prompt_text, command, subprocess.PIPE
 
 
@@ -411,18 +434,18 @@ class ClaudeBackend(WorkerBackend):
         prompt_text = worker_task["prompt_body"]
         db_path = Path(worker_task.get("db_path") or DEFAULT_DB_PATH)
         session_focus = str((snapshot.get("metadata") or {}).get("session_focus") or "")
-        repo_meta = snapshot.get("repo_metadata") or {}
         is_audit = str(snapshot.get("task_type") or "").strip().lower() == "audit"
-        resume_mode = bool(repo_meta.get("session_resume_mode")) and bool(session_focus) and not is_audit
-        fork_result = session_manager.get_fork_args(
-            snapshot["target_repo_id"], db_path, focus=session_focus, resume_mode=resume_mode,
-        )
-        if fork_result and resume_mode:
-            task_id = str(snapshot.get("task_id") or worker_task.get("task_id") or "")
-            if task_id:
-                session_manager.acquire_session_lock(
-                    snapshot["target_repo_id"], db_path, task_id, focus=session_focus,
-                )
+        fork_result = None
+        if session_focus and not is_audit:
+            fork_result = session_manager.get_session_args(
+                snapshot["target_repo_id"], db_path, focus=session_focus, backend="claude",
+            )
+            if fork_result:
+                task_id = str(snapshot.get("task_id") or worker_task.get("task_id") or "")
+                if task_id:
+                    session_manager.acquire_session_lock(
+                        snapshot["target_repo_id"], db_path, task_id, focus=session_focus,
+                    )
         command = build_claude_command(
             worker_task,
             result_path,
