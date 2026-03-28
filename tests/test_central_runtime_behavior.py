@@ -30,6 +30,18 @@ class CentralRuntimeBehaviorTest(unittest.TestCase):
         self.assertIn("sess-123", script)
         self.assertIn("--fork-session", script)
 
+    def test_build_claude_command_omits_session_fork_flags_when_extra_args_none(self) -> None:
+        command = central_runtime.build_claude_command(
+            {"task_id": "CENTRAL-OPS-171", "run_id": "run-171"},
+            Path("/tmp/result.json"),
+            model="claude-sonnet-4-6",
+            extra_args=None,
+        )
+
+        script = command[2]
+        self.assertNotIn("--resume", script)
+        self.assertNotIn("--fork-session", script)
+
     def test_claude_backend_prepare_uses_session_fork_args_and_logs(self) -> None:
         backend = central_runtime.ClaudeBackend()
         snapshot = {"task_id": "CENTRAL-OPS-171", "target_repo_id": "TEST", "dependencies": []}
