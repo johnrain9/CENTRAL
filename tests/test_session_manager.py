@@ -357,6 +357,30 @@ class SessionManagerTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(stale_count["count"], 0)
 
+    def test_refresh_session_preserves_existing_fallbacks_when_seed_fails(self) -> None:
+        self._insert_session(session_id="active-1", status="active")
+        self._insert_session(session_id="stale-1", status="stale")
+        completed = subprocess.CompletedProcess(args=["claude"], returncode=1, stdout="", stderr="seed failed")
+
+        with patch.object(session_manager, "uuid4", return_value="fresh"), patch.object(
+            session_manager.subprocess, "run", return_value=completed
+        ):
+            with self.assertRaisesRegex(RuntimeError, "seed failed"):
+                session_manager.refresh_session("TEST", self.db_path)
+
+        rows = self.conn.execute(
+            "SELECT session_id, status FROM session_registry ORDER BY session_id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["session_id"], row["status"]) for row in rows],
+            [("active-1", "stale"), ("stale-1", "stale")],
+        )
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS count FROM session_registry WHERE session_id = ?",
+            ("fresh",),
+        ).fetchone()
+        self.assertEqual(count["count"], 0)
+
     def test_list_sessions_filters_by_repo(self) -> None:
         self._insert_session(session_id="one")
         rows = session_manager.list_sessions(self.db_path, repo_id="TEST")

@@ -235,7 +235,13 @@ def _extract_context_tokens(completed: subprocess.CompletedProcess[str]) -> int 
     return None
 
 
-def seed_session(repo_id: str, db_path: Path, model: str = DEFAULT_SEED_MODEL, prompt_file: str | None = None) -> str:
+def seed_session(
+    repo_id: str,
+    db_path: Path,
+    model: str = DEFAULT_SEED_MODEL,
+    prompt_file: str | None = None,
+    retire_statuses: tuple[str, ...] = ("active", "stale"),
+) -> str:
     conn = connect(db_path)
     try:
         if not _table_exists(conn, "session_registry"):
@@ -305,15 +311,17 @@ def seed_session(repo_id: str, db_path: Path, model: str = DEFAULT_SEED_MODEL, p
         context_tokens = _extract_context_tokens(completed)
         completed_at = _utc_now_text()
         with conn:
-            conn.execute(
-                """
-                UPDATE session_registry
-                SET status = 'retired',
-                    updated_at = ?
-                WHERE repo_id = ? AND session_id != ? AND status IN ('active', 'stale')
-                """,
-                (completed_at, repo_id, session_id),
-            )
+            if retire_statuses:
+                placeholders = ", ".join("?" for _ in retire_statuses)
+                conn.execute(
+                    f"""
+                    UPDATE session_registry
+                    SET status = 'retired',
+                        updated_at = ?
+                    WHERE repo_id = ? AND session_id != ? AND status IN ({placeholders})
+                    """,
+                    (completed_at, repo_id, session_id, *retire_statuses),
+                )
             conn.execute(
                 """
                 UPDATE session_registry
@@ -340,15 +348,6 @@ def refresh_session(repo_id: str, db_path: Path, model: str = DEFAULT_SEED_MODEL
             conn.execute(
                 """
                 UPDATE session_registry
-                SET status = 'retired',
-                    updated_at = ?
-                WHERE repo_id = ? AND status = 'stale'
-                """,
-                (retired_at, repo_id),
-            )
-            conn.execute(
-                """
-                UPDATE session_registry
                 SET status = 'stale',
                     updated_at = ?
                 WHERE repo_id = ? AND status = 'active'
@@ -357,7 +356,13 @@ def refresh_session(repo_id: str, db_path: Path, model: str = DEFAULT_SEED_MODEL
             )
     finally:
         conn.close()
-    return seed_session(repo_id, db_path, model=model, prompt_file=prompt_file)
+    return seed_session(
+        repo_id,
+        db_path,
+        model=model,
+        prompt_file=prompt_file,
+        retire_statuses=("stale",),
+    )
 
 
 def list_sessions(db_path: Path, repo_id: str | None = None) -> list[dict[str, Any]]:
