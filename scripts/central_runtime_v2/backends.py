@@ -396,19 +396,26 @@ class CodexBackend(WorkerBackend):
             ),
         )
         command = autonomy_runner.build_codex_command(worker_task, result_path, AUTONOMY_SCHEMA_PATH)
-        # Session integration for Codex (currently stubbed — resume not yet verified)
+        # Session integration: replace `codex exec` with `codex exec resume SESSION_ID`
         session_focus = str((snapshot.get("metadata") or {}).get("session_focus") or "")
         is_audit = str(snapshot.get("task_type") or "").strip().lower() == "audit"
         if session_focus and not is_audit:
-            try:
-                fork_result = session_manager.get_session_args(
-                    snapshot["target_repo_id"],
-                    Path(worker_task.get("db_path") or DEFAULT_DB_PATH),
-                    focus=session_focus,
-                    backend="codex",
+            fork_result = session_manager.get_session_args(
+                snapshot["target_repo_id"],
+                Path(worker_task.get("db_path") or DEFAULT_DB_PATH),
+                focus=session_focus,
+                backend="codex",
+            )
+            if fork_result:
+                task_id = str(snapshot.get("task_id") or worker_task.get("task_id") or "")
+                adapter = session_manager.get_adapter("codex")
+                resume_cmd = adapter.build_resume_command(
+                    session_id=fork_result.session_id,
+                    worker_task=worker_task,
+                    result_path=result_path,
                 )
-                if fork_result:
-                    task_id = str(snapshot.get("task_id") or worker_task.get("task_id") or "")
+                if resume_cmd is not None:
+                    command = resume_cmd
                     if task_id:
                         session_manager.acquire_session_lock(
                             snapshot["target_repo_id"],
@@ -416,9 +423,6 @@ class CodexBackend(WorkerBackend):
                             task_id,
                             focus=session_focus,
                         )
-                    # TODO: integrate fork_result.args into codex command when resume is supported
-            except NotImplementedError:
-                pass  # Codex resume not yet supported — cold start
         return prompt_text, command, subprocess.PIPE
 
 

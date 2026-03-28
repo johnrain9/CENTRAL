@@ -85,6 +85,20 @@ class SessionAdapter(ABC):
         """Whether the CLI accepts a caller-supplied session UUID for seeding."""
         return True
 
+    def build_resume_command(
+        self,
+        *,
+        session_id: str,
+        worker_task: dict[str, Any],
+        result_path: Path,
+    ) -> list[str] | None:
+        """Return a full CLI command for resuming a session, or None to use resume_extra_args.
+
+        Override when the backend uses a subcommand (e.g. ``codex exec resume``) rather
+        than extra flags appended to an otherwise unchanged base command.
+        """
+        return None
+
 
 class ClaudeAdapter(SessionAdapter):
     """Claude Code CLI session adapter."""
@@ -151,7 +165,7 @@ class ClaudeAdapter(SessionAdapter):
 
 
 class CodexAdapter(SessionAdapter):
-    """Codex CLI session adapter (stub — resume integration pending CLI verification)."""
+    """Codex CLI session adapter."""
 
     name = "codex"
     _SESSIONS_DIR = Path.home() / ".codex" / "sessions"
@@ -159,23 +173,21 @@ class CodexAdapter(SessionAdapter):
     def build_seed_command(
         self, *, session_id: str, model: str, repo_root: Path, session_name: str,
     ) -> list[str]:
-        # Codex doesn't support --session-id; we run `codex exec` and capture
-        # the session ID from output.
+        # Codex doesn't support --session-id; we run `codex exec --json` and parse
+        # the actual session ID from the session_meta JSONL event in output.
         return [
             "codex", "-a", "never", "exec", "-C", str(repo_root),
-            "--model", model, "--sandbox", "danger-full-access",
+            "--model", model, "--sandbox", "danger-full-access", "--json",
         ]
 
     def build_seed_env(self) -> dict[str, str]:
         return dict(os.environ)
 
     def resume_extra_args(self, session_id: str) -> list[str]:
-        # TODO: `codex resume UUID` is a subcommand, not a flag on `codex exec`.
-        # Need to verify it supports --json / --output-schema / -o for structured output.
-        raise NotImplementedError(
-            "Codex session resume not yet supported — pending verification that "
-            "`codex resume UUID` supports structured output flags (--json, -o)"
-        )
+        # Codex resume uses `codex exec resume SESSION_ID` (a subcommand, not flags).
+        # Return [] so get_session_args() can return a SessionResult; callers should
+        # use build_resume_command() to get the full replacement command.
+        return []
 
     def validate_session(self, session_id: str, repo_root: Path | None) -> bool:
         # Codex sessions live in ~/.codex/sessions/YYYY/MM/DD/rollout-*-UUID.jsonl
@@ -190,8 +202,51 @@ class CodexAdapter(SessionAdapter):
     def extract_context_tokens(self, completed: subprocess.CompletedProcess[str]) -> int | None:
         return None  # Codex doesn't expose token usage in the same format
 
+    def extract_session_id(self, completed: subprocess.CompletedProcess[str], pre_assigned: str) -> str:
+        """Parse the actual session ID from the ``session_meta`` event in codex exec --json output."""
+        for stream in (completed.stdout, completed.stderr):
+            if not stream:
+                continue
+            for line in stream.splitlines():
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("type") == "session_meta":
+                    parsed_id = (payload.get("payload") or {}).get("id")
+                    if parsed_id:
+                        return str(parsed_id)
+        return pre_assigned  # Fallback if event not found
+
     def supports_pre_assigned_session_id(self) -> bool:
         return False  # `codex exec` doesn't accept --session-id
+
+    def build_resume_command(
+        self,
+        *,
+        session_id: str,
+        worker_task: dict[str, Any],
+        result_path: Path,
+    ) -> list[str] | None:
+        """Build ``codex exec resume SESSION_ID ...`` for non-interactive session resumption.
+
+        Note: ``codex exec resume`` supports ``--json`` and ``-o`` but not ``--output-schema``
+        or ``--sandbox``.  Use ``--dangerously-bypass-approvals-and-sandbox`` instead.
+        Structured output relies on the worker prompt rather than schema enforcement.
+        """
+        model = str(worker_task.get("codex_model") or worker_task.get("worker_model") or "")
+        effort = str(worker_task.get("codex_effort") or "medium")
+        command: list[str] = ["codex", "exec", "resume", session_id]
+        if model:
+            command.extend(["-m", model])
+        command.extend([
+            "-c", f'model_reasoning_effort="{effort}"',
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--json",
+            "-o", str(result_path),
+            "-",
+        ])
+        return command
 
 
 # ---------------------------------------------------------------------------
