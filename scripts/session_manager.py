@@ -91,23 +91,70 @@ def validate_session(session_id: str, repo_root: str | Path | None = None) -> bo
     return False
 
 
-def _default_seed_prompt(repo_name: str) -> str:
-    return (
+def _default_seed_prompt(repo_name: str, focus: str = "") -> str:
+    preamble = (
         f"You are being initialized as a persistent base session for the {repo_name} repository.\n"
         "Your goal is to build a deep understanding of this codebase that will be inherited by\n"
-        "future task workers via session forking.\n\n"
+        "future task workers via session forking. Do NOT make any changes to files.\n"
+        "This is a read-only exploration session.\n\n"
+    )
+    if focus == "frontend":
+        return preamble + (
+            "Focus exclusively on the FRONTEND codebase.\n\n"
+            "Please do the following:\n"
+            "1. Read AI_GUIDE.md if it exists at the repo root.\n"
+            "2. Locate the frontend source tree (e.g. src/ui/, frontend/, web/, app/ or similar).\n"
+            "3. Read the entry point (e.g. main.tsx, index.tsx, App.tsx) and trace the top-level component tree.\n"
+            "4. Understand the routing approach (React Router, file-based, etc.) and the main page/view structure.\n"
+            "5. Identify the state management strategy (Redux, Zustand, Context, signals, etc.).\n"
+            "6. Find how the frontend calls the backend — API client, fetch wrappers, generated clients, WebSockets.\n"
+            "7. Note the styling approach (CSS modules, Tailwind, styled-components, etc.).\n"
+            "8. Understand the test infrastructure: runner (Vitest, Jest), component testing patterns, E2E (Playwright, Cypress).\n"
+            "9. Note any patterns, conventions, or gotchas a worker touching UI code should know.\n"
+            "10. Summarize your understanding in a structured format.\n"
+        )
+    if focus == "backend":
+        return preamble + (
+            "Focus exclusively on the BACKEND codebase.\n\n"
+            "Please do the following:\n"
+            "1. Read AI_GUIDE.md if it exists at the repo root.\n"
+            "2. Locate the backend source tree (e.g. src/, lib/, server/, crates/ or similar).\n"
+            "3. Read the main entry point and understand how the application starts.\n"
+            "4. Map the top-level module structure and identify the key domains/subsystems.\n"
+            "5. Understand the HTTP layer: router, handler patterns, middleware, request/response types.\n"
+            "6. Identify the data layer: database client, ORM/query builder, migration strategy, key models.\n"
+            "7. Understand the async runtime and concurrency model (if applicable).\n"
+            "8. Note the test infrastructure: unit test conventions, integration test patterns, fixtures, mocks.\n"
+            "9. Note any patterns, conventions, or gotchas a worker touching backend code should know.\n"
+            "10. Summarize your understanding in a structured format.\n"
+        )
+    # Generic / 'other' / unfocused
+    return preamble + (
         "Please do the following:\n"
         "1. Read AI_GUIDE.md if it exists at the repo root.\n"
         "2. Explore the top-level directory structure and identify key modules.\n"
         "3. Read the main entry points and understand the application architecture.\n"
         "4. Identify the test infrastructure (test runner, fixture patterns, mock strategies).\n"
         "5. Note any patterns, conventions, or gotchas that a worker should know.\n"
-        "6. Summarize your understanding in a structured format.\n\n"
-        "Do NOT make any changes to files. This is a read-only exploration session.\n"
+        "6. Summarize your understanding in a structured format.\n"
     )
 
 
-def _resolve_prompt(repo_row: sqlite3.Row, meta: dict[str, Any], prompt_file: str | None) -> tuple[str, Path | None]:
+def _resolve_prompt(
+    repo_row: sqlite3.Row,
+    meta: dict[str, Any],
+    prompt_file: str | None,
+    focus: str = "",
+) -> tuple[str, Path | None]:
+    """Resolve the seed prompt text and its source path (for hash tracking).
+
+    Resolution order:
+    1. Explicit ``--prompt-file`` CLI argument (always wins).
+    2. Per-focus file from ``session_seed_prompt_files`` dict in repo metadata
+       (e.g. ``{"frontend": "docs/seeds/frontend.md", "backend": "docs/seeds/backend.md"}``).
+    3. Legacy single-file ``session_seed_prompt_file`` in repo metadata (unfocused only).
+    4. Built-in default prompt for the given focus.
+    """
     repo_root = Path(str(repo_row["repo_root"])).expanduser().resolve()
     prompt_path: Path | None = None
     if prompt_file:
@@ -115,23 +162,34 @@ def _resolve_prompt(repo_row: sqlite3.Row, meta: dict[str, Any], prompt_file: st
         if not prompt_path.is_absolute():
             prompt_path = (repo_root / prompt_path).resolve()
         return prompt_path.read_text(encoding="utf-8"), prompt_path
-    meta_prompt = meta.get("session_seed_prompt_file")
-    if isinstance(meta_prompt, str) and meta_prompt.strip():
-        prompt_path = (repo_root / meta_prompt).resolve()
+    # Per-focus prompt files dict in repo metadata
+    focus_prompts = meta.get("session_seed_prompt_files")
+    if isinstance(focus_prompts, dict) and focus and focus in focus_prompts:
+        prompt_path = (repo_root / str(focus_prompts[focus])).resolve()
         return prompt_path.read_text(encoding="utf-8"), prompt_path
+    # Legacy single-file config (unfocused fallback)
+    if not focus:
+        meta_prompt = meta.get("session_seed_prompt_file")
+        if isinstance(meta_prompt, str) and meta_prompt.strip():
+            prompt_path = (repo_root / meta_prompt).resolve()
+            return prompt_path.read_text(encoding="utf-8"), prompt_path
     repo_name = str(repo_row["display_name"] or repo_row["repo_id"])
-    return _default_seed_prompt(repo_name), None
+    return _default_seed_prompt(repo_name, focus), None
 
 
-def _current_prompt_hash(repo_row: sqlite3.Row, meta: dict[str, Any]) -> str | None:
+def _current_prompt_hash(repo_row: sqlite3.Row, meta: dict[str, Any], focus: str = "") -> str | None:
     try:
-        prompt_text, _ = _resolve_prompt(repo_row, meta, None)
+        prompt_text, _ = _resolve_prompt(repo_row, meta, None, focus=focus)
     except OSError:
         return None
     return sha256(prompt_text.encode("utf-8")).hexdigest()
 
 
-def _stale_reason(row: sqlite3.Row | dict[str, Any], meta: dict[str, Any], repo_row: sqlite3.Row) -> str | None:
+def _stale_reason(
+    row: sqlite3.Row | dict[str, Any],
+    meta: dict[str, Any],
+    repo_row: sqlite3.Row,
+) -> str | None:
     refresh_after_forks = int(meta.get("session_refresh_after_forks", DEFAULT_REFRESH_AFTER_FORKS) or DEFAULT_REFRESH_AFTER_FORKS)
     refresh_after_hours = int(meta.get("session_refresh_after_hours", DEFAULT_REFRESH_AFTER_HOURS) or DEFAULT_REFRESH_AFTER_HOURS)
     if int(row["fork_count"] or 0) >= refresh_after_forks:
@@ -139,7 +197,8 @@ def _stale_reason(row: sqlite3.Row | dict[str, Any], meta: dict[str, Any], repo_
     completed_at = _parse_timestamp(str(row["seed_completed_at"] or ""))
     if completed_at is not None and _utc_now() - completed_at > timedelta(hours=refresh_after_hours):
         return f"age_exceeded({refresh_after_hours}h)"
-    current_prompt_hash = _current_prompt_hash(repo_row, meta)
+    focus = str(row["focus"]) if "focus" in row.keys() else ""
+    current_prompt_hash = _current_prompt_hash(repo_row, meta, focus=focus)
     if row["seed_prompt_hash"] and current_prompt_hash is None:
         return "prompt_hash_unavailable"
     if row["seed_prompt_hash"] and str(row["seed_prompt_hash"]) != current_prompt_hash:
@@ -268,7 +327,7 @@ def seed_session(
         if loaded is None:
             raise RuntimeError(f"unknown repo: {repo_id}")
         repo_row, meta = loaded
-        prompt_text, resolved_prompt_path = _resolve_prompt(repo_row, meta, prompt_file)
+        prompt_text, resolved_prompt_path = _resolve_prompt(repo_row, meta, prompt_file, focus=focus)
         session_id = str(uuid4())
         repo_root = Path(str(repo_row["repo_root"])).expanduser().resolve()
         focus_suffix = f"-{focus}" if focus else ""
