@@ -456,12 +456,12 @@ def get_session_args(repo_id: str, db_path: Path, focus: str = "", backend: str 
                 SELECT session_id, status, fork_count, seed_completed_at,
                        seed_prompt_hash, context_tokens, seed_cwd
                 FROM session_registry
-                WHERE repo_id = ? AND focus = ?
+                WHERE repo_id = ? AND focus = ? AND seed_backend = ?
                   AND status IN ('active', 'stale') AND seed_completed_at IS NOT NULL
                 ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,
                          seed_completed_at DESC, registry_id DESC
                 """,
-                (repo_id, candidate_focus),
+                (repo_id, candidate_focus, backend),
             ).fetchall()
             for row in rows:
                 if not adapter.validate_session(str(row["session_id"]), repo_root=Path(str(row["seed_cwd"]))):
@@ -648,13 +648,13 @@ def seed_session(
                 """
                 INSERT INTO session_registry (
                     repo_id, session_id, session_name, status, seed_model,
-                    seed_cwd, seed_prompt_hash, focus, notes, created_at, updated_at
+                    seed_cwd, seed_prompt_hash, focus, seed_backend, notes, created_at, updated_at
                 )
-                VALUES (?, ?, ?, 'seeding', ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, 'seeding', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     repo_id, session_id, session_name, model, str(repo_root),
-                    sha256(prompt_text.encode("utf-8")).hexdigest(), focus, notes,
+                    sha256(prompt_text.encode("utf-8")).hexdigest(), focus, backend, notes,
                     _utc_now_text(), _utc_now_text(),
                 ),
             )
