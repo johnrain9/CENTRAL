@@ -454,7 +454,7 @@ def get_session_args(repo_id: str, db_path: Path, focus: str = "", backend: str 
             rows = conn.execute(
                 """
                 SELECT session_id, status, fork_count, seed_completed_at,
-                       seed_prompt_hash, context_tokens, seed_cwd
+                       seed_prompt_hash, context_tokens, seed_cwd, focus
                 FROM session_registry
                 WHERE repo_id = ? AND focus = ? AND seed_backend = ?
                   AND status IN ('active', 'stale') AND seed_completed_at IS NOT NULL
