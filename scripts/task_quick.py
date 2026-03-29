@@ -466,6 +466,8 @@ def create_task(args: argparse.Namespace) -> None:
         if args.remote:
             scaffold_metadata["remote"] = True
             scaffold_metadata["remote_only"] = True
+        if args.session_focus:
+            scaffold_metadata["session_focus"] = args.session_focus
         scaffold_metadata["audit_required"] = tpl["audit_required"]
         scaffold["metadata"] = scaffold_metadata
         is_platform_repo = (args.repo in PLATFORM_REPOS)
@@ -593,6 +595,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--worker-model", default=None,
                    help="Override the worker model for this task (e.g. 'gemini-3-pro-preview')")
     p.add_argument("--remote", action="store_true", help="Route task to remote workers only")
+    p.add_argument("--session-focus", default=None, choices=["frontend", "backend", "other"],
+                   help="Route task to a session-persistent worker with the given focus (requires session_persistence_enabled on the repo)")
     p.add_argument("--effort", default=None, choices=["low", "medium", "high", "max"],
                    help="Reasoning effort level for this task (applies to codex and claude backends)")
     p.add_argument("--dry-run", action="store_true", help="Run scaffold + preflight and validate, then exit without writing task.")
