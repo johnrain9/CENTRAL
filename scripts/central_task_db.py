@@ -3626,6 +3626,10 @@ def detect_status_mismatch(
         # awaiting_audit is a valid terminal planner state when the task has a paired audit child
         if planner_status == "awaiting_audit" and metadata and metadata.get("child_audit_task_id"):
             return None
+        # failed is a valid terminal planner state — the planner deliberately closed the task
+        # (e.g. max rework retries exhausted via planner.task_failed_by_audit)
+        if planner_status == "failed":
+            return None
         severity = "warning" if planner_status in AUTO_RECONCILE_PLANNER_STATUSES else "error"
         return {
             "task_id": task_id,
