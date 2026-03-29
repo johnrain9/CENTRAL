@@ -839,14 +839,13 @@ class CentralDispatcher:
             self._close_worker_state(state)
             raise
 
-        _spawn_focus = str((snapshot.get("metadata") or {}).get("session_focus") or "")
+        _spawn_focus = str((snapshot.get("metadata") or {}).get("session_focus") or "none")
         log_parts = [
             f"worker_spawned task={snapshot['task_id']} run={run_id} pid={proc.pid} mode={effective_backend}{_title_kv(snapshot)}",
             f"model={worker_task.get('worker_model', '-')}",
             f"model_source={worker_task.get('worker_model_source', '-')}",
+            f"focus={_spawn_focus}",
         ]
-        if _spawn_focus:
-            log_parts.append(f"focus={_spawn_focus}")
         if self.config.audit_worker_model:
             log_parts.append(f"impl_model={self.config.default_worker_model}")
             log_parts.append(f"audit_model={self.config.audit_worker_model}")
@@ -1568,12 +1567,11 @@ class CentralDispatcher:
 
             if extra_artifacts:
                 add_artifacts(task_id, extra_artifacts, self.config.db_path)
-            _finish_focus = str((state.task.get("metadata") or {}).get("session_focus") or "")
-            _focus_kv = f" focus={_finish_focus}" if _finish_focus else ""
+            _finish_focus = str((state.task.get("metadata") or {}).get("session_focus") or "none")
             self.logger.emit(
                 "INF",
                 "central.dispatcher",
-                f"worker_finished task={task_id} run={state.run_id} runtime_status={runtime_status}{_focus_kv}{_title_kv(state.task)}",
+                f"worker_finished task={task_id} run={state.run_id} runtime_status={runtime_status} focus={_finish_focus}{_title_kv(state.task)}",
             )
         finally:
             self._release_session_lock_if_held(state)
