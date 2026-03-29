@@ -20,6 +20,26 @@ repo=CENTRAL do task <task_id>
 - Refresh generated summary views second.
 - Update repo-local mirrors only if those mirrors are still intentionally maintained.
 
+## Session Routing (ecosystem)
+
+`ecosystem` has `session_persistence_enabled`. Tasks with `session_focus` in metadata route to a
+session-persistent worker (resumes an experienced base session instead of cold-starting).
+
+**Always set `--session-focus` for ecosystem implementation tasks:**
+
+```bash
+# Backend: Rust, API, DB, services
+python3 scripts/task_quick.py --title "..." --repo ecosystem --series ECO --session-focus backend
+
+# Frontend: UI, components, React
+python3 scripts/task_quick.py --title "..." --repo ecosystem --series ECO --session-focus frontend
+```
+
+Rules:
+- Audit tasks: **never** set `--session-focus` (audits always cold-start)
+- CENTRAL / Dispatcher tasks: never set `--session-focus`
+- Other repos: no sessions seeded yet — omit flag
+
 ## Quick Replan Prompts
 - "List all blocked CENTRAL tasks and propose unblockers."
 - "Select one unblocked high-priority CENTRAL task per target repo and dispatch."
