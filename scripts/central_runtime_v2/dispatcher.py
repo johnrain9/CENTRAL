@@ -1083,13 +1083,15 @@ class CentralDispatcher:
         if _shutil.which("terminal-notifier"):
             cmd = ["terminal-notifier", "-title", notif_title, "-message", body, "-sound", sound, "-open", open_url]
             _subprocess.run(cmd, check=False)
-        else:
+        elif _shutil.which("osascript"):
             body_esc = body.replace('"', '\\"')
             title_esc = notif_title.replace('"', '\\"')
             _subprocess.run(
                 ["osascript", "-e", f'display notification "{body_esc}" with title "{title_esc}" sound name "{sound}"'],
                 check=False,
             )
+        elif _shutil.which("notify-send"):
+            _subprocess.run(["notify-send", notif_title, body], check=False)
 
     # ------------------------------------------------------------------
     # _finalize_worker helpers
