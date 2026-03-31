@@ -39,6 +39,7 @@ TEMPLATES = {
     "feature": {
         "task_type": "feature",
         "priority": 50,
+        "schedule": "backlog",
         "audit_required": True,
         "objective": "Implement the described feature with clean, tested code.",
         "context": "Feature requested via CENTRAL task system. See title and scope for specifics. An auditor will review your implementation for correctness and style.",
@@ -51,6 +52,7 @@ TEMPLATES = {
     "bugfix": {
         "task_type": "bugfix",
         "priority": 70,
+        "schedule": "anytime",
         "audit_required": True,
         "objective": "Diagnose and fix the described bug with a targeted, minimal change.",
         "context": "Bug reported via CENTRAL task system. See title for the symptom. An auditor will review your fix for correctness and minimal blast radius.",
@@ -63,6 +65,7 @@ TEMPLATES = {
     "refactor": {
         "task_type": "refactor",
         "priority": 40,
+        "schedule": "backlog",
         "audit_required": True,
         "objective": "Improve the structure, readability, or performance of the targeted code without changing external behavior.",
         "context": "Refactor requested via CENTRAL task system. See title and scope for the target area. An auditor will verify behavior is preserved.",
@@ -75,6 +78,7 @@ TEMPLATES = {
     "infrastructure": {
         "task_type": "infrastructure",
         "priority": 60,
+        "schedule": "backlog",
         "audit_required": True,
         "objective": "Implement or improve the described infrastructure, tooling, or configuration.",
         "context": "Infrastructure task dispatched via CENTRAL. See title and scope for specifics. An auditor will verify the change works and doesn't break existing workflows.",
@@ -87,6 +91,7 @@ TEMPLATES = {
     "design": {
         "task_type": "design",
         "priority": 30,
+        "schedule": "backlog",
         "audit_required": False,
         "objective": "Produce a design brief or architecture decision that unblocks downstream implementation tasks.",
         "context": "Design task dispatched via CENTRAL. Output is a document or structured spec, not running code. For LLDs: follow docs/lld_worker_guidelines.md — especially §1.3 (forced decisions), §3 (trace before fixing), §5 (follow-on task table and task creation). For HLDs: follow docs/hld_worker_guidelines.md — especially §1.3 (forced decisions), §5 (required LLD table and LLD task creation).",
@@ -99,6 +104,7 @@ TEMPLATES = {
     "docs": {
         "task_type": "docs",
         "priority": 35,
+        "schedule": "backlog",
         "audit_required": False,
         "objective": "Create or update documentation so that the described system is clearly understood by AI and human readers.",
         "context": "Docs task dispatched via CENTRAL. See title and scope for the target artifact. Documentation is consumed by both AI workers (who read AI_GUIDE.md, AI_UI_GUIDE.md) and human operators — ensure it is accurate and actionable for both audiences.",
@@ -111,6 +117,7 @@ TEMPLATES = {
     "repo-health": {
         "task_type": "repo-health",
         "priority": 55,
+        "schedule": "backlog",
         "audit_required": True,
         "objective": "Implement or update a repo health adapter so the repo reports status correctly to the CENTRAL health system.",
         "context": "Repo health task dispatched via CENTRAL. See docs/repo_health_adapter_contract.md for the contract.",
@@ -123,6 +130,7 @@ TEMPLATES = {
     "validation": {
         "task_type": "validation",
         "priority": 65,
+        "schedule": "anytime",
         "audit_required": False,
         "objective": "Validate that the described system or feature meets its acceptance criteria in a real environment. Do NOT make code changes or create follow-on tasks.",
         "context": "Validation task dispatched via CENTRAL. See title and scope for the target system. An L2 lieutenant or operator will review your results and decide on next actions.",
@@ -135,6 +143,7 @@ TEMPLATES = {
     "cleanup": {
         "task_type": "cleanup",
         "priority": 45,
+        "schedule": "backlog",
         "audit_required": False,
         "objective": "Remove dead code, deprecated layers, or unused artifacts that add confusion without value.",
         "context": "Cleanup task dispatched via CENTRAL. See title and scope for what to remove. L2 gates will verify the build still passes after cleanup.",
@@ -147,6 +156,7 @@ TEMPLATES = {
     "planner-ops": {
         "task_type": "planner-ops",
         "priority": 50,
+        "schedule": "backlog",
         "audit_required": True,
         "objective": "Implement or improve CENTRAL planner tooling, workflow scripts, or dispatch infrastructure.",
         "context": "Planner-ops task dispatched via CENTRAL. Target repo is CENTRAL unless otherwise specified. An auditor will verify the change works and existing workflows are intact. The operator and L3 chief of staff consume planner tooling — changes affect how work flows through the system.",
@@ -160,6 +170,7 @@ TEMPLATES = {
         "task_type": "investigation",
         "task_kind": "read_only",
         "priority": 55,
+        "schedule": "anytime",
         "audit_required": False,
         "objective": "Investigate the described problem, diagnose root causes, and produce a structured findings report. Do NOT make code changes or create follow-on tasks.",
         "context": "Investigation task dispatched via CENTRAL. An L2 lieutenant or operator will review your findings and decide on next actions. Your job is accurate diagnosis, not fixing. Before investigating, load project context: read AI_GUIDE.md and AI_UI_GUIDE.md in the repo root for architecture and conventions. For frontend investigations, also read the relevant LLD docs under docs/design/lld/. Use git log and git blame to understand recent changes to the area under investigation. Check for worker summaries in .task-context/ if present.",
@@ -468,6 +479,9 @@ def create_task(args: argparse.Namespace) -> None:
             scaffold_metadata["remote_only"] = True
         if args.session_focus:
             scaffold_metadata["session_focus"] = args.session_focus
+        schedule = args.schedule or tpl.get("schedule", "backlog")
+        if schedule != "anytime":
+            scaffold_metadata["schedule"] = schedule
         scaffold_metadata["audit_required"] = tpl["audit_required"]
         scaffold["metadata"] = scaffold_metadata
         is_platform_repo = (args.repo in PLATFORM_REPOS)
@@ -597,6 +611,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--remote", action="store_true", help="Route task to remote workers only")
     p.add_argument("--session-focus", default=None, choices=["frontend", "backend", "other"],
                    help="Route task to a session-persistent worker with the given focus (requires session_persistence_enabled on the repo)")
+    p.add_argument("--schedule", default=None, choices=["backlog", "anytime"],
+                   help="Dispatch schedule: backlog (time-gated) or anytime (default: from template)")
     p.add_argument("--effort", default=None, choices=["low", "medium", "high", "max"],
                    help="Reasoning effort level for this task (applies to codex and claude backends)")
     p.add_argument("--dry-run", action="store_true", help="Run scaffold + preflight and validate, then exit without writing task.")

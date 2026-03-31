@@ -138,6 +138,8 @@ def status_payload(db_path: Path, paths) -> dict[str, Any]:
         "eligible_count": eligible,
         "runtime_counts": runtime_counts,
         "lock_payload": payload,
+        "backlog_window_open": task_db.is_backlog_window_open(),
+        "schedule_timezone": task_db._SCHEDULE_TIMEZONE,
     }
 
 

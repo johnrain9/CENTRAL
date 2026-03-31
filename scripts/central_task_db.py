@@ -3846,6 +3846,39 @@ def _is_remote_only_task(snapshot: dict[str, Any]) -> bool:
     return False
 
 
+# --- Backlog schedule gating ------------------------------------------------
+
+_BACKLOG_WEEKDAY_HOURS: list[tuple[int, int]] = [(10, 16)]   # Mon-Fri 10am-4pm
+_BACKLOG_DAILY_HOURS: list[tuple[int, int]] = [(0, 7)]       # every day midnight-7am
+_SCHEDULE_TIMEZONE: str = os.environ.get("CENTRAL_SCHEDULE_TIMEZONE", "America/Denver")
+
+
+def is_backlog_window_open(now: datetime | None = None) -> bool:
+    """Return True when backlog-scheduled tasks are allowed to dispatch."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(_SCHEDULE_TIMEZONE)
+    if now is None:
+        now = datetime.now(tz)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+    else:
+        now = now.astimezone(tz)
+    hour = now.hour
+    weekday = now.weekday()  # 0=Mon ... 6=Sun
+    for start, end in _BACKLOG_DAILY_HOURS:
+        if start <= hour < end:
+            return True
+    if weekday < 5:  # Mon-Fri
+        for start, end in _BACKLOG_WEEKDAY_HOURS:
+            if start <= hour < end:
+                return True
+    return False
+
+
+def _task_schedule(snapshot: dict[str, Any]) -> str:
+    return str((snapshot.get("metadata") or {}).get("schedule") or "anytime")
+
+
 def task_is_eligible(snapshot: dict[str, Any], *, remote_only: bool | None = None) -> bool:
     if snapshot["planner_status"] not in {"todo", "in_progress"}:
         return False
@@ -3862,6 +3895,9 @@ def task_is_eligible(snapshot: dict[str, Any], *, remote_only: bool | None = Non
         return False
     runtime = snapshot["runtime"]
     if runtime is None:
+        # Backlog schedule gating — backlog tasks only dispatch inside the window
+        if _task_schedule(snapshot) == "backlog" and not is_backlog_window_open():
+            return False
         return True
     status = runtime["runtime_status"]
     if status not in {"queued", "failed", "timeout"}:
@@ -3873,6 +3909,9 @@ def task_is_eligible(snapshot: dict[str, Any], *, remote_only: bool | None = Non
     # Retrying cannot fix missing or empty completion_gates on a finished parent task.
     last_error = runtime.get("last_runtime_error") or ""
     if status == "failed" and last_error.startswith("parent gate check permanently failed:"):
+        return False
+    # Backlog schedule gating — backlog tasks only dispatch inside the window
+    if _task_schedule(snapshot) == "backlog" and not is_backlog_window_open():
         return False
     return True
 

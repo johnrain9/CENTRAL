@@ -643,6 +643,7 @@ class CentralDispatcher:
         backoff_str = f" quota_backoff={backoff_remaining:.0f}s" if backoff_remaining > 0 else ""
         elapsed_str = f" elapsed_ms={elapsed_ms}" if elapsed_ms is not None else ""
         done_tasks = snapshot["runtime_counts"].get("done", 0)
+        backlog_str = "open" if task_db.is_backlog_window_open() else "closed"
         self.logger.emit(
             "INF",
             "central.dispatcher",
@@ -654,6 +655,7 @@ class CentralDispatcher:
                 f"idle_slots={idle_slots} "
                 f"running_tasks={self._format_task_ids(active_ids)} "
                 f"eligible={snapshot['eligible_count']} "
+                f"backlog={backlog_str} "
                 f"done={done_tasks} "
                 f"next={snapshot['next_eligible_task_id'] or '-'} "
                 f"leases={snapshot['active_leases']} "

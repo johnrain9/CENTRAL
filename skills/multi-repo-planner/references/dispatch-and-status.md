@@ -40,6 +40,27 @@ Rules:
 - CENTRAL / Dispatcher tasks: never set `--session-focus`
 - Other repos: no sessions seeded yet — omit flag
 
+## Backlog Scheduling
+
+Tasks have a `schedule` metadata field controlling when they can dispatch:
+
+| Value | Behavior |
+|-------|----------|
+| absent / `"anytime"` | Dispatches 24/7 (bugfix, investigation, validation) |
+| `"backlog"` | Only dispatches during backlog windows (all other templates) |
+
+**Backlog windows** (America/Denver, env-overridable via `CENTRAL_SCHEDULE_TIMEZONE`):
+- Weekdays 10:00–16:00
+- Every night 00:00–07:00
+
+Outside these windows, only `anytime` tasks dispatch — keeping the product stable for manual testing.
+
+```bash
+# Override schedule at task creation
+python3 scripts/task_quick.py --title "..." --repo ecosystem --schedule anytime   # urgent
+python3 scripts/task_quick.py --title "..." --repo ecosystem --schedule backlog   # default for most templates
+```
+
 ## Quick Replan Prompts
 - "List all blocked CENTRAL tasks and propose unblockers."
 - "Select one unblocked high-priority CENTRAL task per target repo and dispatch."

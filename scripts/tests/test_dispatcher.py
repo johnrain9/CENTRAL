@@ -333,28 +333,30 @@ class BuildersTest(unittest.TestCase):
 
     def test_claude_backend_prepare_uses_session_fork_args(self) -> None:
         backend = backends.ClaudeBackend()
-        snapshot = {"task_id": "TASK-59", "target_repo_id": "TEST"}
+        snapshot = {"task_id": "TASK-59", "target_repo_id": "TEST", "metadata": {"session_focus": "backend"}}
         worker_task = {
             "prompt_body": "prompt body",
             "worker_model": "claude-sonnet-4-6",
             "db_path": "/tmp/test.db",
         }
         fork_result = backends.session_manager.SessionForkResult(
-            args=["--resume", "sess-123", "--fork-session"],
+            args=["--resume", "sess-123"],
             session_id="sess-123",
             stale=False,
             stale_reason=None,
         )
 
         with (
-            mock.patch.object(backends.session_manager, "get_fork_args", return_value=fork_result) as get_fork_args_mock,
+            mock.patch.object(backends.session_manager, "get_session_args", return_value=fork_result) as get_session_args_mock,
+            mock.patch.object(backends.session_manager, "acquire_session_lock") as acquire_lock_mock,
             mock.patch.object(backend, "_log_session_fork") as log_session_fork_mock,
         ):
             prompt_text, command, stdin_mode = backend.prepare(snapshot, worker_task, "run-1", Path("/tmp/result.json"))
 
         self.assertEqual(prompt_text, "prompt body")
         self.assertEqual(stdin_mode, subprocess.PIPE)
-        get_fork_args_mock.assert_called_once_with("TEST", Path("/tmp/test.db"))
+        get_session_args_mock.assert_called_once_with("TEST", Path("/tmp/test.db"), focus="backend", backend="claude")
+        acquire_lock_mock.assert_called_once_with("TEST", Path("/tmp/test.db"), "TASK-59", focus="backend")
         log_session_fork_mock.assert_called_once_with("TASK-59", "TEST", Path("/tmp/test.db"), fork_result)
         self.assertIn("--resume", command[2])
         self.assertIn("sess-123", command[2])
@@ -370,17 +372,17 @@ class BuildersTest(unittest.TestCase):
         }
 
         with (
-            mock.patch.object(backends.session_manager, "get_fork_args", return_value=None) as get_fork_args_mock,
+            mock.patch.object(backends.session_manager, "get_session_args", return_value=None) as get_session_args_mock,
             mock.patch.object(backend, "_log_session_fork") as log_session_fork_mock,
         ):
             prompt_text, command, stdin_mode = backend.prepare(snapshot, worker_task, "run-1", Path("/tmp/result.json"))
 
         self.assertEqual(prompt_text, "prompt body")
         self.assertEqual(stdin_mode, subprocess.PIPE)
-        get_fork_args_mock.assert_called_once_with("TEST", Path("/tmp/test.db"))
+        # No session_focus in snapshot → get_session_args not called
+        get_session_args_mock.assert_not_called()
         log_session_fork_mock.assert_not_called()
         self.assertNotIn("--resume", command[2])
-        self.assertNotIn("--fork-session", command[2])
         self.assertEqual(worker_task["run_id"], "run-1")
 
     def test_claude_backend_log_session_fork_emits_stale_events(self) -> None:
