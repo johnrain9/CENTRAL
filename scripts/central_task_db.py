@@ -6002,14 +6002,20 @@ def runtime_transition(
             close_active_assignments(conn, task_id=task_id, assignee_kind="worker", assignee_id=str(lease["lease_owner_id"]))
             conn.execute("DELETE FROM task_active_leases WHERE task_id = ?", (task_id,))
     for artifact in artifacts:
-        insert_artifact(
-            conn,
-            task_id=task_id,
-            artifact_kind="runtime_artifact",
-            path_or_uri=artifact,
-            label=Path(artifact).name,
-            metadata={"runtime_status": status},
-        )
+        try:
+            insert_artifact(
+                conn,
+                task_id=task_id,
+                artifact_kind="runtime_artifact",
+                path_or_uri=artifact,
+                label=Path(artifact).name,
+                metadata={"runtime_status": status},
+            )
+        except Exception:
+            # Artifact insert failure (e.g. FK constraint) must not roll back the
+            # status transition — missing artifact metadata is acceptable; a reverted
+            # status update is not.  The caller's exception handler will log if needed.
+            pass
     insert_event(
         conn,
         task_id=task_id,

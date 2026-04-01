@@ -1622,7 +1622,10 @@ class CentralDispatcher:
                     with self._active_lock:
                         self._active.pop(task_id, None)
                     self._worker_prev_log_sizes.pop(task_id, None)
-                    self._finalize_worker(state, timed_out=True)
+                    try:
+                        self._finalize_worker(state, timed_out=True)
+                    except Exception as _fe:
+                        self.logger.emit("ERR", "central.dispatcher", f"worker_finalize_error task={task_id} run={state.run_id} error={_fe}{_title_kv(state.task)}")
                     self._close_worker_state(state)
                     self._emit_status_heartbeat(force=True)
                 continue
@@ -1630,7 +1633,10 @@ class CentralDispatcher:
             elapsed = self._worker_elapsed_seconds(state)
             if elapsed > state.timeout_seconds:
                 terminate_process(state.pid, state.proc, pgid=state.pgid)
-                self._finalize_worker(state, timed_out=True)
+                try:
+                    self._finalize_worker(state, timed_out=True)
+                except Exception as _fe:
+                    self.logger.emit("ERR", "central.dispatcher", f"worker_finalize_error task={task_id} run={state.run_id} error={_fe}{_title_kv(state.task)}")
                 self._close_worker_state(state)
                 with self._active_lock:
                     self._active.pop(task_id, None)
@@ -1664,7 +1670,10 @@ class CentralDispatcher:
                     )
 
             if not self._worker_is_running(state):
-                self._finalize_worker(state, timed_out=False)
+                try:
+                    self._finalize_worker(state, timed_out=False)
+                except Exception as _fe:
+                    self.logger.emit("ERR", "central.dispatcher", f"worker_finalize_error task={task_id} run={state.run_id} error={_fe}{_title_kv(state.task)}")
                 self._close_worker_state(state)
                 with self._active_lock:
                     self._active.pop(task_id, None)
